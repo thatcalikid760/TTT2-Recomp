@@ -61,6 +61,9 @@ Online Player Match runs over Steam: no ports to open, no Xbox LIVE.
     the join waits until a profile is signed in. Steam's "Join Game" keeps working as well.
     To turn it off: Enabled=0 in the [Discord] section of settings.ini.
 
+  - Lobby text chat: START (GAME CHAT) opens a message box; type on the PC keyboard, then ENTER
+    or A sends and ESC or B cancels.
+
 The first time ONLINE MODE is opened the game shows Namco's Online Mode terms; accept them to
 continue. Online leaderboards, World Arena and voice chat are not available.
 

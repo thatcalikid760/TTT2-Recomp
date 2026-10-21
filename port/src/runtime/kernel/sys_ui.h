@@ -21,8 +21,21 @@ struct SysUiMessageBox
     int cancel = -1;
     std::function<void(int choice)> done;
 };
-// False while another message box is showing.
+// False while another message box (or the keyboard) is showing.
 bool SysUiShowMessageBox(SysUiMessageBox box);
+
+// XamShowKeyboardUI (the Xbox virtual keyboard; TTT2's online GAME CHAT) in the game's dialog
+// window: its title, description and the text being typed, edited on the PC keyboard (printable
+// ASCII, at most `maxLength` characters). ENTER / A / START answer with the text, ESC / B cancel.
+// The system UI has the controller meanwhile. `done` runs once, on the game's main thread.
+struct SysUiKeyboard
+{
+    std::string title, description, text;   // UTF-8; `text` is the default text
+    size_t maxLength = 0;
+    std::function<void(bool ok, const std::string& text)> done;
+};
+// False while another keyboard or a message box is showing.
+bool SysUiShowKeyboard(SysUiKeyboard keyboard);
 
 // The game asked to sign a profile in (XamShowSigninUI with nobody signed in). Its sign-in states
 // draw nothing, so the last used profile is signed in directly. Returns false when the UI cannot
@@ -36,7 +49,7 @@ bool SysUiOwnsInput();
 // Profile, so the game must not see them (it would ask for a sign-in where nothing is drawn).
 bool SysUiTitleWantsProfile();
 
-// True while the name dialog takes typed text (letter keys are not mapped to buttons).
+// True while the name dialog or the keyboard takes typed text (letter keys are not mapped to buttons).
 bool SysUiTextEntryActive();
 
 // A character typed on the PC keyboard (window thread, WM_CHAR).

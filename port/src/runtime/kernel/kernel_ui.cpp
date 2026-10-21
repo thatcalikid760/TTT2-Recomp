@@ -1,5 +1,5 @@
-// XamShowMessageBoxUI: the guest owns the result and XOVERLAPPED until completion, just as on
-// Xbox. The box is shown in the game's own dialog window by the system UI (sys_ui.h, menu_ext.cpp)
+// XamShowMessageBoxUI and XamShowKeyboardUI: the guest owns the result and XOVERLAPPED until
+// completion, just as on Xbox. The box (or keyboard) is shown in the game's own dialog window by the system UI (sys_ui.h, menu_ext.cpp)
 // - never a Win32 pop-up; all strings are copied before it is queued, and the answer completes the
 // overlapped from the game's main thread without blocking it.
 #include "kernel_shared.h"
@@ -8,6 +8,7 @@
 #include "sys_ui.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -73,6 +74,14 @@ std::string Utf8(const std::wstring& text) {
     std::string out(size_t(n > 0 ? n : 0), '\0');
     if (n > 0) WideCharToMultiByte(CP_UTF8, 0, text.data(), int(text.size()), out.data(), n, nullptr, nullptr);
     return out;
+}
+
+// `text` (ASCII) into a guest wide-string buffer of `capacity` units, terminated.
+void WriteGuestText(uint8_t* base, uint32_t buffer, uint32_t capacity, const std::string& text) {
+    if (!capacity) return;
+    const uint32_t n = (std::min)(uint32_t(text.size()), capacity - 1);
+    for (uint32_t i = 0; i < n; ++i) GWrite16(base, buffer + i * 2, uint8_t(text[i]));
+    GWrite16(base, buffer + n * 2, 0);
 }
 
 struct Completion { uint8_t* base; uint32_t result, overlapped; };
@@ -149,6 +158,72 @@ PPC_FUNC(__imp__XamShowMessageBoxUI) {
             ctx.r3.u32 = ERROR_ACCESS_DENIED; return;
         }
         XamNotifyEnqueueEvent(9, 1);
+        ctx.r3.u32 = kPending;
+    } catch (...) {
+        ctx.r3.u32 = ERROR_NOT_ENOUGH_MEMORY;
+    }
+}
+
+// XamShowKeyboardUI(user, flags, defaultText, title, description, buffer, bufferLength,
+// pOverlapped): the Xbox virtual keyboard - TTT2's online GAME CHAT asks for its message with it.
+// Shown in the game's dialog window by the system UI, typed on the PC keyboard; the answer writes
+// the text into `buffer` (bufferLength wide characters, terminated) and completes the overlapped
+// with ERROR_SUCCESS, or ERROR_CANCELLED leaving the buffer alone.
+// ABI reference: xenia/kernel/xam/xam_ui.cc XamShowKeyboardUI_entry.
+PPC_FUNC(__imp__XamShowKeyboardUI) {
+    KTrace("XamShowKeyboardUI");
+    constexpr uint32_t kCancelled = 1223;
+    const uint32_t buffer = ctx.r8.u32, capacity = ctx.r9.u32, overlapped = ctx.r10.u32;
+    if (!buffer || !capacity || capacity > 0x10000 || !WritableGuestRange(base, buffer, uint64_t(capacity) * 2)) {
+        ctx.r3.u32 = kInvalidParameter; return;
+    }
+    try {
+        std::wstring defaultText, title, description;
+        if (!CopyGuestText(base, ctx.r5.u32, 0x10000, true, defaultText)
+            || !CopyGuestText(base, ctx.r6.u32, 256, true, title)
+            || !CopyGuestText(base, ctx.r7.u32, 2048, true, description)) {
+            ctx.r3.u32 = kInvalidParameter; return;
+        }
+        std::fprintf(stderr, "[xam] XamShowKeyboardUI '%s' (flags %08X, %u characters)%s\n", Utf8(title).c_str(),
+                     ctx.r4.u32, capacity, overlapped ? "" : " synchronous");
+        if (!overlapped) {
+            // Nobody can type while the caller waits: the default text, as Xenia's headless UI.
+            WriteGuestText(base, buffer, capacity, Utf8(defaultText));
+            ctx.r3.u32 = 0; return;
+        }
+        if (!WritableGuestRange(base, overlapped, 28)
+            || (uint64_t(buffer) < uint64_t(overlapped) + 28 && uint64_t(overlapped) < uint64_t(buffer) + uint64_t(capacity) * 2)) {
+            ctx.r3.u32 = kInvalidParameter; return;
+        }
+        if (const uint32_t error = XamValidateOverlapped(base, overlapped)) {
+            ctx.r3.u32 = error; return;
+        }
+        SysUiKeyboard keyboard;
+        keyboard.title = Utf8(title);
+        keyboard.description = Utf8(description);
+        keyboard.text = Utf8(defaultText);
+        keyboard.maxLength = capacity - 1;
+        keyboard.done = [base, buffer, capacity, overlapped](bool ok, const std::string& text) {
+            if (ok) WriteGuestText(base, buffer, capacity, text);
+            std::thread([base, overlapped, ok] {
+                XamCompleteOverlapped(base, overlapped, ok ? 0 : kCancelled, 0, 0);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                XamNotifyEnqueueEvent(9, 0);                  // XN_SYS_UI closed
+            }).detach();
+        };
+        const uint32_t saved[3] = { GRead32(base, overlapped), GRead32(base, overlapped + 4),
+                                    GRead32(base, overlapped + 24) };
+        GWrite32(base, overlapped + 4, 0);
+        GWrite32(base, overlapped + 24, 0);
+        std::atomic_thread_fence(std::memory_order_release);
+        GWrite32(base, overlapped, kPending);
+        if (!SysUiShowKeyboard(std::move(keyboard))) {
+            GWrite32(base, overlapped, saved[0]);
+            GWrite32(base, overlapped + 4, saved[1]);
+            GWrite32(base, overlapped + 24, saved[2]);
+            ctx.r3.u32 = ERROR_ACCESS_DENIED; return;
+        }
+        XamNotifyEnqueueEvent(9, 1);                          // XN_SYS_UI opened
         ctx.r3.u32 = kPending;
     } catch (...) {
         ctx.r3.u32 = ERROR_NOT_ENOUGH_MEMORY;

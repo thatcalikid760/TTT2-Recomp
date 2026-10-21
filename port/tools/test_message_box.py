@@ -33,6 +33,8 @@ struct PPCContext { Register r1,r3,r4,r5,r6,r7,r8,r9,r10; };
 void KTrace(const char*){}
 uint32_t GRead32(uint8_t* base,uint32_t p){uint32_t v;std::memcpy(&v,base+p,4);return __builtin_bswap32(v);}
 void GWrite32(uint8_t* base,uint32_t p,uint32_t v){v=__builtin_bswap32(v);std::memcpy(base+p,&v,4);}
+uint16_t GRead16(uint8_t* base,uint32_t p){uint16_t v;std::memcpy(&v,base+p,2);return __builtin_bswap16(v);}
+void GWrite16(uint8_t* base,uint32_t p,uint16_t v){v=__builtin_bswap16(v);std::memcpy(base+p,&v,2);}
 bool XamGuestRange(uint32_t,uint64_t,uint32_t=4);
 constexpr uint32_t XAM_SUCCESS=0,XAM_INVALID_PARAMETER=87,XAM_NOT_SUPPORTED=50,XAM_INVALID_HANDLE=6,XAM_IO_PENDING=997;
 HANDLE completed;
@@ -47,6 +49,8 @@ void XamNotifyEnqueueEvent(uint32_t id,uint32_t value){std::lock_guard l(notifyM
 std::mutex boxMutex;
 std::vector<SysUiMessageBox> boxes;
 bool SysUiShowMessageBox(SysUiMessageBox box){std::lock_guard l(boxMutex);if(!boxes.empty())return false;boxes.push_back(std::move(box));return true;}
+std::vector<SysUiKeyboard> keyboards;
+bool SysUiShowKeyboard(SysUiKeyboard k){std::lock_guard l(boxMutex);if(!keyboards.empty())return false;keyboards.push_back(std::move(k));return true;}
 @HELPERS@
 '''
 
@@ -126,8 +130,60 @@ int main(){
         CHECK(!std::memcmp(original.data(),memory,original.size()));CHECK(WaitForSingleObject(completed,0)==WAIT_TIMEOUT);CHECK(NoBox());
     }
     {std::lock_guard l(notifyMutex);CHECK(notifications.size()==accepted*2);for(size_t i=0;i<notifications.size();++i)CHECK(notifications[i]==(i%2?0:1));}
+    // The keyboard (GAME CHAT): typed text into the guest's buffer, cancel, the buffer's size,
+    // synchronous callers, bad arguments, one at a time.
+    size_t kbAccepted=0,before;
+    {std::lock_guard l(notifyMutex);before=notifications.size();}
+    auto KbPrepare=[&](uint32_t capacity=32){
+        std::memset(memory,0xA5,0x1F000);ResetEvent(completed);
+        Text(0x400,L"Hi");Text(0x800,L"GAME CHAT");
+        for(unsigned i=0;i<28;i+=4)GWrite32(memory,0x200+i,0);
+        GWrite32(memory,0x20C,0xF0000100);
+        PPCContext c;c.r3.u32=0;c.r4.u32=0;c.r5.u32=0x400;c.r6.u32=0x800;c.r7.u32=0;c.r8.u32=0x1000;c.r9.u32=capacity;c.r10.u32=0x200;return c;
+    };
+    auto TakeKb=[&](SysUiKeyboard& out){std::lock_guard l(boxMutex);if(keyboards.size()!=1)return false;out=std::move(keyboards[0]);keyboards.clear();return true;};
+    auto Buffer=[&](){std::string s;for(uint32_t at=0x1000;;at+=2){uint16_t u=GRead16(memory,at);if(!u)break;s.push_back(char(u));}return s;};
+    {
+        auto c=KbPrepare();__imp__XamShowKeyboardUI(c,memory);CHECK(c.r3.u32==997&&GRead32(memory,0x200)==997);
+        PPCContext again=c;again.r3.u32=0;again.r10.u32=0x240;
+        for(unsigned i=0;i<28;i+=4)GWrite32(memory,0x240+i,0);
+        GWrite32(memory,0x24C,0xF0000100);
+        __imp__XamShowKeyboardUI(again,memory);CHECK(again.r3.u32==5&&GRead32(memory,0x240)==0);   // busy, untouched
+        SysUiKeyboard k;CHECK(TakeKb(k));++kbAccepted;
+        CHECK(k.title=="GAME CHAT"&&k.text=="Hi"&&k.description.empty()&&k.maxLength==31);
+        CHECK(WaitForSingleObject(completed,20)==WAIT_TIMEOUT);
+        k.done(true,"good game!");CHECK(WaitForSingleObject(completed,2000)==WAIT_OBJECT_0);
+        CHECK(eventResult==0&&Buffer()=="good game!");Sleep(150);
+    }
+    {
+        auto c=KbPrepare();__imp__XamShowKeyboardUI(c,memory);CHECK(c.r3.u32==997);
+        SysUiKeyboard k;CHECK(TakeKb(k));++kbAccepted;
+        k.done(false,"ignored");CHECK(WaitForSingleObject(completed,2000)==WAIT_OBJECT_0);
+        CHECK(eventResult==1223&&GRead16(memory,0x1000)==0xA5A5);Sleep(150);   // cancelled: buffer untouched
+    }
+    {
+        auto c=KbPrepare(8);__imp__XamShowKeyboardUI(c,memory);CHECK(c.r3.u32==997);
+        SysUiKeyboard k;CHECK(TakeKb(k));++kbAccepted;CHECK(k.maxLength==7);
+        k.done(true,"0123456789");CHECK(WaitForSingleObject(completed,2000)==WAIT_OBJECT_0);
+        CHECK(Buffer()=="0123456"&&GRead16(memory,0x1000+16)==0xA5A5);Sleep(150);   // never past the buffer
+    }
+    {
+        auto c=KbPrepare();c.r10.u32=0;__imp__XamShowKeyboardUI(c,memory);
+        CHECK(c.r3.u32==0&&Buffer()=="Hi");SysUiKeyboard k;CHECK(!TakeKb(k));   // synchronous: the default text
+    }
+    for(unsigned bad=0;bad<6;++bad){
+        auto c=KbPrepare();
+        switch(bad){
+        case 0:c.r8.u32=0;break;case 1:c.r9.u32=0;break;case 2:c.r8.u32=0x1EFF0;break;
+        case 3:c.r10.u32=0x1F000;break;case 4:c.r10.u32=0xFF8;break;case 5:Text(0x800,std::wstring(300,L'x'));break;
+        }
+        auto original=std::vector<uint8_t>(memory,memory+0x1F000);
+        __imp__XamShowKeyboardUI(c,memory);CHECK(c.r3.u32==87);
+        CHECK(!std::memcmp(original.data(),memory,original.size()));SysUiKeyboard k;CHECK(!TakeKb(k));
+    }
+    {std::lock_guard l(notifyMutex);CHECK(notifications.size()==before+kbAccepted*2);}
     CloseHandle(completed);VirtualFree(memory,0,MEM_RELEASE);
-    std::printf("PASS %u message-box checks: UTF-16 -> UTF-8 copies, 1-4 choices, default focus, cancel, async/event order, bounds, busy, lifetime\n",checks);
+    std::printf("PASS %u message-box and keyboard checks: UTF-16 -> UTF-8 copies, 1-4 choices, default focus, cancel, async/event order, bounds, busy, lifetime, keyboard text / cancel / size / synchronous\n",checks);
 }
 '''
 
@@ -146,7 +202,7 @@ def main():
         if result.returncode:
             raise RuntimeError(result.stdout + result.stderr)
         print(result.stdout, end="")
-        old = production[:production.index("PPC_FUNC(__imp__XamShowMessageBoxUI)")] + "PPC_FUNC(__imp__XamShowMessageBoxUI){ctx.r3.u32=0;}\n"
+        old = production[:production.index("PPC_FUNC(__imp__XamShowMessageBoxUI)")] + "PPC_FUNC(__imp__XamShowMessageBoxUI){ctx.r3.u32=0;}\nPPC_FUNC(__imp__XamShowKeyboardUI){ctx.r3.u32=0;}\n"
         executable = compile_one(folder, "message_box_old", prefix + old + TEST, [])
         result = subprocess.run([str(executable)], text=True, capture_output=True, timeout=5)
         if result.returncode == 0 or "c.r3.u32==997" not in result.stderr:

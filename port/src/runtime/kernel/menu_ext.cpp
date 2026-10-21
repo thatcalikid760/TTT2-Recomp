@@ -267,6 +267,23 @@ uint32_t g_boxText = 0;
 std::atomic<uint32_t> g_boxBlock{ 0 }, g_boxFont{ 0 }, g_boxSize{ 0 };
 std::mutex g_labelMutex;
 std::vector<uint32_t> g_labels;             // guest texts, set only around the window's opening
+// The keyboard (XamShowKeyboardUI, kernel_ui.cpp): the queued request, the one on screen, its
+// message (kKeyboardTextId, laid out again into g_kbBlock as the text changes) and the characters
+// typed since the last frame.
+constexpr uint32_t kKeyboardTextId = 0x7F04;
+std::mutex g_kbMutex;
+std::vector<SysUiKeyboard> g_kbQueue;
+std::vector<uint32_t> g_kbChars;
+struct KeyboardState
+{
+    bool showing = false, releasing = false;
+    SysUiKeyboard kb;
+    std::string text, note;
+    uint16_t prev = 0;
+} g_kb;
+std::atomic<bool> g_kbOwns{ false };
+uint32_t g_kbText = 0;
+std::atomic<uint32_t> g_kbBlock{ 0 }, g_kbFont{ 0 }, g_kbSize{ 0 };
 
 int64_t NowMs()
 {
@@ -589,6 +606,98 @@ void BoxFrame(PPCContext& ctx, uint8_t* base)
     if (done) done(choice);
 }
 
+// ---- the keyboard in the game's confirmation window (see SysUiKeyboard)
+std::string KeyboardMessage(const KeyboardState& k)
+{
+    std::string m;
+    if (!k.kb.title.empty()) m += k.kb.title + "\n";
+    if (!k.kb.description.empty()) m += k.kb.description + "\n";
+    m += "\n" + k.text + "_\n\n" + (k.note.empty() ? std::string("ENTER: send   ESC: cancel") : k.note);
+    return m;
+}
+void UpdateKeyboard(PPCContext& ctx, uint8_t* base, const KeyboardState& k)
+{
+    WriteTableText(base, g_kbText, 2000, KeyboardMessage(k));
+    const uint32_t block = g_kbBlock.load();
+    if (!block) return;
+    GuestFrame frame(ctx, base, 0x100);
+    ctx.r3.u64 = block;
+    ctx.r4.u64 = g_kbFont.load();
+    ctx.r5.u64 = g_kbSize.load();
+    ctx.r6.u64 = g_kbText;
+    sub_8241B9D0(ctx, base);                          // the window lays its message out again
+}
+void KeyboardFrame(PPCContext& ctx, uint8_t* base)
+{
+    KeyboardState& k = g_kb;
+    const uint16_t now = HostControllerButtons();
+    const uint16_t pressed = now & ~k.prev;
+    k.prev = now;
+    if (k.releasing)
+    {
+        if (now == 0) { k.releasing = false; g_kbOwns = false; }   // the answer's press stays ours
+        return;
+    }
+    if (!k.showing)
+    {
+        {
+            std::lock_guard l(g_kbMutex);
+            if (g_kbQueue.empty()) return;
+            k.kb = std::move(g_kbQueue.front());
+            g_kbQueue.clear();
+            g_kbChars.clear();
+            g_kbOwns = true;
+        }
+        // Only what fits and what the game's font draws.
+        k.text.clear();
+        for (char c : k.kb.text)
+            if (c >= 0x20 && c <= 0x7E && k.text.size() < k.kb.maxLength) k.text.push_back(c);
+        k.note.clear();
+        k.showing = true;
+        WriteTableText(base, g_kbText, 2000, KeyboardMessage(k));
+        g_kbBlock = 0;
+        GuestFrame frame(ctx, base, 0x100);
+        ctx.r3.u64 = 0;
+        ctx.r4.u64 = kKeyboardTextId;
+        ctx.r5.u64 = 0;
+        sub_8241FAF0(ctx, base);                      // lib::WindowShowConfirmation(text id)
+        std::fprintf(stderr, "[sys-ui] keyboard '%s' (at most %zu characters)\n", k.kb.title.c_str(), k.kb.maxLength);
+        return;
+    }
+    std::vector<uint32_t> chars;
+    {
+        std::lock_guard l(g_kbMutex);
+        chars.swap(g_kbChars);
+    }
+    int answer = -1;                                  // 1 send, 0 cancel
+    bool changed = false;
+    for (uint32_t c : chars)
+    {
+        if (c == '\r') { answer = 1; break; }
+        if (c == 0x1B) { answer = 0; break; }
+        k.note.clear();
+        changed = true;
+        if (c == '\b') { if (!k.text.empty()) k.text.pop_back(); }
+        else if (c < 0x20 || c > 0x7E) changed = false;
+        else if (k.text.size() >= k.kb.maxLength) k.note = "At most " + std::to_string(k.kb.maxLength) + " characters.";
+        else k.text.push_back(char(c));
+    }
+    if (answer < 0 && (pressed & (kA | kStart))) answer = 1;
+    else if (answer < 0 && (pressed & kB)) answer = 0;
+    if (answer < 0)
+    {
+        if (changed) UpdateKeyboard(ctx, base, k);
+        return;
+    }
+    MenuSound(ctx, base, answer ? kSoundDecide : kSoundCancel);
+    HideDialog(ctx, base);
+    k.showing = false;
+    k.releasing = true;
+    std::fprintf(stderr, "[sys-ui] keyboard %s (%zu characters)\n", answer ? "sent" : "cancelled", k.text.size());
+    const auto done = std::move(k.kb.done);
+    if (done) done(answer == 1, k.text);
+}
+
 // Confirm: an empty name takes the suggestion; the new profile signs in.
 void Finish(PPCContext& ctx, uint8_t* base, Ui& ui)
 {
@@ -604,6 +713,7 @@ void Finish(PPCContext& ctx, uint8_t* base, Ui& ui)
 void Frame(PPCContext& ctx, uint8_t* base)
 {
     BoxFrame(ctx, base);
+    KeyboardFrame(ctx, base);
     Ui& ui = g_ui;
     const uint16_t pressed = Pressed(ui);
     if (ui.releasing)
@@ -1031,7 +1141,10 @@ struct UiHookInstall { UiHookInstall() { g_uiFrameHook = UiFrame; } } g_uiHookIn
 } // namespace
 
 bool SysUiRequestSignIn() { sysui::g_signInRequest = true; return true; }
-bool SysUiOwnsInput() { return sysui::g_owns.load() || sysui::g_boxOwns.load() || keyui::g_capture.load(); }
+bool SysUiOwnsInput()
+{
+    return sysui::g_owns.load() || sysui::g_boxOwns.load() || sysui::g_kbOwns.load() || keyui::g_capture.load();
+}
 bool SysUiKeyCaptureActive() { return keyui::g_capture.load(); }
 uint16_t SysUiGameButtonMask() { return keyui::g_gameMask.load(); }
 void SysUiOnKey(int vk)
@@ -1041,16 +1154,39 @@ void SysUiOnKey(int vk)
     if (keyui::g_keys.size() < 16) keyui::g_keys.push_back(vk);
 }
 bool SysUiTitleWantsProfile() { return !profiles::SignedIn() && sysui::TitleLogo(); }
-bool SysUiTextEntryActive() { return sysui::g_textEntry.load(); }
+bool SysUiTextEntryActive() { return sysui::g_textEntry.load() || sysui::g_kbOwns.load(); }
+static bool KeyboardBusy()
+{
+    std::lock_guard l(sysui::g_kbMutex);
+    return sysui::g_kbOwns.load() || !sysui::g_kbQueue.empty();
+}
 bool SysUiShowMessageBox(SysUiMessageBox box)
 {
+    if (KeyboardBusy()) return false;                 // one dialog window at a time
     std::lock_guard l(sysui::g_boxMutex);
     if (sysui::g_boxOwns.load() || !sysui::g_boxQueue.empty() || box.buttons.empty()) return false;
     sysui::g_boxQueue.push_back(std::move(box));
     return true;
 }
+bool SysUiShowKeyboard(SysUiKeyboard keyboard)
+{
+    {
+        std::lock_guard l(sysui::g_boxMutex);
+        if (sysui::g_boxOwns.load() || !sysui::g_boxQueue.empty()) return false;
+    }
+    std::lock_guard l(sysui::g_kbMutex);
+    if (sysui::g_kbOwns.load() || !sysui::g_kbQueue.empty()) return false;
+    sysui::g_kbQueue.push_back(std::move(keyboard));
+    return true;
+}
 void SysUiOnChar(uint32_t ch)
 {
+    if (sysui::g_kbOwns.load())
+    {
+        std::lock_guard l(sysui::g_kbMutex);
+        if (sysui::g_kbChars.size() < 64) sysui::g_kbChars.push_back(ch);
+        return;
+    }
     if (!sysui::g_textEntry.load()) return;
     std::lock_guard l(sysui::g_charMutex);
     if (sysui::g_chars.size() < 64) sysui::g_chars.push_back(ch);
@@ -1255,6 +1391,12 @@ PPC_FUNC(sub_8241B9D0)
         sysui::g_nameFont = ctx.r4.u32;
         sysui::g_nameSize = ctx.r5.u32;
     }
+    else if (ctx.r6.u32 && ctx.r6.u32 == sysui::g_kbText)
+    {
+        sysui::g_kbBlock = ctx.r3.u32;
+        sysui::g_kbFont = ctx.r4.u32;
+        sysui::g_kbSize = ctx.r5.u32;
+    }
     else if (ctx.r6.u32 && ctx.r6.u32 == sysui::g_boxText)
     {
         sysui::g_boxBlock = ctx.r3.u32;
@@ -1303,6 +1445,11 @@ PPC_FUNC(sub_8237F5D0)
     if (id == sysui::kNameTextId && sysui::g_nameText)
     {
         ctx.r3.u64 = sysui::g_nameText;
+        return;
+    }
+    if (id == sysui::kKeyboardTextId && sysui::g_kbText)
+    {
+        ctx.r3.u64 = sysui::g_kbText;
         return;
     }
     if (id == sysui::kBoxTextId && sysui::g_boxText)
