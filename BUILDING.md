@@ -36,7 +36,11 @@ because some tools choke on spaces and parentheses in paths.
    `port\third_party\ffmpeg_xma\CMakeLists.txt` (XMA decoding only).
 5. **Steamworks SDK** 1.65 in `tools\steamworks_sdk_165\sdk` (optional; without it the build has
    no Steam online).
-6. **Build**: `tools\build_port.cmd build-o1 1 8 ON` (the game, `port\build-o1\tekken_recomp.exe`),
+6. **SDL3** VC development package (zlib licence) from
+   [libsdl-org/SDL releases](https://github.com/libsdl-org/SDL/releases), unpacked as
+   `tools\SDL3-3.4.18` (optional; without it DualShock 4 / DualSense pads are not read natively).
+   Another version: `-DTTT2_SDL3=<folder>`.
+7. **Build**: `tools\build_port.cmd build-o1 1 8 ON` (the game, `port\build-o1\tekken_recomp.exe`),
    then `tools\build_setup.cmd build-o1 8` (the installer, `port\build-o1\setup\ttt2_setup.exe`).
    How the installer works: [port/INSTALLER.md](port/INSTALLER.md).
 
