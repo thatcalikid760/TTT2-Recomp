@@ -1,0 +1,11 @@
+# Standalone check of the minimal FFmpeg build: decode an XMA2 RIFF and compare with a reference.
+cmake_minimum_required(VERSION 3.20)
+project(ttt2_xma_test C CXX)
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/.. ffmpeg_xma)
+add_executable(xma_decode_test xma_decode_test.cpp)
+target_link_libraries(xma_decode_test PRIVATE ttt2_ffmpeg bcrypt)
+set_target_properties(xma_decode_test PROPERTIES CXX_STANDARD 20)
+add_executable(xma_core_test xma_core_test.cpp)
+target_include_directories(xma_core_test PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../../../src/runtime/kernel)
+target_link_libraries(xma_core_test PRIVATE ttt2_ffmpeg bcrypt)
+set_target_properties(xma_core_test PROPERTIES CXX_STANDARD 20)

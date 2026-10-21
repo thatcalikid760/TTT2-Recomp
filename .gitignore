@@ -1,0 +1,113 @@
+# ============================================================================
+#  NOTHING DERIVED FROM THE GAME DISC OR TITLE UPDATES MAY EVER BE COMMITTED.
+#  This project ships no game data. The installer extracts everything from a
+#  user-supplied disc image + the user's own title-update files. That is what
+#  makes the project publishable. (Same hard rule as the Tom & Jerry port.)
+# ============================================================================
+
+# --- ALLOWLIST: nothing is tracked unless listed here. The working folder also holds the disc
+#     image, title updates, extracted / recompiled game files, Xenia data, the Steamworks SDK
+#     (licence: not redistributable), FFmpeg / Xenia / reference sources and test captures -
+#     none of it may be published, so new files must be let in explicitly. ---
+/*
+!/.gitignore
+!/README.md
+!/BUILDING.md
+!/.github/
+!/port/
+!/tools/
+!/re/
+
+/port/*
+!/port/CMakeLists.txt
+!/port/INSTALLER.md
+!/port/src/
+!/port/tools/
+!/port/third_party/
+
+/tools/*
+!/tools/*.cmd
+!/tools/patches/
+!/tools/x_decompress/
+
+# The recompiler configuration only (addresses and jump tables, no game bytes).
+/re/*
+!/re/recomp/
+/re/recomp/*
+!/re/recomp/tekken.toml
+!/re/recomp/jump_tables.toml
+
+__pycache__/
+*.pyc
+
+# --- Disc / update sourced content (regenerated locally from the user's dump) ---
+*.iso
+*.xex
+*.xexp
+Updates/
+re/Default.xex
+re/extracted_tu/
+re/decrypted/
+# Decompressed/patched PPC image and generated recompiler output.
+re/ppc/
+re/game_files/
+re/game_files_x/
+extracted/
+port/src/game/generated/*.bin
+# Ghidra workspace over the game code.
+re/ghidra/
+
+# --- Recompiler intermediate / generated C++ (derived from the XEX) ---
+port/gen/
+*.gen.cpp
+*.gen.h
+shader_cache.*
+
+# --- Build output ---
+/tools/rea-reference/
+port/build/
+port/build-*/
+build/
+out/
+*.obj
+*.lib
+*.pdb
+*.exe
+*.dll
+*.ilk
+*.exp
+
+# --- Test captures ---
+*.bmp
+*.png
+*.log
+capture_*
+re/captures/
+re/run_*
+re/memory_*
+re/state_*
+re/threads_*
+
+# --- Local deliverables (may contain disc data) ---
+/dist/
+
+# --- Saves / local settings ---
+*.sav
+saves/
+
+# --- Session-handoff / internal working docs (not public) ---
+PROJECT_STATUS.md
+NEXT_SESSION*.md
+docs/*_PLAN.md
+port/*_PLAN.md
+
+# --- Editor / OS noise ---
+.vs/
+.vscode/
+*.user
+Thumbs.db
+
+# --- README artwork (original, port/tools/make_banner.py) - after the *.png rule above ---
+!/.github/assets/*.png
+# README screenshots (.github/assets/screens/*.jpg): captures of the port running, added at the
+# owner's request (2026-10-14) - the only game imagery allowed in the repository.
