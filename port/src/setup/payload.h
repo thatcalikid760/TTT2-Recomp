@@ -1,5 +1,5 @@
 // The files carried inside the installer - ours only: the port's executable, the Steamworks
-// client library, the VC++ runtime and a readme. No game data.
+// client library, SDL3 (when built with it), the VC++ runtime and a readme. No game data.
 #pragma once
 
 #include <cstdint>

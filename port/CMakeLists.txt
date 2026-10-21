@@ -105,6 +105,26 @@ else()
     target_compile_definitions(tekken_recomp PRIVATE TTT2_HAVE_STEAM=0)
     message(STATUS "Steamworks SDK not found - Steam online disabled")
 endif()
+# Native DualShock 4 / DualSense input (kernel/ps_pads.cpp): built when the SDL3 VC development
+# package (zlib licence, github.com/libsdl-org/SDL/releases) is unpacked in tools/SDL3-<version>.
+# SDL3.dll is delay-loaded and copied next to the executable; without it the PlayStation pads
+# are simply not read natively (XInput, DS4Windows and Steam Input keep working).
+set(TTT2_SDL3 "${CMAKE_SOURCE_DIR}/../tools/SDL3-3.4.18" CACHE PATH "SDL3 VC development package")
+set(TTT2_SDL3_DLL "${TTT2_SDL3}/lib/x64/SDL3.dll")
+if(EXISTS "${TTT2_SDL3}/include/SDL3/SDL.h" AND EXISTS "${TTT2_SDL3}/lib/x64/SDL3.lib" AND EXISTS "${TTT2_SDL3_DLL}")
+    set(TTT2_HAVE_SDL ON)
+    target_include_directories(tekken_recomp PRIVATE "${TTT2_SDL3}/include")
+    target_compile_definitions(tekken_recomp PRIVATE TTT2_HAVE_SDL=1)
+    target_link_libraries(tekken_recomp PRIVATE "${TTT2_SDL3}/lib/x64/SDL3.lib" delayimp)
+    target_link_options(tekken_recomp PRIVATE "/DELAYLOAD:SDL3.dll")
+    add_custom_command(TARGET tekken_recomp POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${TTT2_SDL3_DLL}" "$<TARGET_FILE_DIR:tekken_recomp>/SDL3.dll")
+    message(STATUS "SDL3: ${TTT2_SDL3} (native PlayStation pads enabled)")
+else()
+    set(TTT2_HAVE_SDL OFF)
+    target_compile_definitions(tekken_recomp PRIVATE TTT2_HAVE_SDL=0)
+    message(STATUS "SDL3 not found - native PlayStation pads disabled")
+endif()
 # Emit a linker map so faulting PC RVAs can be resolved to guest functions during bring-up.
 target_link_options(tekken_recomp PRIVATE "/MAP:tekken_recomp.map")
 
@@ -142,6 +162,13 @@ if(TTT2_CRT_DIRS AND TTT2_EDITBIN AND EXISTS "${TTT2_STEAM_DLL}" AND EXISTS "${X
     set(CRT_MSVCP140_ATOMIC "${TTT2_CRT_DIR}/msvcp140_atomic_wait.dll")
     set(CRT_VCRUNTIME140    "${TTT2_CRT_DIR}/vcruntime140.dll")
     set(CRT_VCRUNTIME140_1  "${TTT2_CRT_DIR}/vcruntime140_1.dll")
+    # Optional payload files: an .rc line each, and a define so payload.cpp lists them.
+    set(TTT2_OPTIONAL_PAYLOAD_RC "")
+    set(TTT2_OPTIONAL_PAYLOAD_FILES "")
+    if(TTT2_HAVE_SDL)
+        string(APPEND TTT2_OPTIONAL_PAYLOAD_RC "IDR_SDL3               RCDATA  \"${TTT2_SDL3_DLL}\"\n")
+        list(APPEND TTT2_OPTIONAL_PAYLOAD_FILES "${TTT2_SDL3_DLL}")
+    endif()
 
     add_custom_command(OUTPUT "${TTT2_GAME_EXE}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${TTT2_PAYLOAD_DIR}"
@@ -184,7 +211,7 @@ if(TTT2_CRT_DIRS AND TTT2_EDITBIN AND EXISTS "${TTT2_STEAM_DLL}" AND EXISTS "${X
         # The .rc pulls these in by PATH: without OBJECT_DEPENDS a rebuilt game exe would not
         # relink the installer, which would silently ship the previous build (T&J lesson).
         set_source_files_properties("${CMAKE_BINARY_DIR}/${variant}.rc" PROPERTIES OBJECT_DEPENDS
-            "${TTT2_GAME_EXE};${TTT2_SETUP_ICON};${TTT2_SETUP_BG};${TTT2_README_TXT};${TTT2_STEAM_DLL};${TTT2_SETUP_MANIFEST}")
+            "${TTT2_GAME_EXE};${TTT2_SETUP_ICON};${TTT2_SETUP_BG};${TTT2_README_TXT};${TTT2_STEAM_DLL};${TTT2_SETUP_MANIFEST};${TTT2_OPTIONAL_PAYLOAD_FILES}")
         add_executable(${variant} WIN32
             src/setup/setup_main.cpp
             src/setup/payload.cpp
@@ -193,7 +220,8 @@ if(TTT2_CRT_DIRS AND TTT2_EDITBIN AND EXISTS "${TTT2_STEAM_DLL}" AND EXISTS "${X
         target_link_libraries(${variant} PRIVATE ttt2_setup_core comctl32 shell32 ole32 shlwapi advapi32 uuid bcrypt
                               windowscodecs msimg32 uxtheme)
         target_compile_definitions(${variant} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
-                                   TTT2_VERSION_STR="${TTT2_VERSION}")
+                                   TTT2_VERSION_STR="${TTT2_VERSION}"
+                                   TTT2_PAYLOAD_SDL3=$<BOOL:${TTT2_HAVE_SDL}>)
         target_compile_options(${variant} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-O2>")
         target_link_options(${variant} PRIVATE /MANIFEST:NO)   # the manifest is in the .rc
         set_property(TARGET ${variant} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")

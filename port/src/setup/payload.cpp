@@ -19,6 +19,9 @@ const Item kItems[] = {
     { IDR_MSVCP140_ATOMIC, L"msvcp140_atomic_wait.dll" },
     { IDR_VCRUNTIME140,    L"vcruntime140.dll" },
     { IDR_VCRUNTIME140_1,  L"vcruntime140_1.dll" },
+#if TTT2_PAYLOAD_SDL3
+    { IDR_SDL3,            L"SDL3.dll" },            // native DualShock 4 / DualSense input (zlib)
+#endif
     { IDR_README,          L"README.txt" },
 };
 

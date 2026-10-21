@@ -115,13 +115,13 @@ int main() {
 '''
 
 
-def compile_one(folder, name, text, includes):
+def compile_one(folder, name, text, includes, link_args=""):
     vcvars = Path(r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat")
     clang = Path(r"C:\Program Files\LLVM\bin\clang-cl.exe")
     cpp, exe = folder / (name + ".cpp"), folder / (name + ".exe")
     cpp.write_text(text, encoding="utf-8")
     include_args = " ".join('/I"' + str(path) + '"' for path in includes)
-    command = f'@echo off\ncall "{vcvars}" >nul\nif errorlevel 1 exit /b 1\n"{clang}" /nologo /std:c++20 /O2 /EHsc /clang:-march=sandybridge {include_args} "{cpp}" /Fe:"{exe}" /Fo:"{folder / (name + ".obj")}"\n'
+    command = f'@echo off\ncall "{vcvars}" >nul\nif errorlevel 1 exit /b 1\n"{clang}" /nologo /std:c++20 /O2 /EHsc /clang:-march=sandybridge {include_args} "{cpp}" /Fe:"{exe}" /Fo:"{folder / (name + ".obj")}" {link_args}\n'
     batch = folder / (name + ".cmd")
     batch.write_text(command, encoding="utf-8")
     result = subprocess.run(["cmd.exe", "/d", "/c", str(batch)], cwd=folder, text=True, capture_output=True)

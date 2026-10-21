@@ -10,6 +10,7 @@
 #include "sys_ui.h"
 #include "keyboard_keys.h"
 #include "xlive.h"
+#include "ps_pads.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -477,11 +478,12 @@ PPC_FUNC(__imp__ExRegisterTitleTerminateNotification)
 {
     KTrace("ExRegisterTitleTerminateNotification"); ctx.r3.u32 = 0; }
 
-// --- input: host XInput pads, plus focused keyboard controls for player 0 ---
-// Guest users 0-3 are the host XInput pads (big-endian gamepad struct; the Xbox 360
-// XAMINPUT layouts and button masks match PC XInput exactly), assigned by use rather than
-// by XInput slot: the first pad to press a button or trigger becomes user 0, the only
-// signed-in profile, the next one user 1, and so on (see PadPollState::guestOf).
+// --- input: host XInput and PlayStation pads, plus focused keyboard controls for player 0 ---
+// Guest users 0-3 are the host pads (big-endian gamepad struct; the Xbox 360 XAMINPUT layouts
+// and button masks match PC XInput exactly): host pads 0-3 are the XInput slots, 4-7 the
+// DualShock 4 / DualSense pads SDL3 reads (ps_pads.h), already mapped to XINPUT_GAMEPAD. Users
+// are assigned by use rather than by slot: the first pad to press a button or trigger becomes
+// user 0, the only signed-in profile, the next one user 1, and so on (see PadPollState::guestOf).
 //
 // IMPORTANT: the guest polls input from inside a critical section its main loop also
 // takes, and host XInputGetState/GetCapabilities on DISCONNECTED pads can each take
@@ -540,9 +542,11 @@ static KeyboardPad ReadKeyboardPad()
     return pad;
 }
 
+constexpr DWORD kXInputPads = 4, kHostPads = kXInputPads + ps_pads::Slots;
+
 struct PadPollState
 {
-    bool physicalConnected[4]{};
+    bool physicalConnected[kHostPads]{};
     uint64_t retryAtMs[4]{};                  // disconnected: next XInput probe (poll thread clock)
     XINPUT_CAPABILITIES caps[4]{};            // connected: capabilities, refreshed once a second
     uint64_t capsAtMs[4]{};
@@ -553,8 +557,20 @@ struct PadPollState
     // whatever its XInput slot: with an idle device on slot 0 the real pad used to be user 1,
     // which TTT2 treats as signed out - no profile, no save, no title-storage unlock. Pads not
     // claimed yet fill the free users in host order, so a lone pad is user 0 before any press.
-    int guestOf[4]{ -1, -1, -1, -1 };
+    int guestOf[kHostPads]{ -1, -1, -1, -1, -1, -1, -1, -1 };
 };
+
+// What XInputGetCapabilities reports for a wired Xbox 360 pad, minus rumble (none is played).
+static XINPUT_CAPABILITIES PlayStationCaps()
+{
+    XINPUT_CAPABILITIES caps{};
+    caps.Type = XINPUT_DEVTYPE_GAMEPAD;
+    caps.SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
+    caps.Gamepad.wButtons = 0xF3FF;
+    caps.Gamepad.bLeftTrigger = caps.Gamepad.bRightTrigger = 255;
+    caps.Gamepad.sThumbLX = caps.Gamepad.sThumbLY = caps.Gamepad.sThumbRX = caps.Gamepad.sThumbRY = SHORT(0xFFC0);
+    return caps;
+}
 
 // Scripted input for unattended runs (skipping movies, driving menus, two-player fights):
 //   TTT2_INPUT_SCRIPT="8000:START:150,12000:A:150,..."  ms since start : buttons : hold ms
@@ -705,9 +721,9 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
     const uint16_t player2Buttons = script ? ScriptButtons(*script, elapsedMs, 1) : 0;
     if (script && script->active) autoStart = true;        // keep pad 0 connected for the script
     polling.keyboardEverPressed |= keyboardButtons != 0 || keyboard.leftTrigger || keyboard.rightTrigger;
-    XINPUT_STATE sampled[4]{};
-    XINPUT_CAPABILITIES hostCaps[4]{};
-    for (DWORD i = 0; i < 4; ++i)
+    XINPUT_STATE sampled[kHostPads]{};
+    XINPUT_CAPABILITIES hostCaps[kHostPads]{};
+    for (DWORD i = 0; i < kXInputPads; ++i)
     {
         // Sampling depends only on the physical device, never on a synthesized
         // keyboard pad's published connection flag. Probe slot 0 on startup too.
@@ -730,13 +746,22 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
             polling.retryAtMs[i] = elapsedMs + 2000; // retry physical discovery in 2 s
         }
     }
+    ps_pads::Pad playStation[ps_pads::Slots];
+    ps_pads::Poll(playStation);
+    for (DWORD k = 0; k < ps_pads::Slots; ++k)
+    {
+        const DWORD i = kXInputPads + k;
+        polling.physicalConnected[i] = playStation[k].connected;
+        sampled[i].Gamepad = playStation[k].gamepad;
+        if (playStation[k].connected) hostCaps[i] = PlayStationCaps();
+    }
 
     auto claimed = [&](int user) {
-        for (DWORD j = 0; j < 4; ++j)
+        for (DWORD j = 0; j < kHostPads; ++j)
             if (polling.guestOf[j] == user) return true;
         return false;
     };
-    for (DWORD i = 0; i < 4; ++i)
+    for (DWORD i = 0; i < kHostPads; ++i)
     {
         const XINPUT_GAMEPAD& g = sampled[i].Gamepad;
         const bool used = g.wButtons || g.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD ||
@@ -746,9 +771,9 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
             if (!claimed(user)) { polling.guestOf[i] = user; break; }
     }
     int source[4]{ -1, -1, -1, -1 };   // guest user -> host pad
-    for (DWORD i = 0; i < 4; ++i)
+    for (DWORD i = 0; i < kHostPads; ++i)
         if (polling.guestOf[i] >= 0 && polling.physicalConnected[i]) source[polling.guestOf[i]] = int(i);
-    for (DWORD i = 0; i < 4; ++i)
+    for (DWORD i = 0; i < kHostPads; ++i)
     {
         if (polling.guestOf[i] >= 0 || !polling.physicalConnected[i]) continue;
         for (int user = 0; user < 4; ++user)

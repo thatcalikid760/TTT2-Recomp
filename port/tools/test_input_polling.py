@@ -1,12 +1,16 @@
-"""Exercise production input polling with synthetic keyboard and XInput devices.
+"""Exercise production input polling with synthetic keyboard, XInput and PlayStation devices.
 
-No window, hardware pad, real keystroke or game data is needed. Host sampling is
-mocked; source selection, backoff, publication and packet numbers are production, and
-so are the keyboard key settings (keyboard_keys.cpp, kept in a temporary settings.ini).
+No window, hardware pad, real keystroke or game data is needed. Host sampling (XInput and
+the SDL3 PlayStation source, ps_pads::Poll) is mocked; source selection, backoff, publication
+and packet numbers are production, and so are the keyboard key settings (keyboard_keys.cpp,
+kept in a temporary settings.ini) and the PlayStation-to-XInput mapping (ps_pads.h).
+When the SDL3 package is present (tools/SDL3-*), production ps_pads.cpp is also run against
+the real SDL3.dll: [Input] PlayStationNative on, off, and SDL3.dll missing.
 """
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 
@@ -26,7 +30,11 @@ CHECKER = r'''
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include "ps_pads.h"
 std::array<bool,256> keys{};
+ps_pads::Pad psHost[ps_pads::Slots]{};
+unsigned psPolls=0;
+void ps_pads::Poll(ps_pads::Pad out[ps_pads::Slots]) { ++psPolls;for(int k=0;k<ps_pads::Slots;++k) out[k]=psHost[k]; }
 bool physical[4]{};
 XINPUT_STATE host[4]{};
 XINPUT_CAPABILITIES capabilities[4]{};
@@ -58,6 +66,7 @@ static unsigned checks=0;
 void Reset() {
     keys.fill(false);
     focused=windowExists=true;
+    for(auto& pad : psHost) pad={};
     for(unsigned i=0;i<4;++i) {
         physical[i]=false;host[i]={};capabilities[i]={};samples[i]=capsSamples[i]=0;
         g_pads[i].connected=false;g_pads[i].physical=false;g_pads[i].state={};g_pads[i].caps={};
@@ -142,7 +151,7 @@ int main() {
     CHECK(g_pads[0].connected && !g_pads[1].connected && g_pads[0].state.Gamepad.wButtons==0x1000);
     // Even identical held buttons need a new packet at a source handoff.
     packet=g_pads[0].state.dwPacketNumber;physical[0]=true;host[0].Gamepad.wButtons=0x1000;
-    poll.disconnectedBackoff[0]=0;PollPadsOnce(poll,false,24);
+    poll.retryAtMs[0]=0;PollPadsOnce(poll,false,24);
     CHECK(g_pads[0].physical && g_pads[0].state.dwPacketNumber==packet+1);
     physical[0]=false;PollPadsOnce(poll,false,32);
     CHECK(!g_pads[0].physical && g_pads[0].state.dwPacketNumber==packet+2);
@@ -188,7 +197,7 @@ int main() {
     // A claimed pad keeps its user across a disconnect; nobody else takes it meanwhile.
     physical[1]=false;PollPadsOnce(poll,false,40);
     CHECK(g_pads[0].connected && !g_pads[0].physical && g_pads[1].physical); // keyboard keeps player 1
-    physical[1]=true;poll.disconnectedBackoff[1]=0;host[1].Gamepad.wButtons=0x4000;
+    physical[1]=true;poll.retryAtMs[1]=0;host[1].Gamepad.wButtons=0x4000;
     PollPadsOnce(poll,false,48);
     CHECK(g_pads[0].physical && g_pads[0].state.Gamepad.wButtons==0x4000);
     // Stick drift does not claim a user; a trigger press does.
@@ -212,7 +221,7 @@ int main() {
     CHECK(g_pads[1].connected && g_pads[1].state.Gamepad.wButtons==0 && g_pads[0].state.Gamepad.wButtons==0);
     PollPadsOnce(poll,false,310,&script);
     CHECK(g_pads[1].state.Gamepad.wButtons==0x4002 && g_pads[0].state.Gamepad.wButtons==0);
-    physical[1]=true;poll.disconnectedBackoff[1]=0;host[1].Gamepad.wButtons=0x0100;PollPadsOnce(poll,false,320,&script);
+    physical[1]=true;poll.retryAtMs[1]=0;host[1].Gamepad.wButtons=0x0100;PollPadsOnce(poll,false,320,&script);
     CHECK(g_pads[0].physical && g_pads[0].state.Gamepad.wButtons==0x0100); // a used real pad is still player 1
     CHECK(g_pads[1].connected && g_pads[1].state.Gamepad.wButtons==0x4002);
 
@@ -264,9 +273,128 @@ int main() {
     captureActive=false;CHECK(!keyboard_keys::Assignable(VK_ESCAPE));
     keyboard_keys::RestoreDefaults();
     CHECK(keyboard_keys::Key(keyboard_keys::X)=='Z' && keyboard_keys::Key(keyboard_keys::LB)=='Q');
-    std::printf("PASS %u input checks: focused keyboard/controller combination, hotplug, packet edges, START timing, player 1 = first pad used, text entry, key settings\n",checks);
+    // PlayStation mapping (ps_pads.h): face buttons by position, Options = START, Share and the
+    // touchpad click = BACK, the PS button nothing; stick Y flipped, triggers scaled to 0..255.
+    {
+        using namespace ps_pads;
+        const int16_t rest[6]{};
+        const struct { int button; uint16_t mask; } map[] = {
+            {South,0x1000},{East,0x2000},{West,0x4000},{North,0x8000},{LeftShoulder,0x0100},
+            {RightShoulder,0x0200},{LeftStick,0x0040},{RightStick,0x0080},{DpadUp,0x0001},
+            {DpadDown,0x0002},{DpadLeft,0x0004},{DpadRight,0x0008},{Start,0x0010},{Back,0x0020},
+            {Touchpad,0x0020},{Guide,0}};
+        for(const auto& m : map) {
+            const XINPUT_GAMEPAD g=ToXInput(1u<<m.button,rest);
+            CHECK(g.wButtons==m.mask && g.bLeftTrigger==0 && g.sThumbLY==0);
+        }
+        CHECK(ToXInput(0xFFFFFFFFu,rest).wButtons==0xF3FF);
+        const int16_t full[6]{-32768,-32768,32767,32767,32767,16384};
+        XINPUT_GAMEPAD g=ToXInput(0,full);
+        CHECK(g.sThumbLX==-32768 && g.sThumbLY==32767 && g.sThumbRX==32767 && g.sThumbRY==-32767);
+        CHECK(g.bLeftTrigger==255 && g.bRightTrigger==128 && g.wButtons==0);
+        const int16_t low[6]{0,1,0,-1,-5,1};
+        g=ToXInput(0,low);
+        CHECK(g.sThumbLY==-1 && g.sThumbRY==1 && g.bLeftTrigger==0 && g.bRightTrigger==0);
+    }
+
+    // A lone PlayStation pad is player 1 before any press, with Xbox-pad capabilities.
+    Reset();poll={};psHost[0].connected=true;psHost[0].gamepad.sThumbLX=700;psPolls=0;
+    PollPadsOnce(poll,false,0);
+    CHECK(g_pads[0].connected && g_pads[0].physical && g_pads[0].state.Gamepad.sThumbLX==700);
+    CHECK(g_pads[0].caps.Type==XINPUT_DEVTYPE_GAMEPAD && g_pads[0].caps.Gamepad.wButtons==0xF3FF);
+    CHECK(g_pads[0].caps.Gamepad.bRightTrigger==255 && !g_pads[1].connected && psPolls==1);
+    for(unsigned i=0;i<4;++i) CHECK(samples[i]==1); // XInput discovery is unchanged by it.
+    // Keyboard keys join it, packet edges follow its changes.
+    DWORD psPacket=g_pads[0].state.dwPacketNumber;
+    keys['A']=true;psHost[0].gamepad.wButtons=0x0020;PollPadsOnce(poll,false,8);
+    CHECK(g_pads[0].state.Gamepad.wButtons==0x1020 && g_pads[0].state.dwPacketNumber==psPacket+1);
+    PollPadsOnce(poll,false,16);CHECK(g_pads[0].state.dwPacketNumber==psPacket+1);
+    keys['A']=false;psHost[0].gamepad.bLeftTrigger=200;PollPadsOnce(poll,false,24);
+    CHECK(g_pads[0].state.Gamepad.wButtons==0x0020 && g_pads[0].state.Gamepad.bLeftTrigger==200);
+    CHECK(g_pads[0].state.dwPacketNumber==psPacket+2 && poll.guestOf[kXInputPads]==0);
+
+    // An idle Xbox pad on XInput slot 0 does not keep a DualSense from being player 1, and the
+    // Xbox pad pressed next is player 2.
+    Reset();poll={};physical[0]=true;psHost[1].connected=true;
+    PollPadsOnce(poll,false,0);
+    CHECK(g_pads[0].physical && g_pads[1].physical && poll.guestOf[0]==-1);
+    psHost[1].gamepad.wButtons=0x1000;host[0].Gamepad.sThumbLX=3000;PollPadsOnce(poll,false,8);
+    CHECK(poll.guestOf[kXInputPads+1]==0 && g_pads[0].state.Gamepad.wButtons==0x1000);
+    CHECK(g_pads[1].state.Gamepad.sThumbLX==3000 && g_pads[1].state.Gamepad.wButtons==0);
+    psHost[1].gamepad.wButtons=0;host[0].Gamepad.wButtons=0x2000;PollPadsOnce(poll,false,16);
+    CHECK(poll.guestOf[0]==1 && g_pads[1].state.Gamepad.wButtons==0x2000 && g_pads[0].state.Gamepad.wButtons==0);
+    // Unplugging the DualSense keeps player 1 for it; nobody else moves up meanwhile.
+    psHost[1].connected=false;PollPadsOnce(poll,false,24);
+    CHECK(!g_pads[0].connected && g_pads[1].physical && g_pads[1].state.Gamepad.wButtons==0x2000);
+    psHost[1]={};psHost[1].connected=true;psHost[1].gamepad.wButtons=0x8000;PollPadsOnce(poll,false,32);
+    CHECK(g_pads[0].physical && g_pads[0].state.Gamepad.wButtons==0x8000 && g_pads[1].state.Gamepad.wButtons==0x2000);
+    // Four players: two PlayStation pads, two Xbox pads, each on its own user.
+    Reset();poll={};physical[2]=physical[3]=true;psHost[0].connected=psHost[3].connected=true;
+    psHost[3].gamepad.wButtons=0x0001;PollPadsOnce(poll,false,0);
+    host[3].Gamepad.wButtons=0x0002;PollPadsOnce(poll,false,8);
+    psHost[0].gamepad.wButtons=0x0004;PollPadsOnce(poll,false,16);
+    host[2].Gamepad.wButtons=0x0008;PollPadsOnce(poll,false,24);
+    CHECK(poll.guestOf[kXInputPads+3]==0 && poll.guestOf[3]==1 && poll.guestOf[kXInputPads]==2 && poll.guestOf[2]==3);
+    CHECK(g_pads[0].state.Gamepad.wButtons==0x0001 && g_pads[1].state.Gamepad.wButtons==0x0002);
+    CHECK(g_pads[2].state.Gamepad.wButtons==0x0004 && g_pads[3].state.Gamepad.wButtons==0x0008);
+    // A fifth pad (a third PlayStation pad) has no user, even when pressed.
+    psHost[2].connected=true;psHost[2].gamepad.wButtons=0x1000;PollPadsOnce(poll,false,32);
+    CHECK(poll.guestOf[kXInputPads+2]==-1);
+    for(unsigned u=0;u<4;++u) CHECK((g_pads[u].state.Gamepad.wButtons&0x1000)==0);
+    std::printf("PASS %u input checks: focused keyboard/controller combination, hotplug, packet edges, START timing, player 1 = first pad used, text entry, key settings, PlayStation pads\n",checks);
 }
 '''
+
+
+# Production ps_pads.cpp against the real SDL3.dll (delay-loaded, as in the game).
+SDL_CHECKER = r'''
+#define TTT2_HAVE_SDL 1
+@PS_PADS@
+int main() {
+    ps_pads::Pad pads[ps_pads::Slots];
+    for (int i = 0; i < 20; ++i) { ps_pads::Poll(pads); Sleep(5); }
+    int connected = 0;
+    for (const auto& p : pads) connected += p.connected;
+    const bool loaded = GetModuleHandleW(L"SDL3.dll") != nullptr;
+    std::printf("loaded=%d connected=%d\n", int(loaded), connected);
+    return 0;
+}
+'''
+
+
+def check_sdl(kernel, folder):
+    """[Input] PlayStationNative on / off and a missing SDL3.dll, with production ps_pads.cpp."""
+    packages = sorted((ROOT / "tools").glob("SDL3-3.*/lib/x64/SDL3.dll"))
+    if not packages:
+        print("SKIP SDL3 checks: no tools/SDL3-<version> package")
+        return
+    sdl = packages[-1].parents[2]
+    source = SDL_CHECKER.replace("@PS_PADS@", (kernel / "ps_pads.cpp").read_text(encoding="utf-8-sig"))
+    lib = sdl / "lib/x64/SDL3.lib"
+    exe = compile_one(folder, "ps_pads", source, [kernel, sdl / "include"],
+                      f'/link "{lib}" delayimp.lib /DELAYLOAD:SDL3.dll')
+    shutil.copy(sdl / "lib/x64/SDL3.dll", folder / "SDL3.dll")
+
+    def run(exe_path, ini):
+        env = dict(os.environ, TTT2_SETTINGS_INI=str(ini))
+        r = subprocess.run([str(exe_path)], timeout=30, env=env, capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+        return r.stdout + r.stderr
+
+    ini = folder / "sdl_settings.ini"
+    out = run(exe, ini)
+    assert "native PlayStation input on" in out and "loaded=1" in out, out
+    assert "PlayStationNative=1" in ini.read_text(), "the default is written out"
+    ini.write_text("[Input]\nPlayStationNative=0\n")
+    out = run(exe, ini)
+    assert "native PlayStation input off" in out and "loaded=0 connected=0" in out, out
+    alone = folder / "no_sdl"
+    alone.mkdir()
+    shutil.copy(exe, alone / exe.name)
+    ini.write_text("[Input]\nPlayStationNative=1\n")
+    out = run(alone / exe.name, ini)
+    assert "SDL3.dll not found" in out and "loaded=0 connected=0" in out, out
+    print(f"PASS SDL3 checks ({sdl.name}): PlayStationNative on / off, SDL3.dll missing")
 
 
 def main():
@@ -280,6 +408,7 @@ def main():
         exe = compile_one(folder, "input", source, [kernel])
         env = dict(os.environ, TTT2_SETTINGS_INI=str(folder / "settings.ini"))
         subprocess.run([str(exe)], check=True, timeout=10, env=env)
+        check_sdl(kernel, folder)
 
 
 if __name__ == "__main__":

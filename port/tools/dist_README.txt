@@ -14,7 +14,12 @@ PLAYING
 Start "Tekken Tag Tournament 2" from the desktop or the Start menu.
 
 An Xbox controller (or any XInput pad) is the intended way to play; whoever presses a button
-first is player 1. The keyboard also works as player 1:
+first is player 1. DualShock 4 and DualSense (PS5) controllers work directly too, over USB or
+Bluetooth: Cross / Circle / Square / Triangle are A / B / X / Y, L1 / R1 the bumpers, L2 / R2 the
+triggers, Options is START and Share / Create or a touchpad click is BACK. If you use DS4Windows
+or Steam Input (which already turn the pad into an Xbox controller), set PlayStationNative=0 in
+the [Input] section of settings.ini so each press is not read twice.
+The keyboard also works as player 1:
 
     Arrow keys      D-pad                 A / S / Z / X   A / B / X / Y buttons
     Enter or Space  START                 Q / W           left / right bumper
@@ -67,3 +72,5 @@ Tekken Tag Tournament 2 is (c) Bandai Namco Entertainment. This port is an unoff
 project, not affiliated with or endorsed by Bandai Namco or Microsoft. You must own the game.
 Steamworks: steam_api64.dll is (c) Valve Corporation, redistributed under the Steamworks SDK
 licence.
+SDL3.dll (native DualShock 4 / DualSense input) is Simple DirectMedia Layer, (c) Sam Lantinga,
+zlib licence (https://libsdl.org).
