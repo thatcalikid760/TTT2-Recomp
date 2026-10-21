@@ -14,6 +14,8 @@
 //     <Program Files>\Tekken Tag Tournament 2\        exe + runtime + game\ (read-only)
 //     %LOCALAPPDATA%\TTT2Recomp\                       saves, profiles, settings, shader cache, log
 // Uninstalling leaves %LOCALAPPDATA%\TTT2Recomp alone unless the player ticks the box.
+// Run again over an install, it offers an update instead (RunUpdate): only the files it carries
+// are replaced, so no disc image or title update is needed; `/update [folder]` does that silently.
 #include "setup/payload_ids.h"
 #include "setup/payload.h"
 #include "setup/game_data.h"
@@ -237,6 +239,113 @@ static bool Fail(InstallJob* job, const std::wstring& why) {
     return false;
 }
 
+// Add or remove programs (HKLM): written by an install, refreshed by an update.
+static void Register(const std::wstring& dest) {
+    const std::wstring game = dest + L"\\" + kGameExeName, uninst = dest + L"\\" + kUninstallExe;
+    HKEY k = nullptr;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, kRegKey, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS) return;
+    auto S = [&](const wchar_t* n, const std::wstring& v) {
+        RegSetValueExW(k, n, 0, REG_SZ, (const BYTE*)v.c_str(), (DWORD)((v.size() + 1) * sizeof(wchar_t)));
+    };
+    auto D = [&](const wchar_t* n, DWORD v) { RegSetValueExW(k, n, 0, REG_DWORD, (const BYTE*)&v, sizeof v); };
+    S(L"DisplayName", kAppName);
+    S(L"DisplayVersion", TTT2_VERSION_W);
+    S(L"Publisher", L"Native PC port");
+    S(L"InstallLocation", dest);
+    S(L"DisplayIcon", game);
+    S(L"UninstallString", L"\"" + uninst + L"\" /uninstall");
+    S(L"QuietUninstallString", L"\"" + uninst + L"\" /uninstall /quiet");
+    D(L"NoModify", 1);
+    D(L"NoRepair", 1);
+    D(L"EstimatedSize", (DWORD)DirSizeKb(dest));
+    RegCloseKey(k);
+}
+
+static std::wstring RegString(const wchar_t* name) {
+    std::wstring out;
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kRegKey, 0, KEY_READ, &k) != ERROR_SUCCESS) return out;
+    wchar_t v[MAX_PATH] = {}; DWORD n = sizeof v - sizeof(wchar_t), type = 0;
+    if (RegQueryValueExW(k, name, nullptr, &type, (BYTE*)v, &n) == ERROR_SUCCESS && type == REG_SZ) out = v;
+    RegCloseKey(k);
+    return out;
+}
+
+// The install Add or remove programs names, if it is really one of ours; empty otherwise.
+static std::wstring ExistingInstall() {
+    const std::wstring dir = RegString(L"InstallLocation");
+    return LooksLikeInstall(dir) ? dir : std::wstring();
+}
+
+static bool ReadWhole(const std::wstring& path, std::vector<uint8_t>& out) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size = {};
+    bool ok = GetFileSizeEx(h, &size) && size.QuadPart < (1ll << 30);
+    if (ok) {
+        out.resize((size_t)size.QuadPart);
+        DWORD got = 0;
+        ok = out.empty() || (ReadFile(h, out.data(), (DWORD)out.size(), &got, nullptr) && got == out.size());
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+// ---------------------------------------------------------------- the update worker
+//
+// An update replaces only the files this installer carries (the port's exe and DLLs, the readme)
+// and the uninstaller, and refreshes Add or remove programs. The game files built from the
+// player's disc and title update stay; game\tekken.img must be the image this exe was recompiled
+// from. New files are written next to the install first, then swapped in, so a failed write
+// leaves the old version complete.
+static bool RunUpdate(InstallJob* job) {
+    std::string err;
+    job->Set(5, L"Checking the installed game\x2026");
+    if (!LooksLikeInstall(job->dest))
+        return Fail(job, L"No installed copy of the game was found in that folder.");
+    std::vector<uint8_t> image;
+    if (!ReadWhole(job->dest + L"\\" + kImageName, image) || Sha1Hex(image.data(), image.size()) != kImageSha1)
+        return Fail(job, L"The installed game files do not match this version. Run a full install instead.");
+
+    // A running game holds its exe: nothing can be replaced until it is closed.
+    const std::wstring game = job->dest + L"\\" + kGameExeName;
+    HANDLE h = CreateFileW(game.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE && GetLastError() != ERROR_FILE_NOT_FOUND)
+        return Fail(job, L"The game is running. Close it, then update again.");
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+
+    job->Set(20, L"Writing the new version\x2026");
+    const std::wstring staging = job->dest + L"\\update.tmp";
+    DeleteTree(staging);
+    if (!MakeDirs(staging)) return Fail(job, L"Could not write to the install folder.");
+    std::vector<std::wstring> staged;
+    if (!WritePayload(staging.c_str(), err, &staged)) {
+        DeleteTree(staging);
+        return Fail(job, Widen(err));
+    }
+
+    job->Set(70, L"Replacing the game's files\x2026");
+    for (const std::wstring& from : staged) {
+        const std::wstring to = job->dest + from.substr(staging.size());
+        if (!MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            DeleteTree(staging);
+            return Fail(job, L"Could not replace " + to.substr(job->dest.size() + 1) +
+                             L". Close the game and anything else using its folder, then update again.");
+        }
+    }
+    DeleteTree(staging);
+
+    job->Set(90, L"Updating the uninstaller\x2026");
+    wchar_t self[MAX_PATH];
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    CopyFileW(self, (job->dest + L"\\" + kUninstallExe).c_str(), FALSE);
+    Register(job->dest);
+
+    job->ok = true;
+    job->Set(100, L"Done.");
+    return true;
+}
+
 struct Planned { const IsoEntry* entry; uint64_t outBytes; bool expand; };
 
 static bool RunInstall(InstallJob* job) {
@@ -389,24 +498,7 @@ static bool RunInstall(InstallJob* job) {
     }
 
     job->Set(99, L"Registering with Add or remove programs\x2026");
-    HKEY k = nullptr;
-    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, kRegKey, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) == ERROR_SUCCESS) {
-        auto S = [&](const wchar_t* n, const std::wstring& v) {
-            RegSetValueExW(k, n, 0, REG_SZ, (const BYTE*)v.c_str(), (DWORD)((v.size() + 1) * sizeof(wchar_t)));
-        };
-        auto D = [&](const wchar_t* n, DWORD v) { RegSetValueExW(k, n, 0, REG_DWORD, (const BYTE*)&v, sizeof v); };
-        S(L"DisplayName", kAppName);
-        S(L"DisplayVersion", TTT2_VERSION_W);
-        S(L"Publisher", L"Native PC port");
-        S(L"InstallLocation", job->dest);
-        S(L"DisplayIcon", game);
-        S(L"UninstallString", L"\"" + uninst + L"\" /uninstall");
-        S(L"QuietUninstallString", L"\"" + uninst + L"\" /uninstall /quiet");
-        D(L"NoModify", 1);
-        D(L"NoRepair", 1);
-        D(L"EstimatedSize", (DWORD)DirSizeKb(job->dest));
-        RegCloseKey(k);
-    }
+    Register(job->dest);
 
     job->ok = true;
     job->Set(100, L"Done.");
@@ -1029,6 +1121,34 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int) {
         CoUninitialize();
         return ok ? 0 : 1;
     }
+    // /update [install folder]: update an existing install with no UI (the folder Add or remove
+    // programs names when none is given), logging next to the exe like /silent.
+    if (!amUninstaller && HasArg(cmdline, L"/update")) {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        std::wstring dest;
+        for (int i = 1; i < argc; ++i)
+            if (_wcsicmp(argv[i], L"/update") == 0) {
+                if (i + 1 < argc) dest = argv[i + 1];
+                break;
+            }
+        if (argv) LocalFree(argv);
+        if (dest.empty()) dest = ExistingInstall();
+        InitializeCriticalSection(&g_job.lock);
+        g_job.dlg = nullptr;
+        g_job.dest = dest;
+        g_job.log = CreateFileW((std::wstring(selfPath) + L".log").c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (g_job.log != INVALID_HANDLE_VALUE) {
+            DWORD put = 0;
+            WriteFile(g_job.log, "\xEF\xBB\xBF", 3, &put, nullptr);
+        }
+        g_job.Set(0, L"[update] <" + dest + L">");
+        const bool ok = !dest.empty() ? RunUpdate(&g_job) : Fail(&g_job, L"No installed copy of the game was found.");
+        if (g_job.log != INVALID_HANDLE_VALUE) CloseHandle(g_job.log);
+        CoUninitialize();
+        return ok ? 0 : 1;
+    }
     if (amUninstaller) {
         std::wstring dir = selfPath;
         size_t at = dir.find_last_of(L'\\');
@@ -1056,7 +1176,39 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int) {
         if (HasArg(cmdline, L"/quiet")) { DoUninstall(nullptr); rc = 0; }
         else rc = DialogBoxParamW(inst, MAKEINTRESOURCEW(IDD_UNINSTALL), nullptr, UninstallProc, 0) == 1 ? 0 : 1;
     } else {
-        rc = (int)DialogBoxParamW(inst, MAKEINTRESOURCEW(IDD_MAIN), nullptr, MainProc, 0);
+        // Already installed: offer to update just the port's files (no disc or title update needed).
+        const std::wstring existing = ExistingInstall();
+        int choice = IDNO;
+        if (!existing.empty()) {
+            const std::wstring have = RegString(L"DisplayVersion");
+            const std::wstring ask = std::wstring(kAppName) + L" " + (have.empty() ? L"" : have + L" ") +
+                L"is installed in:\n" + existing + L"\n\nUpdate it to version " TTT2_VERSION_W L"? Only the port's own "
+                L"files are replaced, so your disc image and title update are not needed, and saved games, "
+                L"profiles and settings are kept.\n\nYes: update\nNo: full reinstall (disc image and title update "
+                L"needed)\nCancel: quit";
+            choice = MessageBoxW(nullptr, ask.c_str(), kAppName, MB_YESNOCANCEL | MB_ICONQUESTION);
+        }
+        if (choice == IDCANCEL) {
+            rc = 0;
+        } else if (choice == IDYES) {
+            InitializeCriticalSection(&g_job.lock);
+            g_job.dlg = nullptr;
+            g_job.dest = existing;
+            HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+            const bool ok = RunUpdate(&g_job);
+            SetCursor(old);
+            if (ok) {
+                const std::wstring msg = std::wstring(kAppName) + L" is updated to version " TTT2_VERSION_W L".\n\nPlay now?";
+                if (MessageBoxW(nullptr, msg.c_str(), kAppName, MB_YESNO | MB_ICONINFORMATION) == IDYES)
+                    ShellExecuteW(nullptr, L"open", (existing + L"\\" + kGameExeName).c_str(), nullptr, existing.c_str(), SW_SHOWNORMAL);
+                rc = 1;
+            } else {
+                MessageBoxW(nullptr, g_job.error.c_str(), kAppName, MB_ICONERROR);
+                rc = 0;
+            }
+        } else {
+            rc = (int)DialogBoxParamW(inst, MAKEINTRESOURCEW(IDD_MAIN), nullptr, MainProc, 0);
+        }
     }
     CoUninitialize();
     return rc;

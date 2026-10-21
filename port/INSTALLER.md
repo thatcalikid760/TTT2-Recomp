@@ -63,6 +63,14 @@ Version: `TTT2_VERSION` in CMakeLists (VERSIONINFO, Add or remove programs).
     python -I port\tools\verify_install.py "D:\ttt2_install_test\Tekken Tag Tournament 2"
     -> every game file vs re\game_files_x + re\decrypted\Default_patched_tu3.bin, byte for byte
 
+Update: run the installer over an install (the one Add or remove programs names) and it asks
+Update / Full reinstall / Cancel. Update (`RunUpdate`) needs no disc image or title update: it
+checks `game\tekken.img` is the image this exe was recompiled from (SHA-1) and the game is not
+running, writes the payload to `<install>\update.tmp`, moves each file over the old one, then
+refreshes `uninstall.exe` and the HKLM key (version, size). Game files, shortcuts and
+`%LOCALAPPDATA%\TTT2Recomp` are left alone. Scripted: `ttt2_setup_probe.exe /update [folder]`
+(log next to the exe; with the probe, no HKLM refresh).
+
 Uninstall: `uninstall.exe` (or `/uninstall [/quiet]`). It only deletes a folder that has
 `game\tekken.img` and `steam_api64.dll` (checked again right before deleting) and keeps
 `%LOCALAPPDATA%\TTT2Recomp` unless the box is ticked. **Never tick that box on this PC**: it
