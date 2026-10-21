@@ -55,6 +55,11 @@ Online Player Match runs over Steam: no ports to open, no Xbox LIVE.
   - Host: ONLINE MODE > PLAYER MATCH > create a session. Steam shows you as playing
     "Spacewar" - that is Valve's public test app id this port uses for now; it is expected.
   - Join: ONLINE MODE > PLAYER MATCH > search. Hosts on Steam playing this port are listed.
+  - Discord: while you host a Player Match, Discord shows a joinable party (no Discord login
+    needed, only the Discord app running). Friends can press Join on your profile, or you can
+    invite them from a Discord chat (the + button). If the game is closed, Discord starts it and
+    the join waits until a profile is signed in. Steam's "Join Game" keeps working as well.
+    To turn it off: Enabled=0 in the [Discord] section of settings.ini.
 
 The first time ONLINE MODE is opened the game shows Namco's Online Mode terms; accept them to
 continue. Online leaderboards, World Arena and voice chat are not available.
@@ -74,3 +79,5 @@ Steamworks: steam_api64.dll is (c) Valve Corporation, redistributed under the St
 licence.
 SDL3.dll (native DualShock 4 / DualSense input) is Simple DirectMedia Layer, (c) Sam Lantinga,
 zlib licence (https://libsdl.org).
+discord_partner_sdk.dll (Discord Join) is (c) Discord Inc., distributed with this program under
+the Discord Social SDK Terms.

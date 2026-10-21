@@ -125,6 +125,53 @@ else()
     target_compile_definitions(tekken_recomp PRIVATE TTT2_HAVE_SDL=0)
     message(STATUS "SDL3 not found - native PlayStation pads disabled")
 endif()
+# Discord Join / invite (kernel/discord_presence.cpp): built when the Discord Social SDK sits in
+# tools/discord_social_sdk or tools/DiscordSocialSdk-<version>/discord_social_sdk (user-supplied
+# from the Discord Developer Portal, not part of the repository: the SDK Terms do not allow
+# publishing it). discord_partner_sdk.dll is delay-loaded and copied next to the executable.
+# The Application ID comes from TTT2_DISCORD_APP_ID (this build directory's cache, never the
+# repository) or [Discord] ApplicationId in settings.ini.
+set(TTT2_DISCORD_SDK_DEFAULT "${CMAKE_SOURCE_DIR}/../tools/discord_social_sdk")
+if(NOT EXISTS "${TTT2_DISCORD_SDK_DEFAULT}/include/discordpp.h")
+    file(GLOB TTT2_DISCORD_SDK_FOUND "${CMAKE_SOURCE_DIR}/../tools/DiscordSocialSdk-*/discord_social_sdk")
+    if(TTT2_DISCORD_SDK_FOUND)
+        list(SORT TTT2_DISCORD_SDK_FOUND)
+        list(REVERSE TTT2_DISCORD_SDK_FOUND)
+        list(GET TTT2_DISCORD_SDK_FOUND 0 TTT2_DISCORD_SDK_DEFAULT)
+    endif()
+endif()
+set(TTT2_DISCORD_SDK "${TTT2_DISCORD_SDK_DEFAULT}" CACHE PATH "Discord Social SDK (discord_social_sdk folder)")
+set(TTT2_DISCORD_APP_ID "" CACHE STRING "Discord Application ID built into the game (empty: settings.ini only)")
+set(TTT2_DISCORD_DLL "${TTT2_DISCORD_SDK}/bin/release/discord_partner_sdk.dll")
+if(NOT TTT2_DISCORD_APP_ID MATCHES "^[0-9]*$")
+    message(FATAL_ERROR "TTT2_DISCORD_APP_ID must be the numeric Application ID (or empty)")
+endif()
+if(EXISTS "${TTT2_DISCORD_SDK}/include/discordpp.h" AND EXISTS "${TTT2_DISCORD_SDK}/lib/release/discord_partner_sdk.lib"
+   AND EXISTS "${TTT2_DISCORD_DLL}")
+    set(TTT2_HAVE_DISCORD ON)
+    target_include_directories(tekken_recomp PRIVATE "${TTT2_DISCORD_SDK}/include")
+    target_compile_definitions(tekken_recomp PRIVATE TTT2_HAVE_DISCORD=1)
+    if(TTT2_DISCORD_APP_ID)
+        target_compile_definitions(tekken_recomp PRIVATE TTT2_DISCORD_APP_ID=${TTT2_DISCORD_APP_ID}ull)
+    endif()
+    target_link_libraries(tekken_recomp PRIVATE "${TTT2_DISCORD_SDK}/lib/release/discord_partner_sdk.lib" delayimp)
+    target_link_options(tekken_recomp PRIVATE "/DELAYLOAD:discord_partner_sdk.dll")
+    add_custom_command(TARGET tekken_recomp POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${TTT2_DISCORD_DLL}"
+                "$<TARGET_FILE_DIR:tekken_recomp>/discord_partner_sdk.dll")
+    if(TTT2_DISCORD_APP_ID)
+        message(STATUS "Discord Social SDK: ${TTT2_DISCORD_SDK} (Discord Join enabled, Application ID set)")
+    else()
+        message(STATUS "Discord Social SDK: ${TTT2_DISCORD_SDK} (Discord Join enabled; Application ID from settings.ini)")
+    endif()
+else()
+    set(TTT2_HAVE_DISCORD OFF)
+    target_compile_definitions(tekken_recomp PRIVATE TTT2_HAVE_DISCORD=0)
+    message(STATUS "Discord Social SDK not found - Discord Join disabled")
+endif()
+# The Discord Social SDK Terms let the DLL ship integrated with the game; OFF leaves it out of
+# the installer (the game then simply has no Discord Join).
+option(TTT2_BUNDLE_DISCORD "Bundle discord_partner_sdk.dll in the installer" ON)
 # Emit a linker map so faulting PC RVAs can be resolved to guest functions during bring-up.
 target_link_options(tekken_recomp PRIVATE "/MAP:tekken_recomp.map")
 
@@ -168,6 +215,12 @@ if(TTT2_CRT_DIRS AND TTT2_EDITBIN AND EXISTS "${TTT2_STEAM_DLL}" AND EXISTS "${X
     if(TTT2_HAVE_SDL)
         string(APPEND TTT2_OPTIONAL_PAYLOAD_RC "IDR_SDL3               RCDATA  \"${TTT2_SDL3_DLL}\"\n")
         list(APPEND TTT2_OPTIONAL_PAYLOAD_FILES "${TTT2_SDL3_DLL}")
+    endif()
+    set(TTT2_PAYLOAD_DISCORD OFF)
+    if(TTT2_HAVE_DISCORD AND TTT2_BUNDLE_DISCORD)
+        set(TTT2_PAYLOAD_DISCORD ON)
+        string(APPEND TTT2_OPTIONAL_PAYLOAD_RC "IDR_DISCORD            RCDATA  \"${TTT2_DISCORD_DLL}\"\n")
+        list(APPEND TTT2_OPTIONAL_PAYLOAD_FILES "${TTT2_DISCORD_DLL}")
     endif()
 
     add_custom_command(OUTPUT "${TTT2_GAME_EXE}"
@@ -221,7 +274,8 @@ if(TTT2_CRT_DIRS AND TTT2_EDITBIN AND EXISTS "${TTT2_STEAM_DLL}" AND EXISTS "${X
                               windowscodecs msimg32 uxtheme)
         target_compile_definitions(${variant} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
                                    TTT2_VERSION_STR="${TTT2_VERSION}"
-                                   TTT2_PAYLOAD_SDL3=$<BOOL:${TTT2_HAVE_SDL}>)
+                                   TTT2_PAYLOAD_SDL3=$<BOOL:${TTT2_HAVE_SDL}>
+                                   TTT2_PAYLOAD_DISCORD=$<BOOL:${TTT2_PAYLOAD_DISCORD}>)
         target_compile_options(${variant} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-O2>")
         target_link_options(${variant} PRIVATE /MANIFEST:NO)   # the manifest is in the .rc
         set_property(TARGET ${variant} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")

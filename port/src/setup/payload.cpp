@@ -22,6 +22,9 @@ const Item kItems[] = {
 #if TTT2_PAYLOAD_SDL3
     { IDR_SDL3,            L"SDL3.dll" },            // native DualShock 4 / DualSense input (zlib)
 #endif
+#if TTT2_PAYLOAD_DISCORD
+    { IDR_DISCORD,         L"discord_partner_sdk.dll" },   // Discord Join (Discord Social SDK Terms)
+#endif
     { IDR_README,          L"README.txt" },
 };
 

@@ -7,6 +7,7 @@
 #include "kernel/phys_mirror.h"
 #include "kernel/xma.h"
 #include "kernel/steam_net.h"
+#include "kernel/discord_presence.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <tlhelp32.h>
@@ -451,6 +452,8 @@ int main(int argc, char** argv)
     const std::string installedImage = InstalledLayout(argc);
     std::setvbuf(stderr, nullptr, _IONBF, 0);   // unbuffered: trace survives a hard crash
     StartLogWriter();
+    // Early, so a Discord Join that started the game reaches it (Discord holds it ~3 minutes).
+    discord_presence::Start();
 
     // Timer resolution. Since Windows 10 2004 a process that never calls timeBeginPeriod
     // gets the default ~15.6 ms timer even if other processes asked for more, so every

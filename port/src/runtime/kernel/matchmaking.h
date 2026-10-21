@@ -29,7 +29,11 @@ void Remove(uint64_t id);
 // Sessions of other hosts, newest first, at most `max`.
 std::vector<SessionRecord> List(uint32_t max);
 bool Find(uint64_t id, SessionRecord& out);       // also sessions seen in a list or an invite
-// A friend's "Join Game" through Steam, once: the session to join (then findable by id).
+// A friend's "Join Game" through Steam, or a Join queued by QueueInvite, once: the session to
+// join (then findable by id).
 bool TakeInvite(SessionRecord& out);
+// A session to join found another way (a Discord Join, discord_presence.h): TakeInvite hands it
+// to the game like a Steam "Join Game".
+void QueueInvite(const SessionRecord& record);
 
 } // namespace mm

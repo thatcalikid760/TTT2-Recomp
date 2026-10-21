@@ -4,11 +4,13 @@
 #include "matchmaking.h"
 #include "net_transport.h"
 #include "steam_net.h"
+#include "discord_presence.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -24,6 +26,7 @@ constexpr int kStaleSeconds = 10;
 std::mutex g_mutex;
 std::map<uint64_t, SessionRecord> g_owned;
 std::map<uint64_t, SessionRecord> g_seen;       // listed or invited sessions, for Find
+std::deque<SessionRecord> g_queuedInvites;      // QueueInvite (Discord Join)
 bool g_heartbeat = false;
 
 bool Steam() { return std::strcmp(net::BackendName(), "steam") == 0; }
@@ -151,10 +154,12 @@ void Publish(const SessionRecord& record)
     }
     std::fprintf(stderr, "[mm] published %016llX (slots %u/%u)\n", (unsigned long long)record.id,
                  record.filledPublic, record.maxPublic);
+    discord_presence::HostSession(record);
 }
 
 void Remove(uint64_t id)
 {
+    discord_presence::EndSession(id);
     std::lock_guard l(g_mutex);
     if (!g_owned.erase(id)) return;
     if (Steam()) steamnet::RemoveLobby(id);
@@ -210,8 +215,24 @@ bool Find(uint64_t id, SessionRecord& out)
     return Fresh(file) && Load(file, out);
 }
 
+void QueueInvite(const SessionRecord& record)
+{
+    std::lock_guard l(g_mutex);
+    g_seen[record.id] = record;
+    g_queuedInvites.push_back(record);
+}
+
 bool TakeInvite(SessionRecord& out)
 {
+    {
+        std::lock_guard l(g_mutex);
+        if (!g_queuedInvites.empty())
+        {
+            out = std::move(g_queuedInvites.front());
+            g_queuedInvites.pop_front();
+            return true;
+        }
+    }
     std::vector<uint8_t> bytes;
     if (!steamnet::TakeJoinRequest(bytes) || !Deserialize(bytes, out)) return false;
     std::lock_guard l(g_mutex);

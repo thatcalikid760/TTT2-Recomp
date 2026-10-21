@@ -34,6 +34,7 @@
 #include <map>
 #include <mutex>
 #include <vector>
+#include "discord_presence.h"
 
 extern "C" PPC_FUNC(__imp__sub_82346060);
 extern "C" PPC_FUNC(__imp__sub_82A8C170);
@@ -1088,6 +1089,7 @@ PPC_FUNC(NativeExitGameWindow)
     if (static_cast<int32_t>(ctx.r3.u32) == 0)
     {
         std::fprintf(stderr, "[menu] exit confirmed - quitting\n");
+        discord_presence::Shutdown();
         std::fflush(stderr);
         std::fflush(stdout);
         LogDrain(); TerminateProcess(GetCurrentProcess(), 0);

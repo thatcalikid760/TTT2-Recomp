@@ -42,6 +42,6 @@ bool XLiveCloseHandle(uint32_t handle, uint32_t& status);
 // Starts the packet transport with the socket layer's receiver (xsocket.cpp); idempotent.
 bool XSocketStartTransport();
 
-// Polled from XNotifyGetNext: a Steam "Join Game" becomes XN_LIVE_INVITE_ACCEPTED, answered by
+// Polled from XNotifyGetNext: a Steam "Join Game" or a Discord Join becomes XN_LIVE_INVITE_ACCEPTED, answered by
 // XInviteGetAcceptedInfo with that session.
 void XLivePollInvites();

@@ -12,6 +12,7 @@
 #define IDR_README             107
 #define IDR_INSTALLER_BG       108
 #define IDR_SDL3               109
+#define IDR_DISCORD            110
 
 #define IDD_MAIN               200
 #define IDC_ISO_PATH           201

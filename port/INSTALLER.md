@@ -8,7 +8,9 @@ flow, worker thread, uninstaller guard, `/silent` test mode, payload-as-RCDATA.
 **It ships no game data.** The player supplies the Xbox 360 disc image and Title Update 3; every
 game file is produced on their PC at install time. The installer carries only our files: the
 port exe, steam_api64.dll (Steamworks SDK redistributable), SDL3.dll (zlib licence; native
-DualShock 4 / DualSense input, optional at build time), the four VC++ runtime DLLs the exe imports,
+DualShock 4 / DualSense input, optional at build time), discord_partner_sdk.dll (Discord Join;
+optional at build time, allowed by the Discord Social SDK Terms as part of the game, left out with
+`-DTTT2_BUNDLE_DISCORD=OFF`), the four VC++ runtime DLLs the exe imports,
 the readme, and an original icon.
 
 ## What it asks for

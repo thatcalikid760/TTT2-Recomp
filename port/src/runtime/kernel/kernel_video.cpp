@@ -34,6 +34,7 @@
 #include <unordered_map>
 #include <vector>
 #include <process.h>
+#include "discord_presence.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -181,6 +182,7 @@ static LRESULT CALLBACK GameWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
     {
     case WM_CLOSE:
         std::fprintf(stderr, "[window] closed - quitting\n");
+        discord_presence::Shutdown();
         std::fflush(stderr);
         LogDrain(); TerminateProcess(GetCurrentProcess(), 0);
         return 0;

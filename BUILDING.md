@@ -40,7 +40,14 @@ because some tools choke on spaces and parentheses in paths.
    [libsdl-org/SDL releases](https://github.com/libsdl-org/SDL/releases), unpacked as
    `tools\SDL3-3.4.18` (optional; without it DualShock 4 / DualSense pads are not read natively).
    Another version: `-DTTT2_SDL3=<folder>`.
-7. **Build**: `tools\build_port.cmd build-o1 1 8 ON` (the game, `port\build-o1\tekken_recomp.exe`),
+7. **Discord Social SDK** (optional; Discord Join / invites) from the Discord Developer Portal,
+   unpacked so that `tools\discord_social_sdk\include\discordpp.h` or
+   `tools\DiscordSocialSdk-<version>\discord_social_sdk\include\discordpp.h` exists. It is not
+   redistributable as source, so it never goes in the repository. Your Application ID goes into
+   the build directory's cache, not the repository: add `-DTTT2_DISCORD_APP_ID=<id>` to one
+   configure run (or leave it empty and set `[Discord] ApplicationId` in settings.ini).
+   `-DTTT2_BUNDLE_DISCORD=OFF` leaves `discord_partner_sdk.dll` out of the installer.
+8. **Build**: `tools\build_port.cmd build-o1 1 8 ON` (the game, `port\build-o1\tekken_recomp.exe`),
    then `tools\build_setup.cmd build-o1 8` (the installer, `port\build-o1\setup\ttt2_setup.exe`).
    How the installer works: [port/INSTALLER.md](port/INSTALLER.md).
 
