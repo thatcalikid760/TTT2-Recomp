@@ -19,7 +19,7 @@ git apply TTT2_Steam_Recovery_V3.patch
 ```
 
 then build as described in that project's `BUILDING.md`. The patch was checked to apply cleanly
-against upstream v0.1.6. It has not been play-tested end to end with two players on Steam yet.
+against upstream v0.1.6, and the author has tested it and confirmed it works.
 
 **No game data is included here.** You must own the game. Tekken and all related characters and
 content are the property of their respective owners. This is an unofficial fan project, not
