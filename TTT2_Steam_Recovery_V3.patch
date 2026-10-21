@@ -1,0 +1,86 @@
+diff --git a/port/src/runtime/kernel/steam_bridge.cpp b/port/src/runtime/kernel/steam_bridge.cpp
+--- a/port/src/runtime/kernel/steam_bridge.cpp
++++ b/port/src/runtime/kernel/steam_bridge.cpp
+@@ -94,4 +94,7 @@
+ std::map<uint32_t, std::vector<std::vector<uint8_t>>> g_lists;
+ std::deque<std::vector<uint8_t>> g_joins;
++// Desired lobby state survives the helper process, whose Steam lobby IDs do not.
++std::mutex g_hostedMutex;
++std::map<uint64_t, std::vector<uint8_t>> g_hostedRecords;
+ 
+ void Reader()
+@@ -208,13 +211,25 @@
+     std::lock_guard l(m);
+     if (Running()) return true;
+-    static bool tried = false;
+-    if (tried) return false;
+-    tried = true;
+     if (const char* e = std::getenv("TTT2_STEAM_INPROC"); e && *e == '1')
+     {
+         g_inproc = true;
+         std::fprintf(stderr, "[steam] TTT2_STEAM_INPROC=1: Steam in the game process (controllers will be hidden)\n");
+         return direct::Start(receiver);
+     }
+     g_receiver = receiver;
++    // The old Reader has exited before it clears g_running. Release the old
++    // pipe/process handles before launching a new helper.
++    {
++        std::lock_guard writeLock(g_out.m);
++        if (g_out.h != INVALID_HANDLE_VALUE) CloseHandle(g_out.h);
++        g_out.h = INVALID_HANDLE_VALUE;
++    }
++    if (g_in != INVALID_HANDLE_VALUE) { CloseHandle(g_in); g_in = INVALID_HANDLE_VALUE; }
++    if (g_helper) { CloseHandle(g_helper); g_helper = nullptr; }
++    {
++        std::lock_guard stateLock(g_mutex);
++        g_ready = 0;
++        g_lists.clear();
++        g_joins.clear();
++    }
+     if (!Launch()) return false;
+@@ -227,5 +244,18 @@
+     g_running = true;
+     std::fprintf(stderr, "[steam] Steam runs in helper process %lu (Steam id %016llX)\n", GetProcessId(g_helper),
+                  (unsigned long long)g_local.load());
++    // Republish all desired hosted sessions to the newly initialized helper.
++    // Do not hold g_hostedMutex while writing to the helper pipe.
++    std::map<uint64_t, std::vector<uint8_t>> hosted;
++    {
++        std::lock_guard hostedLock(g_hostedMutex);
++        hosted = g_hostedRecords;
++    }
++    for (const auto& [id, record] : hosted)
++    {
++        uint8_t head[8];
++        Put64(head, id);
++        g_out.Frame(kPublish, head, 8, record.data(), record.size());
++    }
+     return true;
+ }
+@@ -249,5 +278,9 @@
+ void PublishLobby(uint64_t sessionId, const std::vector<uint8_t>& record)
+ {
+     if (g_inproc) return direct::PublishLobby(sessionId, record);
+-    if (!g_running) return;
++    {
++        std::lock_guard l(g_hostedMutex);
++        g_hostedRecords[sessionId] = record;
++    }
++    if (!g_running && !Start(g_receiver)) return;
+     uint8_t head[8];
+@@ -260,4 +294,8 @@
+ void RemoveLobby(uint64_t sessionId)
+ {
+     if (g_inproc) return direct::RemoveLobby(sessionId);
++    {
++        std::lock_guard l(g_hostedMutex);
++        g_hostedRecords.erase(sessionId);
++    }
+     if (!g_running) return;
+@@ -270,5 +308,6 @@
+ std::vector<std::vector<uint8_t>> ListLobbies(int max, int timeoutMs)
+ {
+     if (g_inproc) return direct::ListLobbies(max, timeoutMs);
+     std::vector<std::vector<uint8_t>> out;
++    if (!g_running && !Start(g_receiver)) return out;
+     if (!g_running) return out;
