@@ -177,7 +177,7 @@ target_link_options(tekken_recomp PRIVATE "/MAP:tekken_recomp.map")
 
 # --- Version, icon -------------------------------------------------------------------------
 # One version for the game executable's VERSIONINFO, the installer and Add or remove programs.
-set(TTT2_VERSION "0.1.7")
+set(TTT2_VERSION "0.1.8")
 string(REPLACE "." "," TTT2_VERSION_COMMAS "${TTT2_VERSION},0")
 # In-game updates (updater.cpp): the GitHub repository whose latest release is offered. A release's
 # version is read from its tag or its name and must be higher than TTT2_VERSION to be offered.
