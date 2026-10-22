@@ -36,8 +36,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
+#include <string>
+#include <tuple>
 #include <vector>
+
+uint32_t WatchGuestLrOf(DWORD tid);           // data_watch.cpp (TTT2_GUARD_WATCH)
 
 namespace {
 constexpr uint32_t VIEW_A = 0xA0000000u, VIEW_C = 0xC0000000u, VIEW_SIZE = 0x20000000u;
@@ -192,15 +197,99 @@ void SetGuards(uint32_t first, uint32_t end, bool guard)
     }
 }
 
+// TTT2_GUARD_WATCH=<hex start>:<hex size>[,...] (diagnostics): every CPU access to those A-view
+// pages is logged as a [guard-watch] line (address, read / write, host RVA -> port/tools/rva2sym.py,
+// guest LR) - each new (RVA, LR, kind) once, then a count every 4096 hits. The page's guard is
+// re-armed after the access by single-stepping it.
+std::vector<uint8_t> g_watch;                // per A-view page: watched
+thread_local uint32_t tl_rearm = 0;          // watched page + 1 to re-guard after this step
+
+void ParseWatch()
+{
+    const char* e = std::getenv("TTT2_GUARD_WATCH");
+    if (!e || !*e) return;
+    g_watch.assign(A_PAGES, 0);
+    const std::string all(e);
+    for (size_t at = 0; at < all.size();)
+    {
+        const size_t comma = (std::min)(all.find(',', at), all.size());
+        const std::string item = all.substr(at, comma - at);
+        at = comma + 1;
+        const size_t colon = item.find(':');
+        const uint32_t start = uint32_t(std::strtoul(item.c_str(), nullptr, 16));
+        const uint32_t size = colon == std::string::npos ? PAGE : uint32_t(std::strtoul(item.c_str() + colon + 1, nullptr, 16));
+        if (start < VIEW_A || start >= VIEW_A + VIEW_SIZE || !size) continue;
+        const uint32_t first = (start - VIEW_A) / PAGE;
+        const uint32_t last = (std::min)(A_PAGES, uint32_t((uint64_t(start - VIEW_A) + size + PAGE - 1) / PAGE));
+        DWORD old;
+        for (uint32_t q = first; q < last; ++q)
+        {
+            g_watch[q] = 1;
+            VirtualProtect(g_mirrorBase + VIEW_A + size_t(q) * PAGE, PAGE, PAGE_READWRITE | PAGE_GUARD, &old);
+        }
+        std::fprintf(stderr, "[guard-watch] watching %08X..%08X\n", VIEW_A + first * PAGE, VIEW_A + last * PAGE);
+    }
+}
+
+void WatchHit(const EXCEPTION_POINTERS* ep, uint32_t address)
+{
+    static std::mutex m;
+    static std::map<std::tuple<uint64_t, uint32_t, int>, uint64_t> seen;
+    static uint64_t hits = 0;
+    const uint64_t module = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+    const uint64_t rva = reinterpret_cast<uint64_t>(ep->ExceptionRecord->ExceptionAddress) - module;
+    const int kind = int(ep->ExceptionRecord->ExceptionInformation[0]);    // 0 read, 1 write
+    const uint32_t lr = WatchGuestLrOf(GetCurrentThreadId());
+    std::lock_guard<std::mutex> lock(m);
+    const uint64_t n = ++seen[{ rva, lr, kind }];
+    ++hits;
+    if (n == 1 && seen.size() <= 400)
+    {
+        uint64_t callers[3] = {};
+        CONTEXT walk = *ep->ContextRecord;
+        for (uint64_t& caller : callers)
+        {
+            DWORD64 imageBase = 0;
+            PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(walk.Rip, &imageBase, nullptr);
+            if (!fn) { walk.Rip = *reinterpret_cast<const DWORD64*>(walk.Rsp); walk.Rsp += 8; }
+            else
+            {
+                PVOID handlerData = nullptr;
+                DWORD64 establisher = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, walk.Rip, fn, &walk, &handlerData, &establisher, nullptr);
+            }
+            if (!walk.Rip) break;
+            caller = walk.Rip - module;
+        }
+        std::fprintf(stderr, "[guard-watch] %s %08X pc RVA=0x%llX guest LR=%08X tid %lu callers 0x%llX 0x%llX 0x%llX\n",
+                     kind ? "write" : "read", address, (unsigned long long)rva, lr, GetCurrentThreadId(),
+                     (unsigned long long)callers[0], (unsigned long long)callers[1], (unsigned long long)callers[2]);
+    }
+    if ((hits & 4095) == 0) std::fprintf(stderr, "[guard-watch] %llu hits\n", (unsigned long long)hits);
+}
+
 LONG CALLBACK GuardVeh(EXCEPTION_POINTERS* ep)
 {
     const EXCEPTION_RECORD* r = ep->ExceptionRecord;
+    if (r->ExceptionCode == EXCEPTION_SINGLE_STEP && tl_rearm)
+    {
+        DWORD old;                                       // the watched access is done: arm it again
+        VirtualProtect(g_mirrorBase + VIEW_A + size_t(tl_rearm - 1) * PAGE, PAGE, PAGE_READWRITE | PAGE_GUARD, &old);
+        tl_rearm = 0;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (r->ExceptionCode != STATUS_GUARD_PAGE_VIOLATION || r->NumberParameters < 2 || !g_mirrorBase)
         return EXCEPTION_CONTINUE_SEARCH;
     const uint64_t lo = reinterpret_cast<uint64_t>(g_mirrorBase) + VIEW_A;
     const uint64_t fault = r->ExceptionInformation[1];
     if (fault < lo || fault >= lo + VIEW_SIZE) return EXCEPTION_CONTINUE_SEARCH;
     const uint32_t page = uint32_t((fault - lo) / PAGE);
+    if (!g_watch.empty() && g_watch[page])
+    {
+        WatchHit(ep, VIEW_A + uint32_t(fault - lo));
+        tl_rearm = page + 1;
+        ep->ContextRecord->EFlags |= 0x100;              // trap after this one instruction
+    }
     {
         // Windows has already lifted this page's guard.
         std::lock_guard<std::mutex> lock(g_guardMutex);
@@ -268,6 +357,7 @@ void PhysMirrorInit(uint8_t* base)
     }
     AddVectoredExceptionHandler(1, MirrorVeh);
     g_guarded.assign(A_PAGES, 0);
+    ParseWatch();
     AddVectoredExceptionHandler(1, GuardVeh);
     std::fprintf(stderr, "[phys-guard] A-view resolve guards %s\n", GuardsOn() ? "on" : "off (TTT2_RESOLVE_GUARD=0)");
 }

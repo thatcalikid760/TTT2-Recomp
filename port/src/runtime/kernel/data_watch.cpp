@@ -18,6 +18,13 @@
 
 PPCContext* WatchGuestContextOf(DWORD tid);    // diag_hooks.cpp
 
+// The guest LR of a thread (0 when it runs no guest code): phys_mirror.cpp's TTT2_GUARD_WATCH.
+uint32_t WatchGuestLrOf(DWORD tid)
+{
+    const PPCContext* c = WatchGuestContextOf(tid);
+    return c ? uint32_t(c->lr) : 0;
+}
+
 namespace {
 std::atomic<uint64_t> g_watchHost{ 0 };
 std::mutex g_hitsMutex;

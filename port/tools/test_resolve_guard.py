@@ -31,6 +31,7 @@ CHECKER = r'''
 uint8_t* g_guest = nullptr;
 std::atomic<int> writebacks{0};
 thread_local volatile bool inBackend = false;   // read by the exception handler (as BackendScope)
+uint32_t WatchGuestLrOf(DWORD) { return 0; }   // TTT2_GUARD_WATCH (diagnostics)
 bool GpuHwThreadInBackend() { return inBackend; }
 void PhysUnguard(uint32_t start, uint32_t size);
 // The mock backend: one live resolve [resolveStart, +resolveSize) filled with 0x5A, like Scatter -
@@ -66,6 +67,15 @@ int main(int argc, char** argv) {
     CHECK(VirtualAlloc(g_guest + 0xA0000000u, 0x40000000u, MEM_COMMIT, PAGE_READWRITE));   // A + C views
     PhysMirrorInit(g_guest);
     const uint32_t res = 0xA7515000u, size = 0x30000;   // a 48-page resolve
+    if (off && std::strcmp(argv[1], "watch") == 0) {
+        // TTT2_GUARD_WATCH=A0200000:2000: each access is seen and the page is guarded again after it.
+        CHECK(Guarded(0xA0200000u) && Guarded(0xA0201000u) && !Guarded(0xA0202000u));
+        for (int i = 0; i < 3; ++i) { g_guest[0xA0200010u] = uint8_t(i); CHECK(Guarded(0xA0200000u)); }
+        sink = g_guest[0xA0201020u];
+        CHECK(Guarded(0xA0201000u) && g_guest[0xA0200010u] == 2 && writebacks == 0);
+        std::printf("PASS %u guard-watch checks: logged, re-armed after every access\n", checks);
+        return 0;
+    }
     if (off) {
         PhysGuardResolve(res, size);
         CHECK(!Guarded(res));
@@ -162,6 +172,12 @@ def main():
         exe = compile_one(folder, "guard", CHECKER.replace("@MIRROR@", mirror), [kernel])
         subprocess.run([str(exe)], check=True, timeout=60)
         subprocess.run([str(exe), "off"], check=True, timeout=60, env=dict(os.environ, TTT2_RESOLVE_GUARD="0"))
+        r = subprocess.run([str(exe), "watch"], timeout=60, capture_output=True, text=True,
+                           env=dict(os.environ, TTT2_GUARD_WATCH="A0200000:2000"))
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "[guard-watch] watching A0200000..A0202000" in r.stderr, r.stderr
+        assert r.stderr.count("[guard-watch] write") >= 1 and r.stderr.count("[guard-watch] read") >= 1, r.stderr
+        print(r.stdout, end="")
 
 
 if __name__ == "__main__":

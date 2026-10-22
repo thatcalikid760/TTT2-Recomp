@@ -35,6 +35,7 @@ HARNESS = r'''
 static uint8_t* g_b = nullptr;
 static bool g_gpuOnly = false;                 // a resolve at A0100000..A0120000 not yet in memory
 static std::vector<std::pair<uint32_t, uint32_t>> g_writeBackCalls;
+uint32_t WatchGuestLrOf(DWORD) { return 0; }   // TTT2_GUARD_WATCH (diagnostics)
 bool GpuHwThreadInBackend() { return false; }   // A-view guards: test_resolve_guard.py
 void GpuHwWriteBackRange(uint32_t start, uint32_t size)
 {
