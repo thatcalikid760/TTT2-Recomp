@@ -270,7 +270,9 @@ std::vector<uint32_t> g_labels;             // guest texts, set only around the 
 // The keyboard (XamShowKeyboardUI, kernel_ui.cpp): the queued request, the one on screen, its
 // message (kKeyboardTextId, laid out again into g_kbBlock as the text changes) and the characters
 // typed since the last frame.
-constexpr uint32_t kKeyboardTextId = 0x7F04;
+// Text ids the port supplies: 0x7F01 exit, 0x7F02 name dialog, 0x7F03 message box, 0x7F04 switch
+// profile (menu_doc.cpp retargets the game's texts to 0x7F01 / 0x7F04), 0x7F05 keyboard.
+constexpr uint32_t kKeyboardTextId = 0x7F05;
 std::mutex g_kbMutex;
 std::vector<SysUiKeyboard> g_kbQueue;
 std::vector<uint32_t> g_kbChars;
@@ -1295,6 +1297,12 @@ void RegisterNatives(PPCContext& ctx, uint8_t* base, uint32_t lib)
 // dialogs). The window looks up its button labels right after its message: text 0x3D8 "OK" and
 // 0x3DC "CANCEL" (MEASURED 2026-10-12); for these dialogs they read YES / NO.
 constexpr uint32_t kExitTextId = 0x7F01, kSwitchTextId = 0x7F04, kOkTextId = 0x03D8, kCancelTextId = 0x03DC;
+// The lookup below answers the first id that matches: each text the port supplies needs its own.
+static_assert(sysui::kNameTextId != kExitTextId && sysui::kNameTextId != kSwitchTextId &&
+              sysui::kBoxTextId != kExitTextId && sysui::kBoxTextId != kSwitchTextId &&
+              sysui::kKeyboardTextId != kExitTextId && sysui::kKeyboardTextId != kSwitchTextId &&
+              sysui::kKeyboardTextId != sysui::kNameTextId && sysui::kKeyboardTextId != sysui::kBoxTextId,
+              "port text ids must be distinct");
 std::atomic<int> g_exitLabelsPending{ 0 };
 } // namespace
 
