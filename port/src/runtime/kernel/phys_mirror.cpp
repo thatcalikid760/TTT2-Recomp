@@ -202,7 +202,10 @@ void SetGuards(uint32_t first, uint32_t end, bool guard)
 // guest LR) - each new (RVA, LR, kind) once, then a count every 4096 hits. The page's guard is
 // re-armed after the access by single-stepping it.
 std::vector<uint8_t> g_watch;                // per A-view page: watched
-thread_local uint32_t tl_rearm = 0;          // watched page + 1 to re-guard after this step
+// Watched pages to re-guard after the single step. A stack: a writeback inside the handler can
+// touch watched pages too (a nested fault and step) before the outer instruction completes.
+thread_local uint32_t tl_rearm[16];
+thread_local int tl_rearmCount = 0;
 
 void ParseWatch()
 {
@@ -271,11 +274,12 @@ void WatchHit(const EXCEPTION_POINTERS* ep, uint32_t address)
 LONG CALLBACK GuardVeh(EXCEPTION_POINTERS* ep)
 {
     const EXCEPTION_RECORD* r = ep->ExceptionRecord;
-    if (r->ExceptionCode == EXCEPTION_SINGLE_STEP && tl_rearm)
+    if (r->ExceptionCode == EXCEPTION_SINGLE_STEP && tl_rearmCount)
     {
-        DWORD old;                                       // the watched access is done: arm it again
-        VirtualProtect(g_mirrorBase + VIEW_A + size_t(tl_rearm - 1) * PAGE, PAGE, PAGE_READWRITE | PAGE_GUARD, &old);
-        tl_rearm = 0;
+        DWORD old;                                       // the watched accesses are done: arm them again
+        for (int i = 0; i < tl_rearmCount; ++i)
+            VirtualProtect(g_mirrorBase + VIEW_A + size_t(tl_rearm[i]) * PAGE, PAGE, PAGE_READWRITE | PAGE_GUARD, &old);
+        tl_rearmCount = 0;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (r->ExceptionCode != STATUS_GUARD_PAGE_VIOLATION || r->NumberParameters < 2 || !g_mirrorBase)
@@ -287,7 +291,7 @@ LONG CALLBACK GuardVeh(EXCEPTION_POINTERS* ep)
     if (!g_watch.empty() && g_watch[page])
     {
         WatchHit(ep, VIEW_A + uint32_t(fault - lo));
-        tl_rearm = page + 1;
+        if (tl_rearmCount < 16) tl_rearm[tl_rearmCount++] = page;
         ep->ContextRecord->EFlags |= 0x100;              // trap after this one instruction
     }
     {

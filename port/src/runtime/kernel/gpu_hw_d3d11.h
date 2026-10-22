@@ -882,7 +882,13 @@ public:
     // up to ~15 ms each, MEASURED 2026-10-14). `block` waits in Map instead (the caller's last resort).
     bool WriteBackRange(uint32_t start, uint32_t size, bool block = false, bool fromGuard = false)
     {
-        static const bool trustGuard = [] { const char* e = std::getenv("TTT2_GUARD_TRUST"); return e && *e == '1'; }();
+        // A guard fault proves the range unwritten since the resolve: every CPU write to a guarded page
+        // faults first (and is written back then), and Windows' own writes fail on one. Write watch,
+        // however, reports a page written on its first access of any kind - a read included - when it
+        // was never touched before (MEASURED 2026-10-21: a GPU-only resolve's pages; the CPU's first
+        // read of the custom-character card's 128x304 resolve marked it "written", the writeback was
+        // skipped, the card came out black). TTT2_GUARD_TRUST=0 restores the write-watch check.
+        static const bool trustGuard = [] { const char* e = std::getenv("TTT2_GUARD_TRUST"); return !(e && *e == '0'); }();
         bool pending = false;
         pendingFence_ = 0;
         for (auto& [rs, r] : resolved_)
