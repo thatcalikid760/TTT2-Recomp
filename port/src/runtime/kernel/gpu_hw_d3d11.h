@@ -20,9 +20,11 @@
 #include "display_settings.h"
 #include "phys_mirror.h"
 #include "button_prompts.h"
+#include "voice_chat.h"
 #include <d3d11_1.h>
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
+#include <dxgi1_5.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <array>
@@ -1053,7 +1055,14 @@ public:
             d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; d.BufferCount = buffers;
             d.Scaling = DXGI_SCALING_STRETCH; d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
             d.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-            d.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+            {
+                // V-SYNC OFF presents with tearing allowed, which the swap chain must be made for.
+                ComPtr<IDXGIFactory5> f5;
+                BOOL tearing = FALSE;
+                tearingSupported_ = SUCCEEDED(factory.As(&f5)) &&
+                    SUCCEEDED(f5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing))) && tearing;
+            }
+            d.Flags = SwapChainFlags();
             Check(factory->CreateSwapChainForHwnd(device_.Get(), w, &d, nullptr, nullptr, &swapchain_), "CreateSwapChainForHwnd");
             factory->MakeWindowAssociation(w, DXGI_MWA_NO_ALT_ENTER);       // the window thread owns Alt+Enter
             bufW_ = d.Width; bufH_ = d.Height;
@@ -1090,7 +1099,15 @@ public:
             diagDrainMs_ += ms(c - b).count();
             diagDrainMax_ = (std::max)(diagDrainMax_, ms(c - b).count());
         }
-        HRESULT hr = (toggle_ & 16) ? S_OK : swapchain_->Present(0, noWait ? DXGI_PRESENT_DO_NOT_WAIT : 0);
+        // V-SYNC ON: no tearing - a flip swap chain at sync interval 0 shows the newest frame at each
+        // refresh without blocking; exclusive fullscreen needs interval 1 for that. V-SYNC OFF:
+        // tearing allowed (exclusive fullscreen tears at interval 0 by itself).
+        const bool exclusive = exclusive_.load();
+        const UINT interval = gfx_.vsync && exclusive ? 1 : 0;
+        UINT presentFlags = noWait ? DXGI_PRESENT_DO_NOT_WAIT : 0;
+        if (!gfx_.vsync && !exclusive && tearingSupported_) presentFlags |= DXGI_PRESENT_ALLOW_TEARING;
+        HRESULT hr = (toggle_ & 16) ? S_OK : swapchain_->Present(interval, presentFlags);
+        CountFps();
         const auto t4 = clock::now();
         if (hr == DXGI_ERROR_WAS_STILL_DRAWING) { ++presentHist_[7]; hr = S_OK; }
         Probe("present");
@@ -1252,6 +1269,36 @@ private:
     // owns exclusive fullscreen (entered at the chosen resolution, re-entered only while the
     // window is in the foreground so Alt+Tab is not fought).
     UINT bufW_ = 0, bufH_ = 0;
+    bool tearingSupported_ = false;
+    UINT SwapChainFlags() const
+    {
+        return DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH | (tearingSupported_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u);
+    }
+    // GRAPHICS SETTINGS (display_settings::Graphics), refreshed when the settings change.
+    display_settings::Graphics gfx_;
+    uint32_t gfxGeneration_ = ~0u;
+    void UpdateGraphics()
+    {
+        const uint32_t g = display_settings::Generation();
+        if (g == gfxGeneration_) return;
+        gfxGeneration_ = g;
+        const display_settings::Graphics next = display_settings::GetGraphics();
+        if (next.anisotropy != gfx_.anisotropy) samplers_.clear();     // made again with the new filter
+        gfx_ = next;
+    }
+    // The FPS counter: presents counted over half-second windows.
+    std::chrono::steady_clock::time_point fpsSince_ = std::chrono::steady_clock::now();
+    uint32_t fpsFrames_ = 0, fpsShown_ = 0;
+    void CountFps()
+    {
+        ++fpsFrames_;
+        const auto now = std::chrono::steady_clock::now();
+        const double s = std::chrono::duration<double>(now - fpsSince_).count();
+        if (s < 0.5) return;
+        fpsShown_ = uint32_t(fpsFrames_ / s + 0.5);
+        fpsFrames_ = 0;
+        fpsSince_ = now;
+    }
     std::atomic<bool> exclusive_{ false };
     std::chrono::steady_clock::time_point lastExclusiveTry_{};
     display_settings::Resolution exclusiveRes_{ 0, 0 };     // display mode set for exclusive fullscreen
@@ -1319,18 +1366,139 @@ private:
             backRtvFor_ = nullptr;
             context_->OMSetRenderTargets(0, nullptr, nullptr);
             context_->Flush();
-            const HRESULT hr = swapchain_->ResizeBuffers(0, cw, ch, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH);
+            const HRESULT hr = swapchain_->ResizeBuffers(0, cw, ch, DXGI_FORMAT_UNKNOWN, SwapChainFlags());
             if (SUCCEEDED(hr)) { bufW_ = cw; bufH_ = ch; }
             std::fprintf(stderr, "[gpu-hw] back buffer %ux%u%s\n", cw, ch, SUCCEEDED(hr) ? "" : " (resize failed)");
         }
     }
 
-    // The game image into the back buffer: letterboxed to its own aspect, bilinear, red/blue
-    // exchanged when the stored order differs from the display swizzle, then the guest's gamma
-    // ramp - one pass. Variants: [swap | gamma << 1].
+    // The game image into the back buffer, letterboxed to its own aspect. The first pass exchanges
+    // red / blue when the stored order differs from the display swizzle, applies the guest's gamma
+    // ramp and BRIGHTNESS (variants: [swap | gamma << 1]). GRAPHICS SETTINGS add passes:
+    //   prep (source size) -> FXAA (source size) -> resample to the viewport (an area filter when
+    //   RENDER SCALE / RESOLUTION render above it, bilinear below) -> sharpen (contrast-adaptive,
+    //   after AMD's CAS) -> FPS counter.
+    // With none of them and no downscale, prep draws straight into the viewport (bilinear).
     ComPtr<ID3D11VertexShader> presentVs_;
-    ComPtr<ID3D11PixelShader> presentPs_[4];
+    ComPtr<ID3D11PixelShader> presentPs_[4], fxaaPs_, downsamplePs_, sharpenPs_, fpsPs_, voicePs_;
     ComPtr<ID3D11SamplerState> presentSampler_;
+    ComPtr<ID3D11Buffer> postCb_;
+    struct PostCB { float srcSize[4]; float dstSize[4]; float params[4]; };   // params: brightness exponent, sharpness, fps
+    struct PostTarget { ComPtr<ID3D11Texture2D> tex; ComPtr<ID3D11RenderTargetView> rtv; ComPtr<ID3D11ShaderResourceView> srv; UINT w = 0, h = 0; };
+    PostTarget post_[3];
+    PostTarget& Post(int slot, UINT w, UINT h)
+    {
+        PostTarget& t = post_[slot];
+        if (t.tex && t.w == w && t.h == h) return t;
+        t = {};
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = w; d.Height = h; d.MipLevels = d.ArraySize = 1; d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        Check(device_->CreateTexture2D(&d, nullptr, &t.tex), "CreatePostTarget");
+        Check(device_->CreateRenderTargetView(t.tex.Get(), nullptr, &t.rtv), "CreatePostRtv");
+        Check(device_->CreateShaderResourceView(t.tex.Get(), nullptr, &t.srv), "CreatePostSrv");
+        t.w = w; t.h = h;
+        return t;
+    }
+    ComPtr<ID3D11PixelShader> PostShader(const std::string& body, const char* name)
+    {
+        const std::string header =
+            "Texture2D<float4> src : register(t0); Texture2D<float4> lut : register(t1); SamplerState smp : register(s0);\n"
+            "cbuffer Post : register(b0) { float4 srcSize; float4 dstSize; float4 params; };\n";
+        auto code = Compile(header + body, "ps_5_0", name);
+        ComPtr<ID3D11PixelShader> ps;
+        Check(device_->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &ps), name);
+        return ps;
+    }
+    void MakePostShaders()
+    {
+        // FXAA (the compact "FXAA 2" form): luma edges from the four diagonal neighbours, blended
+        // along the edge direction; the wider blend is rejected when it leaves the local luma range.
+        fxaaPs_ = PostShader(
+            "float L(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
+            "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+            "  float2 t = srcSize.zw;\n"
+            "  float3 m = src.SampleLevel(smp, uv, 0).rgb;\n"
+            "  float nw = L(src.SampleLevel(smp, uv + float2(-1, -1) * t, 0).rgb), ne = L(src.SampleLevel(smp, uv + float2(1, -1) * t, 0).rgb);\n"
+            "  float sw = L(src.SampleLevel(smp, uv + float2(-1, 1) * t, 0).rgb), se = L(src.SampleLevel(smp, uv + float2(1, 1) * t, 0).rgb);\n"
+            "  float lm = L(m), lo = min(lm, min(min(nw, ne), min(sw, se))), hi = max(lm, max(max(nw, ne), max(sw, se)));\n"
+            "  if (hi - lo < max(0.0312, hi * 0.125)) return float4(m, 1);\n"
+            "  float2 dir = float2(-((nw + ne) - (sw + se)), (nw + sw) - (ne + se));\n"
+            "  float reduce = max((nw + ne + sw + se) * (0.25 / 8.0), 1.0 / 128.0);\n"
+            "  dir = clamp(dir / (min(abs(dir.x), abs(dir.y)) + reduce), -8.0, 8.0) * t;\n"
+            "  float3 a = 0.5 * (src.SampleLevel(smp, uv + dir * (1.0 / 3.0 - 0.5), 0).rgb + src.SampleLevel(smp, uv + dir * (2.0 / 3.0 - 0.5), 0).rgb);\n"
+            "  float3 b = a * 0.5 + 0.25 * (src.SampleLevel(smp, uv - dir * 0.5, 0).rgb + src.SampleLevel(smp, uv + dir * 0.5, 0).rgb);\n"
+            "  float lb = L(b);\n"
+            "  return float4((lb < lo || lb > hi) ? a : b, 1); }\n", "ttt2 fxaa ps");
+        // Resample: up to 4 x 4 bilinear taps spread over each output pixel's footprint in the
+        // source (a box filter when downscaling; one tap when upscaling).
+        downsamplePs_ = PostShader(
+            "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+            "  float2 ratio = srcSize.xy / dstSize.xy;\n"
+            "  int2 n = clamp((int2)ceil(ratio - 0.01), 1, 4);\n"
+            "  float2 step = ratio * srcSize.zw / n;\n"
+            "  float3 c = 0;\n"
+            "  for (int y = 0; y < n.y; ++y) for (int x = 0; x < n.x; ++x)\n"
+            "    c += src.SampleLevel(smp, uv + (float2(x, y) + 0.5 - n * 0.5) * step, 0).rgb;\n"
+            "  return float4(c / (n.x * n.y), 1); }\n", "ttt2 resample ps");
+        // Contrast-adaptive sharpening on the cross neighbourhood: strong where the local contrast
+        // is low, gentle on edges that are already hard.
+        sharpenPs_ = PostShader(
+            "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+            "  int2 lim = int2(srcSize.xy) - 1, p = clamp(int2(uv * srcSize.xy), 0, lim);\n"
+            "  float3 e = src.Load(int3(p, 0)).rgb;\n"
+            "  float3 b = src.Load(int3(clamp(p + int2(0, -1), 0, lim), 0)).rgb, h = src.Load(int3(clamp(p + int2(0, 1), 0, lim), 0)).rgb;\n"
+            "  float3 d = src.Load(int3(clamp(p + int2(-1, 0), 0, lim), 0)).rgb, f = src.Load(int3(clamp(p + int2(1, 0), 0, lim), 0)).rgb;\n"
+            "  float3 mn = min(e, min(min(b, h), min(d, f))), mx = max(e, max(max(b, h), max(d, f)));\n"
+            "  float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-4)));\n"
+            "  float3 w = amp * (-1.0 / lerp(8.0, 5.0, params.y));\n"
+            "  return float4(saturate((w * (b + d + f + h) + e) / (1.0 + 4.0 * w)), 1); }\n", "ttt2 sharpen ps");
+        // FPS counter: three 3 x 5 digits (bit 14 = top left) on a dark plate of 13 x 7 cells.
+        fpsPs_ = PostShader(
+            "static const uint font[10] = { 31599, 11415, 29671, 29647, 23497, 31183, 31215, 29257, 31727, 31695 };\n"
+            "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+            "  int2 cell = int2(uv * float2(13, 7)) - 1;\n"
+            "  uint fps = (uint)params.z;\n"
+            "  int digit = cell.x / 4, col = cell.x % 4;\n"
+            "  bool on = false;\n"
+            "  if (cell.x >= 0 && cell.y >= 0 && cell.y < 5 && digit < 3 && col < 3) {\n"
+            "    uint place = digit == 0 ? 100 : digit == 1 ? 10 : 1;\n"
+            "    if (fps >= place || digit == 2) on = ((font[(fps / place) % 10] >> (14 - (cell.y * 3 + col))) & 1) != 0;\n"
+            "  }\n"
+            "  return on ? float4(1, 0.85, 0.1, 1) : float4(0.04, 0.04, 0.04, 1); }\n", "ttt2 fps ps");
+        // Voice chat: a microphone (lit green while our voice is sent) and a speaker (yellow while
+        // somebody is heard, red while F8 mutes everyone), 8 x 8 glyphs on a plate of 20 x 10 cells.
+        // params.z: 1 talking, 2 heard, 4 all muted.
+        voicePs_ = PostShader(
+            "static const uint glyph[16] = { 60, 60, 60, 189, 153, 66, 60, 24, 16, 52, 242, 242, 242, 242, 52, 16 };\n"
+            "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+            "  int2 cell = int2(uv * float2(20, 10)) - 1;\n"
+            "  uint flags = (uint)params.z;\n"
+            "  int icon = cell.x >= 10 ? 1 : 0, col = cell.x - icon * 10;\n"
+            "  if (cell.y < 0 || cell.y > 7 || col < 0 || col > 7) return float4(0.04, 0.04, 0.04, 1);\n"
+            "  if (((glyph[icon * 8 + cell.y] >> (7 - col)) & 1) == 0) return float4(0.04, 0.04, 0.04, 1);\n"
+            "  if (icon == 0) return (flags & 1) ? float4(0.2, 1, 0.3, 1) : float4(0.3, 0.3, 0.3, 1);\n"
+            "  if (flags & 4) return float4(1, 0.2, 0.15, 1);\n"
+            "  return (flags & 2) ? float4(1, 0.85, 0.1, 1) : float4(0.3, 0.3, 0.3, 1); }\n", "ttt2 voice ps");
+    }
+    void PostPass(ID3D11PixelShader* ps, ID3D11ShaderResourceView* srv, ID3D11RenderTargetView* rtv, const D3D11_VIEWPORT& vp,
+                  const PostCB& cb)
+    {
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (SUCCEEDED(context_->Map(postCb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        {
+            std::memcpy(m.pData, &cb, sizeof(cb));
+            context_->Unmap(postCb_.Get(), 0);
+        }
+        context_->OMSetRenderTargets(1, &rtv, nullptr);
+        context_->RSSetViewports(1, &vp);
+        context_->PSSetShader(ps, nullptr, 0);
+        ID3D11ShaderResourceView* v[2] = { srv, gammaSrv_.Get() };
+        context_->PSSetShaderResources(0, 2, v);
+        context_->Draw(3, 0);
+        ID3D11ShaderResourceView* none[2] = { nullptr, nullptr };
+        context_->PSSetShaderResources(0, 2, none);
+    }
     void PresentScaled(ID3D11Texture2D* source, ID3D11Texture2D* back, bool swap)
     {
         if (!presentVs_)
@@ -1345,22 +1513,25 @@ private:
             sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
             sd.MaxLOD = D3D11_FLOAT32_MAX;
             Check(device_->CreateSamplerState(&sd, &presentSampler_), "CreatePresentSampler");
+            D3D11_BUFFER_DESC b{};
+            b.ByteWidth = sizeof(PostCB); b.Usage = D3D11_USAGE_DYNAMIC; b.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            b.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            Check(device_->CreateBuffer(&b, nullptr, &postCb_), "CreatePostCb");
+            MakePostShaders();
         }
         const int variant = (swap ? 1 : 0) | (gammaApplied_ ? 2 : 0);
         ComPtr<ID3D11PixelShader>& ps = presentPs_[variant];
         if (!ps)
         {
-            std::string src =
-                "Texture2D<float4> src : register(t0); Texture2D<float4> lut : register(t1); SamplerState smp : register(s0);\n"
-                "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
-                "  float4 c = src.SampleLevel(smp, uv, 0)";
+            std::string src = "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+                              "  float4 c = src.SampleLevel(smp, uv, 0)";
             src += (variant & 1) ? ".bgra;\n" : ";\n";
             if (variant & 2)
                 src += "  uint3 i = (uint3)round(saturate(c.rgb) * 255.0);\n"
                        "  c.rgb = float3(lut.Load(int3(i.r, 0, 0)).r, lut.Load(int3(i.g, 0, 0)).g, lut.Load(int3(i.b, 0, 0)).b);\n";
-            src += "  return float4(c.rgb, 1); }\n";
-            auto code = Compile(src, "ps_5_0", "ttt2 present ps");
-            Check(device_->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &ps), "CreatePresentPs");
+            src += "  c.rgb = pow(saturate(c.rgb), params.x);\n"     // BRIGHTNESS (exponent 1 = unchanged)
+                   "  return float4(c.rgb, 1); }\n";
+            ps = PostShader(src, "ttt2 present ps");
         }
         if (backRtvFor_ != back)
         {
@@ -1373,31 +1544,86 @@ private:
         const float srcW = 1280.0f, srcH = 720.0f;          // the guest's front buffer size
         const float scale = std::min(float(bufW_) / srcW, float(bufH_) / srcH);
         const float vw = srcW * scale, vh = srcH * scale;
-        D3D11_VIEWPORT vp{ (float(bufW_) - vw) * 0.5f, (float(bufH_) - vh) * 0.5f, vw, vh, 0, 1 };
+        const D3D11_VIEWPORT vp{ std::floor((float(bufW_) - vw) * 0.5f), std::floor((float(bufH_) - vh) * 0.5f), vw, vh, 0, 1 };
+        const UINT outW = std::max(1u, UINT(vw + 0.5f)), outH = std::max(1u, UINT(vh + 0.5f));
         const float black[4] = { 0, 0, 0, 1 };
         ID3D11RenderTargetView* rtv = backRtv_.Get();
         context_->ClearRenderTargetView(rtv, black);
         ComPtr<ID3D11ShaderResourceView> srv;
         Check(device_->CreateShaderResourceView(source, nullptr, &srv), "CreatePresentSrv");
-        context_->OMSetRenderTargets(1, &rtv, nullptr);
+
+        // The game's draws keep their pixel constants bound at b0.
+        ComPtr<ID3D11Buffer> savedCb;
+        context_->PSGetConstantBuffers(0, 1, &savedCb);
         context_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
         context_->OMSetDepthStencilState(nullptr, 0);
-        context_->RSSetViewports(1, &vp);
         context_->RSSetState(raster_.Get());
         D3D11_RECT sc{ 0, 0, LONG(bufW_), LONG(bufH_) };
         context_->RSSetScissorRects(1, &sc);
         context_->IASetInputLayout(nullptr);
         context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         context_->VSSetShader(presentVs_.Get(), nullptr, 0);
-        context_->PSSetShader(ps.Get(), nullptr, 0);
-        ID3D11ShaderResourceView* v[2] = { srv.Get(), gammaSrv_.Get() };
-        context_->PSSetShaderResources(0, 2, v);
-        ID3D11SamplerState* s = presentSampler_.Get();
-        context_->PSSetSamplers(0, 1, &s);
-        context_->Draw(3, 0);
-        ID3D11ShaderResourceView* none[2] = { nullptr, nullptr };
-        context_->PSSetShaderResources(0, 2, none);
-        (void)sd;
+        ID3D11SamplerState* smp = presentSampler_.Get();
+        context_->PSSetSamplers(0, 1, &smp);
+        ID3D11Buffer* cbs = postCb_.Get();
+        context_->PSSetConstantBuffers(0, 1, &cbs);
+
+        PostCB cb{};
+        auto sizes = [&](UINT sw, UINT sh, float dw, float dh) {
+            cb.srcSize[0] = float(sw); cb.srcSize[1] = float(sh); cb.srcSize[2] = 1.0f / float(sw); cb.srcSize[3] = 1.0f / float(sh);
+            cb.dstSize[0] = dw; cb.dstSize[1] = dh; cb.dstSize[2] = 1.0f / dw; cb.dstSize[3] = 1.0f / dh;
+        };
+        static const float kSharpness[4] = { 0.0f, 0.3f, 0.6f, 1.0f };
+        cb.params[0] = std::pow(2.0f, float(5 - gfx_.brightness) / 10.0f);
+        cb.params[1] = kSharpness[std::clamp(gfx_.sharpen, 0, 3)];
+        const bool fxaa = gfx_.fxaa, sharpen = gfx_.sharpen > 0;
+        const bool downscale = float(sd.Width) > vw * 1.01f || float(sd.Height) > vh * 1.01f;
+        if (!fxaa && !sharpen && !downscale)
+        {
+            sizes(sd.Width, sd.Height, vw, vh);
+            PostPass(ps.Get(), srv.Get(), rtv, vp, cb);
+        }
+        else
+        {
+            const D3D11_VIEWPORT full{ 0, 0, float(sd.Width), float(sd.Height), 0, 1 };
+            sizes(sd.Width, sd.Height, float(sd.Width), float(sd.Height));
+            PostTarget& prep = Post(0, sd.Width, sd.Height);
+            PostPass(ps.Get(), srv.Get(), prep.rtv.Get(), full, cb);
+            PostTarget* cur = &prep;
+            if (fxaa)
+            {
+                PostTarget& aa = Post(1, sd.Width, sd.Height);
+                PostPass(fxaaPs_.Get(), cur->srv.Get(), aa.rtv.Get(), full, cb);
+                cur = &aa;
+            }
+            sizes(sd.Width, sd.Height, float(outW), float(outH));
+            if (sharpen)
+            {
+                PostTarget& scaled = Post(2, outW, outH);
+                PostPass(downsamplePs_.Get(), cur->srv.Get(), scaled.rtv.Get(), D3D11_VIEWPORT{ 0, 0, float(outW), float(outH), 0, 1 }, cb);
+                sizes(outW, outH, float(outW), float(outH));
+                PostPass(sharpenPs_.Get(), scaled.srv.Get(), rtv, D3D11_VIEWPORT{ vp.TopLeftX, vp.TopLeftY, float(outW), float(outH), 0, 1 }, cb);
+            }
+            else
+                PostPass(downsamplePs_.Get(), cur->srv.Get(), rtv, vp, cb);
+        }
+        if (gfx_.fpsCounter)
+        {
+            const float cell = std::max(2.0f, std::floor(vh / 200.0f));
+            cb.params[2] = float(std::min(fpsShown_, 999u));
+            PostPass(fpsPs_.Get(), nullptr, rtv, D3D11_VIEWPORT{ vp.TopLeftX + cell * 2, vp.TopLeftY + cell * 2, cell * 13, cell * 7, 0, 1 }, cb);
+        }
+        const uint32_t voice = (voice_chat::LocalTalking() ? 1u : 0u) | (voice_chat::RemoteTalking() ? 2u : 0u) |
+                               (voice_chat::AllMuted() ? 4u : 0u);
+        if (voice)
+        {
+            const float cell = std::max(2.0f, std::floor(vh / 200.0f));
+            cb.params[2] = float(voice);
+            PostPass(voicePs_.Get(), nullptr, rtv,
+                     D3D11_VIEWPORT{ vp.TopLeftX + vw - cell * 22, vp.TopLeftY + cell * 2, cell * 20, cell * 10, 0, 1 }, cb);
+        }
+        ID3D11Buffer* restore = savedCb.Get();
+        context_->PSSetConstantBuffers(0, 1, &restore);
     }
 public:
     bool IsExclusiveFullscreen() const { return exclusive_.load(); }
@@ -1594,7 +1820,13 @@ private:
         ComPtr<ID3D11SamplerState>& s = samplers_[key];
         if (!s)
         {
-            const D3D11_SAMPLER_DESC d = SamplerDesc(info);
+            D3D11_SAMPLER_DESC d = SamplerDesc(info);
+            const int aniso = display_settings::Anisotropies()[size_t(gfx_.anisotropy)];
+            if (aniso > 1 && info[2])                     // TEXTURE FILTERING: the game's linear filtering only
+            {
+                d.Filter = D3D11_FILTER_ANISOTROPIC;
+                d.MaxAnisotropy = UINT(aniso);
+            }
             Check(device_->CreateSamplerState(&d, &s), "CreateSamplerState");
         }
         return s.Get();
@@ -2174,12 +2406,15 @@ private:
     {
         if (const char* e = std::getenv("TTT2_RENDER_SCALE"); e && *e)
             return std::clamp(float(std::atof(e)), 1.0f, 4.0f);
+        // RESOLUTION, times GRAPHICS SETTINGS' RENDER SCALE (supersampling, filtered down when presented).
         const display_settings::Resolution r = display_settings::GetResolution();
-        return std::clamp(std::min(float(r.width) / 1280.0f, float(r.height) / 720.0f), 1.0f, 4.0f);
+        const float extra = float(display_settings::RenderScales()[size_t(display_settings::GetGraphics().renderScale)]) / 100.0f;
+        return std::clamp(std::min(float(r.width) / 1280.0f, float(r.height) / 720.0f) * extra, 1.0f, 4.0f);
     }
     // Follow the RESOLUTION setting (checked once per change of the settings generation).
     void UpdateScale()
     {
+        UpdateGraphics();
         const uint32_t g = display_settings::Generation();
         if (g == scaleGeneration_) return;
         scaleGeneration_ = g;

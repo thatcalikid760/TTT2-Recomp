@@ -35,6 +35,8 @@
 #include <mutex>
 #include <vector>
 #include "discord_presence.h"
+#include "voice_chat.h"
+#include "updater.h"
 
 extern "C" PPC_FUNC(__imp__sub_82346060);
 extern "C" PPC_FUNC(__imp__sub_82A8C170);
@@ -214,9 +216,9 @@ void MenuSound(PPCContext& ctx, uint8_t* base, uint32_t id)
 
 namespace sysui {
 
-enum class Screen { None, Profiles, Name };
+enum class Screen { None, Profiles, Name, Graphics, Voice, Update };
 constexpr int kRows = 9;
-constexpr uint16_t kUp = 0x0001, kDown = 0x0002, kStart = 0x0010, kA = 0x1000, kB = 0x2000;
+constexpr uint16_t kUp = 0x0001, kDown = 0x0002, kLeft = 0x0004, kRight = 0x0008, kStart = 0x0010, kA = 0x1000, kB = 0x2000;
 constexpr uint32_t kNameTextId = 0x7F02;              // the name dialog's message (text lookup hook)
 
 struct Row { std::string label, value, help; };
@@ -369,9 +371,189 @@ void HideDialog(PPCContext& ctx, uint8_t* base)
     sub_8241E7C8(ctx, base);                          // lib::WindowHideDialog()
 }
 
-void Open(Ui& ui, int cursor)
+// ---- Options -> GRAPHICS SETTINGS (display_settings::Graphics): the page's rows, in order.
+enum GraphicsRow { kVsync, kRenderScale, kAntiAliasing, kFiltering, kSharpen, kBrightness, kFps, kDefault, kGraphicsRows };
+void BuildGraphics(Ui& ui)
 {
-    ui.screen = Screen::Profiles;
+    const display_settings::Graphics g = display_settings::GetGraphics();
+    static const char* const sharpen[] = { "OFF", "LOW", "MEDIUM", "HIGH" };
+    const int aniso = display_settings::Anisotropies()[size_t(g.anisotropy)];
+    ui.rows = {
+        { "V-SYNC", g.vsync ? "ON" : "OFF", "ON: no tearing. OFF: lowest latency; the picture may tear." },
+        { "RENDER SCALE", std::to_string(display_settings::RenderScales()[size_t(g.renderScale)]) + "%",
+          "Render above the resolution and scale down for a cleaner image. Demanding." },
+        { "ANTI-ALIASING", g.fxaa ? "FXAA" : "OFF", "FXAA smooths jagged edges on the final image." },
+        { "TEXTURE FILTERING", aniso > 1 ? std::to_string(aniso) + "X ANISOTROPIC" : "STANDARD",
+          "Anisotropic filtering keeps floors and walls sharp at an angle." },
+        { "SHARPENING", sharpen[g.sharpen], "Sharpen the final image." },
+        { "BRIGHTNESS", std::to_string(g.brightness), "Adjust the brightness of the picture." },
+        { "FPS COUNTER", g.fpsCounter ? "ON" : "OFF", "Show frames per second in the corner. The game runs at a fixed 60." },
+        { "DEFAULT", "", "Reset to default settings." },
+    };
+}
+// LEFT / RIGHT (dir -1 / +1; A cycles forward) on a row; DEFAULT resets with A.
+void ChangeGraphics(int row, int dir)
+{
+    display_settings::Graphics g = display_settings::GetGraphics();
+    auto step = [dir](int v, int count) { return (v + dir + count) % count; };
+    switch (row)
+    {
+    case kVsync: g.vsync = !g.vsync; break;
+    case kRenderScale: g.renderScale = step(g.renderScale, int(display_settings::RenderScales().size())); break;
+    case kAntiAliasing: g.fxaa = !g.fxaa; break;
+    case kFiltering: g.anisotropy = step(g.anisotropy, int(display_settings::Anisotropies().size())); break;
+    case kSharpen: g.sharpen = step(g.sharpen, 4); break;
+    case kBrightness: g.brightness = std::clamp(g.brightness + dir, 0, 10); break;
+    case kFps: g.fpsCounter = !g.fpsCounter; break;
+    case kDefault: if (dir > 0) g = {}; break;
+    }
+    display_settings::SetGraphics(g);
+}
+
+// ---- Options -> VOICE CHAT (display_settings::Voice, voice_chat.h): mode, talk key, volume, then
+// the players met this session (A / LEFT / RIGHT mutes or unmutes one).
+enum VoiceRow { kVoiceMode, kVoiceKey, kVoiceVolume, kVoicePlayers };
+std::atomic<bool> g_voiceCapture{ false };               // PUSH-TO-TALK KEY waits for a key
+std::atomic<int> g_voiceKey{ 0 };
+std::vector<uint64_t> g_voicePeers;                      // the player rows' peers, in row order
+void BuildVoice(Ui& ui)
+{
+    const display_settings::Voice v = display_settings::GetVoice();
+    static const char* const modes[] = { "OFF", "OPEN MIC", "PUSH TO TALK" };
+    const bool capturing = g_voiceCapture.load();
+    ui.rows = {
+        { "VOICE CHAT", modes[v.mode], "Talk with players in online lobbies and matches. F8 mutes everyone." },
+        { "PUSH-TO-TALK KEY", capturing ? "PRESS A KEY" : keyboard_keys::KeyName(v.pushToTalkKey),
+          capturing ? "Press the key to hold while talking.   ESC: cancel" : "A: choose the key you hold to talk (PUSH TO TALK)." },
+        { "VOICE VOLUME", std::to_string(v.volume), "How loud other players are." },
+    };
+    g_voicePeers.clear();
+    for (const voice_chat::Player& p : voice_chat::Players())
+    {
+        g_voicePeers.push_back(p.peer);
+        std::string name = p.name;
+        for (char& c : name)                                  // what the game's font draws
+            if (c < 0x20 || c > 0x7E || c == '~') c = '?';
+        if (name.size() > 24) name.resize(24);
+        ui.rows.push_back({ name, p.muted ? "MUTED" : p.talking ? "TALKING" : "ON",
+                            "A: mute or unmute this player. Your microphone is chosen in Steam's voice settings." });
+    }
+    if (g_voicePeers.empty())
+        ui.rows.push_back({ "NO PLAYERS YET", "", "Players from your online lobbies show here, to mute them." });
+}
+void ChangeVoice(int row, int dir)
+{
+    display_settings::Voice v = display_settings::GetVoice();
+    if (row == kVoiceMode) v.mode = (v.mode + dir + 3) % 3;
+    else if (row == kVoiceVolume) v.volume = std::clamp(v.volume + dir, 0, 10);
+    else if (row >= kVoicePlayers && size_t(row - kVoicePlayers) < g_voicePeers.size())
+    {
+        const uint64_t peer = g_voicePeers[size_t(row - kVoicePlayers)];
+        display_settings::SetVoiceMuted(peer, !display_settings::IsVoiceMuted(peer));
+        return;
+    }
+    display_settings::SetVoice(v);
+}
+
+// ---- Options -> UPDATES (updater.h): this build's version, the latest release's, CHECK FOR UPDATES
+// and DOWNLOAD AND INSTALL. Opening the page checks; each answer is told in a message box (a newer
+// release asks to download it; once downloaded, asks to install - the game then closes and starts
+// again). Message box answers set g_updateAction, done on the next frame (a box cannot open
+// another from its own answer).
+enum UpdateRow { kUpdateCurrent, kUpdateLatest, kUpdateCheck, kUpdateInstall };
+std::atomic<int> g_updateAction{ 0 };                    // 1 download, 2 install
+updater::State g_updateTold = updater::State::Idle;       // the last state a message box reported
+void BuildUpdate(Ui& ui)
+{
+    const updater::Status st = updater::Get();
+    using S = updater::State;
+    const std::string latest = st.state == S::Checking ? "CHECKING..." : st.latest.empty() ? "-" : st.latest;
+    std::string status, install;
+    switch (st.state)
+    {
+    case S::Idle: break;
+    case S::Checking: status = "CHECKING..."; break;
+    case S::UpToDate: status = "UP TO DATE"; break;
+    case S::Available: status = "UPDATE AVAILABLE"; break;
+    case S::Failed: status = "FAILED"; break;
+    case S::Downloading: status = "UPDATE AVAILABLE"; install = "DOWNLOADING " + std::to_string(st.percent) + "%"; break;
+    case S::Downloaded: status = "UPDATE AVAILABLE"; install = "READY"; break;
+    }
+    std::string checkHelp = "A: check again. Updates come from github.com/" + updater::Repo() + ".";
+    if (st.state == S::Failed && !st.error.empty()) checkHelp = "Could not check: " + st.error + ".";
+    ui.rows = {
+        { "INSTALLED VERSION", updater::CurrentVersion(), "The version you are playing." },
+        { "LATEST RELEASE", latest, "The newest version published on GitHub." },
+        { "CHECK FOR UPDATES", status, checkHelp },
+        { "DOWNLOAD AND INSTALL", install, "A: download the newest version and install it. The game restarts afterwards." },
+    };
+}
+void QuitForUpdate()
+{
+    std::fprintf(stderr, "[menu] quitting for the update\n");
+    discord_presence::Shutdown();
+    std::fflush(stderr);
+    std::fflush(stdout);
+    LogDrain(); TerminateProcess(GetCurrentProcess(), 0);
+}
+void UpdateBox(const std::string& text, std::vector<std::string> buttons, int action)
+{
+    SysUiMessageBox box;
+    box.text = text;
+    box.buttons = std::move(buttons);
+    box.cancel = int(box.buttons.size()) - 1;
+    box.done = [action](int choice) { if (choice == 0 && action) g_updateAction = action; };
+    SysUiShowMessageBox(std::move(box));
+}
+void ConfirmInstall(const updater::Status& st)
+{
+    if (!updater::CanInstall())
+    {
+        UpdateBox("Version " + st.latest + " is downloaded, but this copy of the game\nis not an installed one, so it cannot be updated here.",
+                  { "OK" }, 0);
+        return;
+    }
+    UpdateBox("Version " + st.latest + " is ready to install.\n\nThe game closes, Windows asks for permission,\nand the game starts again when the update is done.",
+              { "INSTALL", "LATER" }, 2);
+}
+// Every frame on the page: the actions chosen in message boxes, and a box for each new answer.
+void UpdateFrame()
+{
+    using S = updater::State;
+    const int action = g_updateAction.exchange(0);
+    if (action == 1) updater::Download();
+    if (action == 2)
+    {
+        std::string error;
+        if (updater::Install(error)) { QuitForUpdate(); return; }
+        UpdateBox("The update could not be started:\n" + error, { "OK" }, 0);
+    }
+    const updater::Status st = updater::Get();
+    if (st.state == g_updateTold) return;
+    bool shown = true;
+    switch (st.state)
+    {
+    case S::UpToDate:
+        UpdateBox(std::string("You are already on the latest update.\n\nInstalled: ") + updater::CurrentVersion() +
+                  (st.latest.empty() ? "" : "\nLatest release: " + st.latest), { "OK" }, 0);
+        break;
+    case S::Available:
+        UpdateBox("Version " + st.latest + " is available.\nYou have " + updater::CurrentVersion() + ".\n\nDownload and install it now?",
+                  { "YES", "NO" }, 1);
+        break;
+    case S::Failed:
+        UpdateBox("The update failed:\n" + st.error + ".", { "OK" }, 0);
+        break;
+    case S::Downloaded: ConfirmInstall(st); break;
+    default: shown = false; break;
+    }
+    (void)shown;
+    g_updateTold = st.state;
+}
+
+void Open(Ui& ui, int cursor, Screen screen = Screen::Profiles)
+{
+    ui.screen = screen;
     ui.cursor = cursor;
     ui.setupFrames = 1;
     ui.shown.clear();
@@ -397,10 +579,34 @@ void SignInAndClose(PPCContext& ctx, uint8_t* base, Ui& ui, int index)
     Close(ctx, base, ui, true);                          // and the title takes START
 }
 
-void DrawCursor(PPCContext& ctx, uint8_t* base, int count, int cursor, bool force);
+void DrawCursor(PPCContext& ctx, uint8_t* base, int count, int cursor, bool force, const std::string& icon);
+// The Options room behind the Options pages: each page's OnFocus requests the menu background
+// lumen into slot 3 and plays its option_bg label (MEASURED 2026-10-22: lib::MenuLumenRequest(3,
+// "lumen_main_menu_bg.lm", "lumen_main_menu_bg.nut", 0, 0, 0), impl sub_8256FDA8, C strings; then
+// lib::MenuIFLumenMoviePlayFromLabel("bg_all", "option_bg", false)). The port's own pages have no
+// OnFocus, so they do the same when they come up.
+void OptionsBackground(PPCContext& ctx, uint8_t* base)
+{
+    {
+        GuestFrame frame(ctx, base, 0x100);
+        ctx.r3.u64 = 3;
+        ctx.r4.u64 = GuestStr(base, "lumen_main_menu_bg.lm");
+        ctx.r5.u64 = GuestStr(base, "lumen_main_menu_bg.nut");
+        ctx.r6.u64 = 0; ctx.r7.u64 = 0; ctx.r8.u64 = 0;
+        sub_8256FDA8(ctx, base);
+    }
+    GuestFrame frame(ctx, base, 0x100);
+    ctx.r3.u64 = GuestStr(base, "bg_all");
+    ctx.r4.u64 = GuestStr(base, "option_bg");
+    ctx.r5.u64 = 0;
+    sub_8256D578(ctx, base);                          // lib::MenuIFLumenMoviePlayFromLabel
+}
 void Draw(PPCContext& ctx, uint8_t* base, Ui& ui)
 {
-    BuildProfiles(ui);
+    if (ui.screen == Screen::Graphics) BuildGraphics(ui);
+    else if (ui.screen == Screen::Voice) BuildVoice(ui);
+    else if (ui.screen == Screen::Update) BuildUpdate(ui);
+    else BuildProfiles(ui);
     const int count = std::clamp(int(ui.rows.size()), 2, kRows);
     ui.rows.resize(size_t(count), Row{ "-", "", "-" });
     ui.cursor = std::clamp(ui.cursor, 0, count - 1);
@@ -420,6 +626,7 @@ void Draw(PPCContext& ctx, uint8_t* base, Ui& ui)
         // As Display Settings' OnFocus does: no large icon (IFMainMenuL would show its first,
         // the globe), and the bottom bar scrolls the game's tips.
         MenuMovieVisible(ctx, base, "rmc_icon_menu_L", false);
+        if (ui.screen != Screen::Profiles) OptionsBackground(ctx, base);
         MenuTelopTarget(ctx, base, "StaticTelopSysMenu" + std::to_string(count));
     }
     const std::string n = std::to_string(count) + "_";
@@ -437,7 +644,11 @@ void Draw(PPCContext& ctx, uint8_t* base, Ui& ui)
     ui.shown = ui.rows;
     if (ui.cursor != ui.shownCursor)
     {
-        DrawCursor(ctx, base, count, ui.cursor, ui.shownCursor < 0);
+        // Select Profile shows the main menu's PROFILE icon, GRAPHICS SETTINGS Display Settings' monitor.
+        DrawCursor(ctx, base, count, ui.cursor, ui.shownCursor < 0,
+                   ui.screen == Screen::Graphics || ui.screen == Screen::Update ? "icon_s_046"
+                   : ui.screen == Screen::Voice                                  ? "icon_s_000"
+                                                                                 : "icon_s_006");
         ui.shownCursor = ui.cursor;
     }
 }
@@ -445,26 +656,34 @@ void Draw(PPCContext& ctx, uint8_t* base, Ui& ui)
 // The cursor as the interface script global::IFMainMenuL_Cursor / _CursorSet draws it (menus get no
 // input on the title, so their OnTrigger never runs): the selection bar, the row icons (the
 // selected one lit), and only the selected row's help text.
-void DrawCursor(PPCContext& ctx, uint8_t* base, int count, int cursor, bool force)
+void DrawCursor(PPCContext& ctx, uint8_t* base, int count, int cursor, bool force, const std::string& icon)
 {
     const std::string n = std::to_string(count);
     MenuSetCursor(ctx, base, "MenuSysMenu" + n, cursor);
     MenuMoviePlay(ctx, base, "amc_menu_bar_sentaku_L", "menu_bar_sentaku_solo_" + Two(cursor + 1), force);
     for (int i = 0; i < count; ++i)
     {
-        MenuMoviePlay(ctx, base, "mc_icon_menu_S_L_" + Two(i + 1), i == cursor ? "icon_s_006" : "icon_s_006_x", force);
+        MenuMoviePlay(ctx, base, "mc_icon_menu_S_L_" + Two(i + 1), i == cursor ? icon : icon + "_x", force);
         const std::string help = "StaticSysMenu" + n + "_0" + std::to_string(i + 1);
         MenuTextHide(ctx, base, help, i != cursor);
         MenuTickCount(ctx, base, help, 0);
     }
 }
 
-// Pressed-this-frame buttons, with auto-repeat for UP / DOWN (400 ms, then every 90 ms).
+// lib::MenuGetCurrentFrameName.
+std::string CurrentFrameName(PPCContext& ctx, uint8_t* base)
+{
+    GuestFrame frame(ctx, base, 0x100);
+    sub_8256C100(ctx, base);
+    return GuestString(base, ctx.r3.u32, 64);
+}
+
+// Pressed-this-frame buttons, with auto-repeat for the directions (400 ms, then every 90 ms).
 uint16_t Pressed(Ui& ui)
 {
     const uint16_t now = HostControllerButtons();
     uint16_t pressed = now & ~ui.prev;
-    const uint16_t dirs = now & (kUp | kDown);
+    const uint16_t dirs = now & (kUp | kDown | kLeft | kRight);
     const int64_t t = NowMs();
     if (dirs && dirs == ui.repeatKey && t >= ui.repeatAt) { pressed |= dirs; ui.repeatAt = t + 90; }
     else if (dirs != ui.repeatKey) { ui.repeatKey = dirs; ui.repeatAt = t + 400; }
@@ -742,6 +961,23 @@ void Frame(PPCContext& ctx, uint8_t* base)
     }
     if (ui.screen == Screen::None)
     {
+        const std::string current = CurrentFrameName(ctx, base);
+        if (current == "FrameGraphicsSettings" || current == "FrameVoiceSettings" || current == "FrameUpdates")
+        {
+            // Options -> GRAPHICS SETTINGS / VOICE CHAT / UPDATES played Options out and switched to
+            // its empty frame.
+            const Screen screen = current == "FrameGraphicsSettings" ? Screen::Graphics
+                                  : current == "FrameVoiceSettings"  ? Screen::Voice
+                                                                     : Screen::Update;
+            Open(ui, 0, screen);
+            if (screen == Screen::Update)
+            {
+                g_updateTold = updater::State::Checking;         // tell this check's answer
+                updater::Check();
+            }
+            std::fprintf(stderr, "[sys-ui] %s\n", current.c_str());
+            return;
+        }
         if (g_switchProfile.load() && TitleLogo())
         {
             // SWITCH PROFILE: the game is back on the title; the profile signs out here (not in
@@ -773,6 +1009,88 @@ void Frame(PPCContext& ctx, uint8_t* base)
     {
         std::lock_guard l(g_charMutex);
         chars.swap(g_chars);
+    }
+    if (ui.screen == Screen::Voice && g_voiceCapture.load())
+    {
+        // PUSH-TO-TALK KEY: the next key pressed (ESC, or a pad's B, cancels). The keys held then
+        // count as pressed only once they are let go.
+        const int vk = g_voiceKey.exchange(0);
+        bool done = (pressed & kB) != 0;
+        if (vk && vk != VK_ESCAPE && keyboard_keys::Assignable(vk))
+        {
+            display_settings::Voice v = display_settings::GetVoice();
+            v.pushToTalkKey = vk;
+            display_settings::SetVoice(v);
+            MenuSound(ctx, base, kSoundDecide);
+            done = true;
+        }
+        else if (vk == VK_ESCAPE) done = true;
+        if (done)
+        {
+            g_voiceCapture = false;
+            ui.prev = 0xFFFF;
+        }
+        Draw(ctx, base, ui);
+        return;
+    }
+    if ((ui.screen == Screen::Graphics || ui.screen == Screen::Voice || ui.screen == Screen::Update) && g_boxOwns.load())
+    {
+        Draw(ctx, base, ui);                                 // a message box has the controller
+        return;
+    }
+    if (ui.screen == Screen::Update) UpdateFrame();
+    if (ui.screen == Screen::Update && (pressed & (kA | kStart)) && !(pressed & (kUp | kDown)))
+    {
+        using S = updater::State;
+        const updater::Status st = updater::Get();
+        MenuSound(ctx, base, kSoundDecide);
+        if (ui.cursor == kUpdateCheck) { g_updateTold = S::Checking; updater::Check(); }
+        else if (ui.cursor == kUpdateInstall)
+        {
+            if (st.state == S::Available || (st.state == S::Failed && !st.latest.empty())) updater::Download();
+            else if (st.state == S::Downloaded) ConfirmInstall(st);
+            else if (st.state == S::UpToDate) g_updateTold = S::Idle;   // tell it again
+            else if (st.state != S::Checking && st.state != S::Downloading) { g_updateTold = S::Checking; updater::Check(); }
+        }
+        Draw(ctx, base, ui);
+        return;
+    }
+    if (ui.screen == Screen::Graphics || ui.screen == Screen::Voice || ui.screen == Screen::Update)
+    {
+        const bool graphics = ui.screen == Screen::Graphics;
+        if (ui.settle > 0 && --ui.settle == 0) ui.shownCursor = -1;
+        const int rows = int(ui.rows.size());
+        if (pressed & (kUp | kDown))
+        {
+            ui.cursor = (ui.cursor + ((pressed & kUp) ? rows - 1 : 1)) % rows;
+            MenuSound(ctx, base, kSoundCursor);
+        }
+        else if ((pressed & (kLeft | kRight)) && ui.screen != Screen::Update && (graphics ? ui.cursor != kDefault : ui.cursor != kVoiceKey))
+        {
+            if (graphics) ChangeGraphics(ui.cursor, (pressed & kLeft) ? -1 : 1);
+            else ChangeVoice(ui.cursor, (pressed & kLeft) ? -1 : 1);
+            MenuSound(ctx, base, kSoundCursor);
+        }
+        else if (pressed & (kA | kStart))
+        {
+            if (graphics) ChangeGraphics(ui.cursor, 1);
+            else if (ui.cursor == kVoiceKey) { g_voiceKey = 0; g_voiceCapture = true; }
+            else ChangeVoice(ui.cursor, 1);
+            MenuSound(ctx, base, kSoundDecide);
+        }
+        else if (pressed & kB)
+        {
+            // Back to Options (its menu kept its cursor on GRAPHICS SETTINGS).
+            MenuSound(ctx, base, kSoundCancel);
+            SwitchFrame(ctx, base, "FrameMode007-01");
+            ui.screen = Screen::None;
+            ui.frameRows = 0;
+            ui.releasing = true;
+            ui.continueAfter = false;
+            return;
+        }
+        Draw(ctx, base, ui);
+        return;
     }
     if (ui.screen == Screen::Profiles)
     {
@@ -1147,10 +1465,11 @@ bool SysUiOwnsInput()
 {
     return sysui::g_owns.load() || sysui::g_boxOwns.load() || sysui::g_kbOwns.load() || keyui::g_capture.load();
 }
-bool SysUiKeyCaptureActive() { return keyui::g_capture.load(); }
+bool SysUiKeyCaptureActive() { return keyui::g_capture.load() || sysui::g_voiceCapture.load(); }
 uint16_t SysUiGameButtonMask() { return keyui::g_gameMask.load(); }
 void SysUiOnKey(int vk)
 {
+    if (sysui::g_voiceCapture.load()) { sysui::g_voiceKey = vk; return; }
     if (!keyui::g_capture.load()) return;
     std::lock_guard l(keyui::g_keyMutex);
     if (keyui::g_keys.size() < 16) keyui::g_keys.push_back(vk);
@@ -1559,3 +1878,4 @@ PPC_FUNC(sub_82A8C170)
     }
     __imp__sub_82A8C170(ctx, base);
 }
+

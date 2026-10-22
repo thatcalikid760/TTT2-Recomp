@@ -8,9 +8,11 @@
 //
 // Frames on both pipes: u32 size (type + payload), u8 type, payload; integers little-endian.
 //   game -> helper: SEND u64 peer, u8 reliable, data | PUBLISH u64 session, record |
-//                   REMOVE u64 session | LIST u32 request, i32 max, i32 timeoutMs
+//                   REMOVE u64 session | LIST u32 request, i32 max, i32 timeoutMs |
+//                   VOICE_RECORD u8 on | VOICE_PEERS n x u64
 //   helper -> game: READY u8 ok, u64 steamId | RECV u64 peer, u8 reliable, data |
-//                   LIST_RESULT u32 request, u32 n, n x (u32 size, record) | JOIN record
+//                   LIST_RESULT u32 request, u32 n, n x (u32 size, record) | JOIN record |
+//                   VOICE_PCM u64 peer, u32 rate, i16 samples | VOICE_TALK u8 on | VOICE_NAME u64 peer, chars
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <io.h>
@@ -29,7 +31,8 @@
 namespace steamnet {
 namespace {
 
-enum : uint8_t { kSend = 1, kPublish = 2, kRemove = 3, kList = 4, kReady = 101, kRecv = 102, kListResult = 103, kJoin = 104 };
+enum : uint8_t { kSend = 1, kPublish = 2, kRemove = 3, kList = 4, kVoiceRecord = 5, kVoicePeers = 6,
+                 kReady = 101, kRecv = 102, kListResult = 103, kJoin = 104, kVoicePcm = 105, kVoiceTalk = 106, kVoiceName = 107 };
 constexpr uint32_t kMaxFrame = 16u << 20;
 
 void Put32(uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); }
@@ -97,6 +100,11 @@ bool g_inproc = false;                          // TTT2_STEAM_INPROC=1
 std::atomic<bool> g_running{ false };
 std::atomic<uint64_t> g_local{ 0 };
 Receiver g_receiver = nullptr;
+VoiceHandlers g_voice;
+// The voice state the game wants, sent again to a restarted helper.
+std::mutex g_voiceMutex;
+bool g_voiceRecord = false;
+std::vector<uint64_t> g_voicePeers;
 HANDLE g_in = INVALID_HANDLE_VALUE;             // from the helper
 HANDLE g_helper = nullptr;
 std::mutex g_mutex;
@@ -147,6 +155,19 @@ void Reader()
         {
             std::lock_guard l(g_mutex);
             g_joins.push_back(p);
+        }
+        else if (type == kVoicePcm && p.size() >= 12)
+        {
+            if (g_voice.pcm)
+                g_voice.pcm(Get64(p.data()), reinterpret_cast<const int16_t*>(p.data() + 12), (p.size() - 12) / 2, Get32(p.data() + 8));
+        }
+        else if (type == kVoiceTalk && p.size() >= 1)
+        {
+            if (g_voice.talking) g_voice.talking(p[0] != 0);
+        }
+        else if (type == kVoiceName && p.size() >= 8)
+        {
+            if (g_voice.name) g_voice.name(Get64(p.data()), std::string(p.begin() + 8, p.end()));
         }
     }
     const bool wasUp = g_running.load();
@@ -289,7 +310,47 @@ bool Start(Receiver receiver)
         Put64(head, id);
         g_out.Frame(kPublish, head, 8, record.data(), record.size());
     }
+    bool record;
+    std::vector<uint64_t> peers;
+    {
+        std::lock_guard voiceLock(g_voiceMutex);
+        record = g_voiceRecord;
+        peers = g_voicePeers;
+    }
+    VoicePeers(peers);
+    VoiceRecord(record);
     return true;
+}
+
+void VoiceSetHandlers(const VoiceHandlers& handlers)
+{
+    g_voice = handlers;
+    direct::VoiceSetHandlers(handlers);                   // TTT2_STEAM_INPROC=1
+}
+
+void VoiceRecord(bool on)
+{
+    {
+        std::lock_guard l(g_voiceMutex);
+        g_voiceRecord = on;
+    }
+    if (g_inproc) return direct::VoiceRecord(on);
+    if (!g_running) return;
+    const uint8_t b = on ? 1 : 0;
+    g_out.Frame(kVoiceRecord, &b, 1);
+}
+
+void VoicePeers(const std::vector<uint64_t>& peers)
+{
+    {
+        std::lock_guard l(g_voiceMutex);
+        g_voicePeers = peers;
+    }
+    if (g_inproc) return direct::VoicePeers(peers);
+    if (!g_running) return;
+    std::vector<uint8_t> body(peers.size() * 8);
+    for (size_t i = 0; i < peers.size(); ++i) Put64(body.data() + i * 8, peers[i]);
+    g_out.Frame(kVoicePeers, body.data(), body.size());
 }
 
 bool Running() { return g_inproc ? direct::Running() : g_running.load(); }
@@ -381,6 +442,20 @@ int RunBridge()
         head[8] = reliable ? 1 : 0;
         g_out.Frame(kRecv, head, 9, data, size);
     });
+    VoiceHandlers voice;
+    voice.pcm = [](uint64_t peer, const int16_t* samples, size_t count, uint32_t rate) {
+        uint8_t head[12];
+        Put64(head, peer);
+        Put32(head + 8, rate);
+        g_out.Frame(kVoicePcm, head, 12, samples, count * 2);
+    };
+    voice.talking = [](bool on) { const uint8_t b = on ? 1 : 0; g_out.Frame(kVoiceTalk, &b, 1); };
+    voice.name = [](uint64_t peer, const std::string& name) {
+        uint8_t head[8];
+        Put64(head, peer);
+        g_out.Frame(kVoiceName, head, 8, name.data(), name.size());
+    };
+    direct::VoiceSetHandlers(voice);
     uint8_t ready[9] = { uint8_t(ok ? 1 : 0) };
     Put64(ready + 1, ok ? direct::LocalId() : 0);
     g_out.Frame(kReady, ready, 9);
@@ -403,6 +478,14 @@ int RunBridge()
             direct::PublishLobby(Get64(p.data()), std::vector<uint8_t>(p.begin() + 8, p.end()));
         else if (type == kRemove && p.size() >= 8)
             direct::RemoveLobby(Get64(p.data()));
+        else if (type == kVoiceRecord && p.size() >= 1)
+            direct::VoiceRecord(p[0] != 0);
+        else if (type == kVoicePeers)
+        {
+            std::vector<uint64_t> peers(p.size() / 8);
+            for (size_t i = 0; i < peers.size(); ++i) peers[i] = Get64(p.data() + i * 8);
+            direct::VoicePeers(peers);
+        }
         else if (type == kList && p.size() >= 12)
         {
             const uint32_t request = Get32(p.data());

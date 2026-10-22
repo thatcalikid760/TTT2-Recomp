@@ -282,7 +282,8 @@ void XtalResizeArrays(std::string& blob, std::initializer_list<uint8_t> consts, 
 // One more row in a straight-line OnLoad's icon arrays: the small-icon array gets `icon` (a new
 // string constant), the large-icon array a copy of its last element. Arrays as above; the
 // constant table ends the blob: u16 count (entry 0 is null), then 0B + u32 length + text each.
-void XtalAppendIconRow(std::string& blob, uint8_t lastSmall, uint8_t large, const std::string& icon)
+// Returns the new constant's index (the next row's `lastSmall`).
+uint8_t XtalAppendIconRow(std::string& blob, uint8_t lastSmall, uint8_t large, const std::string& icon)
 {
     const auto* b = reinterpret_cast<const uint8_t*>(blob.data());
     const uint32_t codeSize = Be32(b, blob.size(), 8);
@@ -314,10 +315,13 @@ void XtalAppendIconRow(std::string& blob, uint8_t lastSmall, uint8_t large, cons
     std::string head = blob.substr(0, 8);
     PutBe32(head, uint32_t(code.size()));
     blob = head + code + tail;
+    return k;
 }
 
 void AddSystemFrames(Doc& d);
-void AddSwitchProfile(Doc& d);
+uint8_t AddSwitchProfile(Doc& d);
+uint8_t AddHostPage(Doc& d, uint8_t lastSmall, int row, const char* label, const char* help, const char* icon,
+                    const char* frameName);
 void AddKeyboardMode(Doc& d);
 void AddInputDelay(Doc& d);
 
@@ -430,12 +434,40 @@ void Edit(Doc& d, const PcLists& lists, std::string* note)
         top.insert(top.begin() + std::ptrdiff_t(at) + 1, std::move(dialog));
     }
 
-    AddSwitchProfile(d);
+    const uint8_t switchIcon = AddSwitchProfile(d);
+    // GRAPHICS SETTINGS edits a copy: if the Options page is not as measured, only it is left out.
+    Doc graphics = d;
+    uint8_t lastIcon = switchIcon;
+    try
+    {
+        lastIcon = AddHostPage(graphics, lastIcon, 7, "GRAPHICS SETTINGS", "V-Sync, render scale, anti-aliasing, filtering and more.",
+                               "icon_s_046", "FrameGraphicsSettings");
+        d = std::move(graphics);
+    }
+    catch (const Fail& e) { if (note) *note = std::string("Options GRAPHICS SETTINGS left out: ") + e.what(); }
+    // And VOICE CHAT after it (the main menu's ONLINE MODE globe).
+    Doc voice = d;
+    try
+    {
+        lastIcon = AddHostPage(voice, lastIcon, 8, "VOICE CHAT", "Open mic or push to talk online, and muting players.",
+                               "icon_s_000", "FrameVoiceSettings");
+        d = std::move(voice);
+    }
+    catch (const Fail& e) { if (note) *note += std::string(note->empty() ? "" : "; ") + "Options VOICE CHAT left out: " + e.what(); }
+    // And UPDATES (Display Settings' monitor icon).
+    Doc updates = d;
+    try
+    {
+        AddHostPage(updates, lastIcon, 9, "UPDATES", "Check for a newer version of the game and install it.", "icon_s_046",
+                    "FrameUpdates");
+        d = std::move(updates);
+    }
+    catch (const Fail& e) { if (note) *note += std::string(note->empty() ? "" : "; ") + "Options UPDATES left out: " + e.what(); }
     AddSystemFrames(d);
     // KEYBOARD edits a copy: if the screen is not as measured, only that part is left out.
     Doc keyboard = d;
     try { AddKeyboardMode(keyboard); d = std::move(keyboard); }
-    catch (const Fail& e) { if (note) *note = std::string("Controller Setup KEYBOARD mode left out: ") + e.what(); }
+    catch (const Fail& e) { if (note) *note += std::string(note->empty() ? "" : "; ") + "Controller Setup KEYBOARD mode left out: " + e.what(); }
     // So does INPUT DELAY.
     Doc inputDelay = d;
     try { AddInputDelay(inputDelay); d = std::move(inputDelay); }
@@ -496,7 +528,7 @@ void AddKeyboardMode(Doc& d)
 // another profile?" with YES / NO). Its answer is read through lib::SwitchProfileWindow (on YES
 // the profile signs out once the title is back, and Select Profile opens); YES then requests the
 // game's own SIGNOUT mode change (back to the title), NO returns to Options.
-void AddSwitchProfile(Doc& d)
+uint8_t AddSwitchProfile(Doc& d)
 {
     Node row = d.Find("MenuItemMode007-04");
     d.Set(row, "name", "MenuItemMode007-06");
@@ -509,7 +541,7 @@ void AddSwitchProfile(Doc& d)
         std::vector<Node>& items = d.ListOf("MenuItemMode007-05", at);
         items.insert(items.begin() + std::ptrdiff_t(at) + 1, std::move(row));
     }
-    XtalAppendIconRow(d.Event(d.Find("MenuMode007-01"), "OnLoad").text, 5, 6, "icon_s_006");
+    const uint8_t icon = XtalAppendIconRow(d.Event(d.Find("MenuMode007-01"), "OnLoad").text, 5, 6, "icon_s_006");
     for (const char* prefix : { "StaticMode007-0", "StaticValueMode007-0" })
     {
         size_t at = 0;
@@ -530,6 +562,49 @@ void AddSwitchProfile(Doc& d)
     XtalRename(tick, "WindowGetValue", "SwitchProfileWindow");
     XtalRename(tick, "FrameMainMenu", "FrameMode007-01");
     top.insert(top.begin() + std::ptrdiff_t(at) + 1, std::move(dialog));
+    return icon;
+}
+
+// ---- Options: a page the port draws itself (GRAPHICS SETTINGS = row 7, VOICE CHAT = row 8), after
+// row `row` - 1. Its OnEnter is DISPLAY SETTINGS' aimed at `frameName`, an empty frame:
+// menu_ext.cpp's system UI sees it come up and draws the page in FrameSysMenu<N> (the rows are the
+// port's own, changed with LEFT / RIGHT), then returns to Options. Returns the row's small-icon
+// constant (the next row's `lastSmall`).
+uint8_t AddHostPage(Doc& d, uint8_t lastSmall, int row, const char* label, const char* help, const char* icon,
+                    const char* frameName)
+{
+    const std::string n = std::to_string(row), prev = std::to_string(row - 1);
+    Node item = d.Find("MenuItemMode007-04");
+    d.Set(item, "name", ("MenuItemMode007-0" + n).c_str());
+    d.Set(item, "text", label);
+    d.Set(item, "textid", nullptr);
+    d.Set(item, "textid360", nullptr);
+    XtalRename(d.Event(item, "OnEnter").text, "FrameMode007-04-01", frameName);
+    {
+        size_t at = 0;
+        std::vector<Node>& items = d.ListOf(("MenuItemMode007-0" + prev).c_str(), at);
+        items.insert(items.begin() + std::ptrdiff_t(at) + 1, std::move(item));
+    }
+    const uint8_t k = XtalAppendIconRow(d.Event(d.Find("MenuMode007-01"), "OnLoad").text, lastSmall, 6, icon);
+    for (const char* prefix : { "StaticMode007-0", "StaticValueMode007-0" })
+    {
+        size_t at = 0;
+        std::vector<Node>& list = d.ListOf((std::string(prefix) + prev).c_str(), at);
+        Node copy = list[at];
+        d.Set(copy, "name", (std::string(prefix) + n).c_str());
+        d.Set(copy, "text", std::string(prefix) == "StaticMode007-0" ? help : "");
+        d.Set(copy, "textid", nullptr);
+        d.Set(copy, "textid360", nullptr);
+        list.insert(list.begin() + std::ptrdiff_t(at) + 1, std::move(copy));
+    }
+    size_t at = 0;
+    std::vector<Node>& top = d.ListOf("FrameMode007-04-01", at);
+    Node frame;
+    frame.index = top[at].index;
+    frame.text = top[at].text;
+    d.Set(frame, "name", frameName);
+    top.insert(top.begin() + std::ptrdiff_t(at) + 1, std::move(frame));
+    return k;
 }
 
 // ---- System UI frames (menu_ext.cpp, PROFILE_PLAN.md): the console-side screens - Select Profile

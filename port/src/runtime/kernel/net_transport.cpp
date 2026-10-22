@@ -9,6 +9,7 @@
 #include <windows.h>
 #include "net_transport.h"
 #include "steam_net.h"
+#include "voice_chat.h"
 #include <atomic>
 #include <cstdlib>
 #include <cstdio>
@@ -38,6 +39,7 @@ bool g_steam = false;
 
 void FromSteam(uint64_t peer, bool reliable, const uint8_t* data, size_t size)
 {
+    voice_chat::NotePeer(peer);                          // who is in our session: our voice goes there
     if (g_receiver) g_receiver(peer, reliable ? Channel::Reliable : Channel::Unreliable, data, size);
 }
 
@@ -69,6 +71,7 @@ bool Start(Receiver receiver)
     if (!wantLoopback)
     {
         g_receiver = receiver;
+        voice_chat::Install();
         if (steamnet::Start(FromSteam))
         {
             g_steam = true;

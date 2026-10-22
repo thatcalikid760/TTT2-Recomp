@@ -27,6 +27,7 @@ namespace {
 
 constexpr const char* kProtocol = "ttt2-port-1";          // lobbies of other builds / games are ignored
 constexpr int kChannel = 0;
+constexpr int kVoiceChannel = 1;                          // compressed voice, apart from the game's packets
 
 std::atomic<bool> g_running{ false };
 std::atomic<uint64_t> g_local{ 0 };
@@ -64,6 +65,124 @@ void WriteLobbyData(uint64_t lobby, const std::vector<uint8_t>& record)
     CSteamID id(lobby);
     SteamMatchmaking()->SetLobbyData(id, "proto", kProtocol);
     SteamMatchmaking()->SetLobbyData(id, "rec", Hex(record).c_str());
+}
+
+// ---- voice: recorded, sent and received on a thread of its own (every 10 ms).
+std::mutex g_voiceMutex;
+VoiceHandlers g_voice;
+bool g_voiceRecord = false;
+std::vector<uint64_t> g_voicePeers;
+std::map<uint64_t, std::string> g_voiceNames;                    // peer -> Steam name sent to the game
+
+// TTT2_VOICE_ECHO=1 (diagnostics): our own voice comes back as if from a peer (microphone, codec,
+// playback and overlay on one PC), recorded without any peer.
+bool VoiceEcho()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_VOICE_ECHO"); return e && *e == '1'; }();
+    return on;
+}
+
+void Voice()
+{
+    std::vector<uint8_t> packet(8192);
+    std::vector<int16_t> pcm(48000);                             // up to a second of mono 16-bit
+    std::vector<SteamNetworkingMessage_t*> messages(32);
+    bool recording = false, talking = false;
+    auto lastVoice = std::chrono::steady_clock::now();
+    auto lastNames = lastVoice;
+    for (;;)
+    {
+        bool record;
+        std::vector<uint64_t> peers;
+        VoiceHandlers h;
+        {
+            std::lock_guard l(g_voiceMutex);
+            record = g_voiceRecord && (!g_voicePeers.empty() || VoiceEcho());
+            peers = g_voicePeers;
+            h = g_voice;
+        }
+        if (record != recording)
+        {
+            if (record) SteamUser()->StartVoiceRecording();
+            else SteamUser()->StopVoiceRecording();             // GetVoice still drains the tail
+            recording = record;
+            std::fprintf(stderr, "[voice] microphone %s (%zu peer(s))\n", record ? "on" : "off", peers.size());
+        }
+        const auto now = std::chrono::steady_clock::now();
+        uint32_t available = 0;
+        const EVoiceResult result = SteamUser()->GetAvailableVoice(&available);
+        static EVoiceResult lastResult = k_EVoiceResultOK;
+        if (recording && result != lastResult)
+        {
+            // 2 not recording, 3 no data (silence), 6 not initialized, 7 not hooked up, 8 restricted
+            // (a limited account), 10 receiver did not answer, 11 data corrupted.
+            std::fprintf(stderr, "[voice] Steam voice result %d\n", int(result));
+            lastResult = result;
+        }
+        if (result == k_EVoiceResultOK && available)
+        {
+            uint32_t written = 0;
+            if (SteamUser()->GetVoice(true, packet.data(), uint32_t(packet.size()), &written) == k_EVoiceResultOK && written)
+            {
+                for (uint64_t peer : peers)
+                {
+                    SteamNetworkingIdentity id;
+                    id.SetSteamID64(peer);
+                    SteamNetworkingMessages()->SendMessageToUser(id, packet.data(), written,
+                        k_nSteamNetworkingSend_UnreliableNoNagle | k_nSteamNetworkingSend_AutoRestartBrokenSession, kVoiceChannel);
+                }
+                lastVoice = now;
+                uint32_t bytes = 0;
+                if (VoiceEcho() && h.pcm &&
+                    SteamUser()->DecompressVoice(packet.data(), written, pcm.data(), uint32_t(pcm.size() * 2), &bytes,
+                                                 SteamUser()->GetVoiceOptimalSampleRate()) == k_EVoiceResultOK && bytes)
+                    h.pcm(g_local.load(), pcm.data(), bytes / 2, SteamUser()->GetVoiceOptimalSampleRate());
+            }
+        }
+        const bool nowTalking = now - lastVoice < std::chrono::milliseconds(250);
+        if (nowTalking != talking)
+        {
+            talking = nowTalking;
+            if (h.talking) h.talking(talking);
+        }
+        for (;;)
+        {
+            const int n = SteamNetworkingMessages()->ReceiveMessagesOnChannel(kVoiceChannel, messages.data(), int(messages.size()));
+            if (n <= 0) break;
+            const uint32_t rate = SteamUser()->GetVoiceOptimalSampleRate();
+            for (int i = 0; i < n; ++i)
+            {
+                SteamNetworkingMessage_t* m = messages[size_t(i)];
+                uint32_t bytes = 0;
+                if (h.pcm && SteamUser()->DecompressVoice(m->GetData(), uint32_t(m->GetSize()), pcm.data(),
+                                                          uint32_t(pcm.size() * 2), &bytes, rate) == k_EVoiceResultOK && bytes)
+                    h.pcm(m->m_identityPeer.GetSteamID64(), pcm.data(), bytes / 2, rate);
+                m->Release();
+            }
+        }
+        if (h.name && now - lastNames > std::chrono::seconds(1))
+        {
+            // Names of the voice peers, once Steam knows them (RequestUserInformation fetches a
+            // stranger's; the answer lands in Steam's cache).
+            lastNames = now;
+            for (uint64_t peer : peers)
+            {
+                const CSteamID id(peer);
+                const char* name = SteamFriends()->GetFriendPersonaName(id);
+                std::string text = name ? name : "";
+                if (text.empty() || text == "[unknown]")
+                {
+                    SteamFriends()->RequestUserInformation(id, true);
+                    continue;
+                }
+                std::lock_guard l(g_voiceMutex);
+                if (g_voiceNames[peer] == text) continue;
+                g_voiceNames[peer] = text;
+                h.name(peer, text);
+            }
+        }
+        Sleep(10);
+    }
 }
 
 // Service thread: callbacks, call results, packets.
@@ -214,6 +333,7 @@ bool Start(Receiver receiver)
     g_local = SteamUser()->GetSteamID().ConvertToUint64();
     g_running = true;
     std::thread(Service).detach();
+    std::thread(Voice).detach();
     std::fprintf(stderr, "[steam] running as %s (%016llX), app 480\n", SteamFriends()->GetPersonaName(),
                  (unsigned long long)g_local.load());
     return true;
@@ -286,6 +406,10 @@ bool TakeJoinRequest(std::vector<uint8_t>& record)
     return true;
 }
 
+void VoiceSetHandlers(const VoiceHandlers& handlers) { std::lock_guard l(g_voiceMutex); g_voice = handlers; }
+void VoiceRecord(bool on) { std::lock_guard l(g_voiceMutex); g_voiceRecord = on; }
+void VoicePeers(const std::vector<uint64_t>& peers) { std::lock_guard l(g_voiceMutex); g_voicePeers = peers; }
+
 } // namespace steamnet::direct
 
 #else  // no Steamworks SDK in this build
@@ -299,6 +423,9 @@ void PublishLobby(uint64_t, const std::vector<uint8_t>&) {}
 void RemoveLobby(uint64_t) {}
 std::vector<std::vector<uint8_t>> ListLobbies(int, int) { return {}; }
 bool TakeJoinRequest(std::vector<uint8_t>&) { return false; }
+void VoiceSetHandlers(const VoiceHandlers&) {}
+void VoiceRecord(bool) {}
+void VoicePeers(const std::vector<uint64_t>&) {}
 } // namespace steamnet::direct
 
 #endif

@@ -28,6 +28,19 @@ std::vector<std::vector<uint8_t>> ListLobbies(int max, int timeoutMs);
 // A friend's "Join Game" (GameLobbyJoinRequested_t): the lobby's record, once.
 bool TakeJoinRequest(std::vector<uint8_t>& record);
 
+// Voice chat (voice_chat.h) through Steam's voice API: Steam records the microphone chosen in its
+// own Settings -> Voice and compresses it (Opus, with voice detection); the compressed packets go
+// to the voice peers on their own SteamNetworkingMessages channel and arrive decompressed.
+struct VoiceHandlers
+{
+    void (*pcm)(uint64_t peer, const int16_t* samples, size_t count, uint32_t rate) = nullptr;   // mono
+    void (*talking)(bool talking) = nullptr;                // our own voice is being sent (or stopped)
+    void (*name)(uint64_t peer, const std::string& name) = nullptr;   // a voice peer's Steam name
+};
+void VoiceSetHandlers(const VoiceHandlers& handlers);    // before Start
+void VoiceRecord(bool on);                                // the microphone open (open mic / talk key held)
+void VoicePeers(const std::vector<uint64_t>& peers);      // who our voice goes to
+
 // The calls above run Steam in a HELPER PROCESS (steam_bridge.cpp): this exe started again as
 // `--steam-bridge`, talking over its stdin/stdout. Steam Input hides every controller from the
 // process that runs SteamAPI as app 480 (MEASURED 2026-10-12: XInput slots 0+1 connected before
@@ -47,6 +60,9 @@ void PublishLobby(uint64_t sessionId, const std::vector<uint8_t>& record);
 void RemoveLobby(uint64_t sessionId);
 std::vector<std::vector<uint8_t>> ListLobbies(int max, int timeoutMs);
 bool TakeJoinRequest(std::vector<uint8_t>& record);
+void VoiceSetHandlers(const VoiceHandlers& handlers);
+void VoiceRecord(bool on);
+void VoicePeers(const std::vector<uint64_t>& peers);
 } // namespace direct
 
 } // namespace steamnet

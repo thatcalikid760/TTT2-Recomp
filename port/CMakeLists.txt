@@ -179,6 +179,11 @@ target_link_options(tekken_recomp PRIVATE "/MAP:tekken_recomp.map")
 # One version for the game executable's VERSIONINFO, the installer and Add or remove programs.
 set(TTT2_VERSION "0.1.7")
 string(REPLACE "." "," TTT2_VERSION_COMMAS "${TTT2_VERSION},0")
+# In-game updates (updater.cpp): the GitHub repository whose latest release is offered. A release's
+# version is read from its tag or its name and must be higher than TTT2_VERSION to be offered.
+set(TTT2_UPDATE_REPO "thatcalikid760/TTT2-Recomp" CACHE STRING "GitHub owner/name the in-game updater checks")
+target_compile_definitions(tekken_recomp PRIVATE TTT2_VERSION_STR="${TTT2_VERSION}" TTT2_UPDATE_REPO="${TTT2_UPDATE_REPO}")
+target_link_libraries(tekken_recomp PRIVATE winhttp)
 # Original art (port/tools/make_icon.py), not the game's.
 set(TTT2_SETUP_ICON "${CMAKE_SOURCE_DIR}/src/setup/ttt2.ico")
 configure_file(src/runtime/game.rc.in "${CMAKE_BINARY_DIR}/game.rc" @ONLY)
