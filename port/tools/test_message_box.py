@@ -159,7 +159,10 @@ int main(){
         auto c=KbPrepare();__imp__XamShowKeyboardUI(c,memory);CHECK(c.r3.u32==997);
         SysUiKeyboard k;CHECK(TakeKb(k));++kbAccepted;
         k.done(false,"ignored");CHECK(WaitForSingleObject(completed,2000)==WAIT_OBJECT_0);
-        CHECK(eventResult==1223&&GRead16(memory,0x1000)==0xA5A5);Sleep(150);   // cancelled: buffer untouched
+        // Cancelled: an empty message (GAME CHAT would send the last one again) and the cancel's
+        // extended error.
+        CHECK(eventResult==1223&&GRead32(memory,0x218)==0x800704C7u);
+        CHECK(GRead16(memory,0x1000)==0&&GRead16(memory,0x1002)==0xA5A5);Sleep(150);
     }
     {
         auto c=KbPrepare(8);__imp__XamShowKeyboardUI(c,memory);CHECK(c.r3.u32==997);

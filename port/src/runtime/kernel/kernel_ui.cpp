@@ -168,7 +168,8 @@ PPC_FUNC(__imp__XamShowMessageBoxUI) {
 // pOverlapped): the Xbox virtual keyboard - TTT2's online GAME CHAT asks for its message with it.
 // Shown in the game's dialog window by the system UI, typed on the PC keyboard; the answer writes
 // the text into `buffer` (bufferLength wide characters, terminated) and completes the overlapped
-// with ERROR_SUCCESS, or ERROR_CANCELLED leaving the buffer alone.
+// with ERROR_SUCCESS, or with ERROR_CANCELLED (extended error HRESULT_FROM_WIN32) and an empty
+// buffer.
 // ABI reference: xenia/kernel/xam/xam_ui.cc XamShowKeyboardUI_entry.
 PPC_FUNC(__imp__XamShowKeyboardUI) {
     KTrace("XamShowKeyboardUI");
@@ -204,9 +205,11 @@ PPC_FUNC(__imp__XamShowKeyboardUI) {
         keyboard.text = Utf8(defaultText);
         keyboard.maxLength = capacity - 1;
         keyboard.done = [base, buffer, capacity, overlapped](bool ok, const std::string& text) {
-            if (ok) WriteGuestText(base, buffer, capacity, text);
+            // A cancel empties the buffer: GAME CHAT reopens the keyboard after every message and
+            // sends whatever the buffer holds when it is closed - the last message, again.
+            WriteGuestText(base, buffer, capacity, ok ? text : std::string());
             std::thread([base, overlapped, ok] {
-                XamCompleteOverlapped(base, overlapped, ok ? 0 : kCancelled, 0, 0);
+                XamCompleteOverlapped(base, overlapped, ok ? 0 : kCancelled, 0, ok ? 0 : 0x800704C7u);
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 XamNotifyEnqueueEvent(9, 0);                  // XN_SYS_UI closed
             }).detach();
