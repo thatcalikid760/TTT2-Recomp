@@ -302,7 +302,8 @@ LONG CALLBACK GuardVeh(EXCEPTION_POINTERS* ep)
     // page opens without a writeback, so the backend never waits on itself.
     if (GpuHwThreadInBackend()) return EXCEPTION_CONTINUE_EXECUTION;
     GpuHwWriteBackRange(VIEW_A + page * PAGE, PAGE);   // the resolve(s) on this page, whole
-    if (n < 40 || (n & 1023) == 0)
+    static const bool trace = [] { const char* e = std::getenv("TTT2_RESOLVE_TRACE"); return e && *e == '1'; }();
+    if (n < 40 || (n & 1023) == 0 || trace)
     {
         const uint64_t module = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
         std::fprintf(stderr, "[phys-guard] cpu %s of resolved page %08X (fault #%llu, pc RVA=0x%llX)\n",

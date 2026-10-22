@@ -868,10 +868,22 @@ public:
         pendingFence_ = 0;
         for (auto& [rs, r] : resolved_)
         {
-            if (!r.valid || r.cpuCoherent || !r.tex) continue;
             if (!(uint64_t(start) < uint64_t(rs) + r.size && uint64_t(rs) < uint64_t(start) + size)) continue;
+            if (!r.valid || r.cpuCoherent || !r.tex)
+            {
+                if (ResolveTraceOn() && !r.cpuCoherent)
+                    std::fprintf(stderr, "[rtrace] cpu read of %08X: resolve %08X %ux%u not written back (%s)\n", start, rs,
+                                 r.pitch, r.height, !r.valid ? "invalid" : "no texture");
+                continue;
+            }
             dirty_.Sync(rs, r.size);
-            if (dirty_.Newest(rs, r.size) > r.seq) { r.valid = false; continue; }   // the CPU overwrote it
+            if (dirty_.Newest(rs, r.size) > r.seq)   // the CPU overwrote it
+            {
+                if (ResolveTraceOn())
+                    std::fprintf(stderr, "[rtrace] writeback skipped dest=%08X %ux%u (cpu read): the CPU wrote it after the resolve\n", rs, r.pitch, r.height);
+                r.valid = false;
+                continue;
+            }
             if (!r.readbackHot && r.sourceKey != ~0u)
             {
                 r.readbackHot = true;
@@ -2600,7 +2612,13 @@ private:
             const uint32_t rs = it->first;
             if (!(uint64_t(t.base) < uint64_t(rs) + r.size && uint64_t(rs) < uint64_t(t.base) + bytes)) continue;
             dirty_.Sync(rs, r.size);
-            if (dirty_.Newest(rs, r.size) > r.seq) { r.valid = false; continue; }   // the CPU overwrote it
+            if (dirty_.Newest(rs, r.size) > r.seq)   // the CPU overwrote it
+            {
+                if (ResolveTraceOn())
+                    std::fprintf(stderr, "[rtrace] writeback skipped dest=%08X %ux%u (texture fetch): the CPU wrote it after the resolve\n", rs, r.pitch, r.height);
+                r.valid = false;
+                continue;
+            }
             if (!array && t.base == rs && (r.rg16f ? t.format == FMT_16_16_FLOAT : t.format == FMT_8_8_8_8) && t.tiled &&
                 ((t.pitch + 31) & ~31u) == ((r.pitch + 31) & ~31u) && t.width <= r.pitch && t.height <= r.height)
             {
