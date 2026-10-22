@@ -98,6 +98,13 @@ inline Mode ActiveMode() { return g_failed.load(std::memory_order_relaxed) ? Mod
 // writes in the scope are never moved outside it (without the fences the paired stores were
 // dropped as dead - test_resolve_guard.py).
 inline thread_local volatile int g_backendDepth = 0;
+// TTT2_RESOLVE_TRACE=1 (diagnostics): every resolve, writeback and texture upload as an [rtrace]
+// line - which GPU results the CPU or a texture later needed, and whether they were in memory.
+inline bool ResolveTraceOn()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_RESOLVE_TRACE"); return e && *e == '1'; }();
+    return on;
+}
 struct BackendScope
 {
     BackendScope() { g_backendDepth = g_backendDepth + 1; std::atomic_signal_fence(std::memory_order_seq_cst); }
@@ -841,6 +848,10 @@ public:
             // GPU-only from here: a CPU read through the A view writes it back (phys_mirror.cpp).
             if (ActiveMode() == Mode::On) PhysGuardResolve(dest, r.size);
         }
+        if (ResolveTraceOn())
+            std::fprintf(stderr, "[rtrace] resolve dest=%08X %ux%u src=%u colour=%05X depth=%03X destFmt=%u swap=%d hot=%d %s\n",
+                         dest, pitch, height, srcSelect, colorBase, depthBase, destFormat, int(swapRB), int(r.readbackHot),
+                         writeback ? "written" : pitch * height <= smallWriteback ? "small" : "gpu-only");
         MaybeReportStats();
     }
 
@@ -882,6 +893,7 @@ public:
                 continue;
             }
             r.staged = false;
+            traceCause_ = "cpu read";
             lastStagedAgeMs_ = std::chrono::duration<double, std::milli>(t0 - r.stagedAt).count();
             ++writebackCauses_["cpu read (cached view, or a guarded A-view page)"];
             static int logged = 0;
@@ -2606,6 +2618,7 @@ private:
                               t.tiled ? "tiled " : "", t.width, t.height, t.pitch, r.pitch, r.height,
                               t.base == rs ? "" : " offset");
                 ++writebackCauses_[cause];
+                traceCause_ = "texture fetch";
                 WriteBack(rs, r);
             }
         }
@@ -2719,6 +2732,13 @@ private:
         }
         size_t total = 0;
         for (const auto& f : faces) total += f.size();
+        if (ResolveTraceOn())
+        {
+            size_t nonzero = 0;
+            for (const auto& f : faces) for (uint8_t b : f) nonzero += b != 0;
+            std::fprintf(stderr, "[rtrace] upload base=%08X fmt=%u %s %ux%u pitch=%u: %zu of %zu bytes non-zero\n", t.base, t.format,
+                         t.tiled ? "tiled" : "linear", t.width, t.height, t.pitch, nonzero, total);
+        }
         D3D11_TEXTURE2D_DESC d{};
         d.Width = allocW; d.Height = allocH; d.MipLevels = 1; d.ArraySize = slices; d.Format = format;
         d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -2816,6 +2836,7 @@ private:
     // Small resolves staged for the CPU (the exposure readback): into guest memory as soon as the
     // GPU has done their copy - never waiting for it.
     std::unordered_set<uint32_t> smallPending_;
+    const char* traceCause_ = "env";               // TTT2_RESOLVE_TRACE: why the next Scatter runs
     void FinishSmallWritebacks()
     {
         for (auto it = smallPending_.begin(); it != smallPending_.end();)
@@ -2831,6 +2852,7 @@ private:
             std::vector<uint32_t> px;
             if (!ReadStaging(r.staging.Get(), r.pitch, r.height, px, true)) { ++it; continue; }
             r.staged = false;
+            traceCause_ = "small";
             Scatter(*it, r, px, 0);
             it = smallPending_.erase(it);
         }
@@ -2883,6 +2905,9 @@ private:
         }
         else rows(0, r.height);
         PhysUnguard(dest, r.size);                 // the pages no texel landed on
+        if (ResolveTraceOn())
+            std::fprintf(stderr, "[rtrace] writeback dest=%08X %ux%u (%s)\n", dest, r.pitch, r.height, traceCause_);
+        traceCause_ = "env";
         dirty_.Sync(dest, r.size);
         r.seq = dirty_.Current();
         r.cpuCoherent = true;
