@@ -75,6 +75,9 @@ int main() {
     CHECK(!IsPlayerMatchHost(Session(1,1,2,0x32E)));           // joined, not hosted
     CHECK(!IsPlayerMatchHost(Session(1,0,0)));
     mm::SessionRecord bare=Session(1,1,2);bare.contexts.clear();CHECK(IsPlayerMatchHost(bare));
+    // A friends-only session has private slots only (MEASURED 2026-10-21: XSessionCreate public 0,
+    // private 6): joinable too - invites are what fill private slots.
+    mm::SessionRecord friends=Session(2,0,0);friends.maxPrivate=6;friends.filledPrivate=1;CHECK(IsPlayerMatchHost(friends));
 
     // Without the SDK nothing waits: quitting returns at once.
     Start();
@@ -99,6 +102,13 @@ int main() {
     OnJoinSecret(SecretOf(0x8000000000000F00ull));
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     CHECK(Queued()==0 && ListCalls()==1);
+    Reset();{std::lock_guard l(mockMutex);mm::SessionRecord r=Session(0x8000000000000F02ull,0,0);r.maxPrivate=2;r.filledPrivate=2;listed.push_back(r);}
+    OnJoinSecret(SecretOf(0x8000000000000F02ull));
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    CHECK(Queued()==0 && ListCalls()==1);                       // full private slots too
+    Reset();{std::lock_guard l(mockMutex);mm::SessionRecord r=Session(0x8000000000000F03ull,0,0);r.maxPrivate=6;r.filledPrivate=1;listed.push_back(r);}
+    OnJoinSecret(SecretOf(0x8000000000000F03ull));
+    CHECK(WaitQueued(1,3000));                                  // a friends-only session is joined
     Reset();OnJoinSecret(SecretOf(0x8000000000000F01ull));
     std::this_thread::sleep_for(std::chrono::milliseconds(7500));
     CHECK(Queued()==0 && ListCalls()==5);

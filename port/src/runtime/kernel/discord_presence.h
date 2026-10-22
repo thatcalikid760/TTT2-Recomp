@@ -1,6 +1,7 @@
 // Discord Join / invite (Discord Social SDK), beside Steam's "Join Game" (steam_net.h), which it
 // does not replace. While this player hosts a Player Match session, Discord shows a joinable
-// party: id = the session id, size = filledPublic / maxPublic, join secret = the session id
+// party: id = the session id, size = filled / max slots (public and private: a friends-only session
+// has only private ones, which invites fill), join secret = the session id
 // (XNKID) - not the Steam lobby id, which does not survive a Steam helper restart. Nothing else
 // goes into the presence (no addresses, no paths).
 //
@@ -40,7 +41,7 @@ constexpr uint32_t kContextGameType = 0x800A;                  // X_CONTEXT_GAME
 // GAME_TYPE 1 for Player Match.
 inline bool IsPlayerMatchHost(const mm::SessionRecord& r)
 {
-    if (!(r.flags & kFlagHost) || (r.flags & kFlagArbitration) || !r.maxPublic) return false;
+    if (!(r.flags & kFlagHost) || (r.flags & kFlagArbitration) || !(r.maxPublic + r.maxPrivate)) return false;
     for (const mm::Context& c : r.contexts)
         if (c.id == kContextGameType && c.value == 0) return false;
     return true;

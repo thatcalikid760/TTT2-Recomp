@@ -79,7 +79,8 @@ bool Resolve(uint64_t id)
                          (unsigned long long)id, attempt + 1, kTries);
             continue;
         }
-        if (found.maxPublic && found.filledPublic >= found.maxPublic)
+        const uint32_t slots = found.maxPublic + found.maxPrivate, filled = found.filledPublic + found.filledPrivate;
+        if (slots && filled >= slots)
         {
             std::fprintf(stderr, "[discord] Join: session %016llX is full\n", (unsigned long long)id);
             return false;
@@ -267,7 +268,7 @@ void HostSession(const mm::SessionRecord& r)
 {
     if (detail::IsPlayerMatchHost(r))
     {
-        SetDesired({ true, r.id, r.filledPublic, r.maxPublic });
+        SetDesired({ true, r.id, r.filledPublic + r.filledPrivate, r.maxPublic + r.maxPrivate });
         return;
     }
     std::unique_lock l(g_mutex);
