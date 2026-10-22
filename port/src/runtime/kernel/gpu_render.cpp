@@ -2489,6 +2489,15 @@ uint32_t GpuPixelShaderTextureSlots(uint32_t addr, uint32_t sizeDwords)
 }
 
 // ---- hardware backend entry points (no-ops when it is compiled out or disabled) ----
+bool GpuHwThreadInBackend()
+{
+#if defined(TTT2_GPU_HW_BACKEND)
+    return ttt2_hw::g_backendDepth > 0;
+#else
+    return false;
+#endif
+}
+
 int GpuHwMode()
 {
 #if defined(TTT2_GPU_HW_BACKEND)

@@ -18,6 +18,7 @@
 // resolve. Include inside gpu_render.cpp after Vertex/Surface/Texture and the interpreter.
 #include "gpu_hw_translate.h"
 #include "display_settings.h"
+#include "phys_mirror.h"
 #include <d3d11_1.h>
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
@@ -91,6 +92,17 @@ inline Mode RequestedMode()
 }
 inline std::atomic<bool> g_failed{ false };
 inline Mode ActiveMode() { return g_failed.load(std::memory_order_relaxed) ? Mode::Off : RequestedMode(); }
+
+// This thread is inside the backend (Guarded, Scatter's helpers). Read by an exception handler on
+// the same thread (phys_mirror.cpp GuardVeh) the compiler cannot see: volatile, and fenced so the
+// writes in the scope are never moved outside it (without the fences the paired stores were
+// dropped as dead - test_resolve_guard.py).
+inline thread_local volatile int g_backendDepth = 0;
+struct BackendScope
+{
+    BackendScope() { g_backendDepth = g_backendDepth + 1; std::atomic_signal_fence(std::memory_order_seq_cst); }
+    ~BackendScope() { std::atomic_signal_fence(std::memory_order_seq_cst); g_backendDepth = g_backendDepth - 1; }
+};
 
 // ---------------------------------------------------------------------------------------
 // Write-watch based dirty tracking. Every Sync consumes the OS write-watch bits of a range
@@ -823,7 +835,12 @@ public:
         static const bool smallSync = [] { const char* e = std::getenv("TTT2_SMALL_WRITEBACK_SYNC"); return e && *e == '1'; }();
         if (writeback || (pitch * height <= smallWriteback && smallSync)) WriteBack(dest, r);
         else if (pitch * height <= smallWriteback) { if (!(toggle_ & 8)) { StageReadback(r); smallPending_.insert(dest); } }
-        else if (r.readbackHot) StageReadback(r);
+        else
+        {
+            if (r.readbackHot) StageReadback(r);
+            // GPU-only from here: a CPU read through the A view writes it back (phys_mirror.cpp).
+            if (ActiveMode() == Mode::On) PhysGuardResolve(dest, r.size);
+        }
         MaybeReportStats();
     }
 
@@ -866,7 +883,7 @@ public:
             }
             r.staged = false;
             lastStagedAgeMs_ = std::chrono::duration<double, std::milli>(t0 - r.stagedAt).count();
-            ++writebackCauses_["cpu read through the cached physical view"];
+            ++writebackCauses_["cpu read (cached view, or a guarded A-view page)"];
             static int logged = 0;
             if (logged < 40)
             {
@@ -2837,8 +2854,12 @@ private:
     {
         using clock = std::chrono::steady_clock;
         const auto t1 = clock::now();
+        // A-view guards stay up while the bytes are written: these writes (helper threads too) are
+        // the backend's, so each just opens its page; a guest thread touching the resolve meanwhile
+        // faults and waits on the backend lock instead of reading half-written bytes. Dropped after.
         const uint32_t aligned = (r.pitch + 31) & ~31u;
         auto rows = [&](uint32_t y0, uint32_t y1) {
+            BackendScope scope;
             for (uint32_t y = y0; y < y1; ++y)
                 for (uint32_t x = 0; x < r.pitch; ++x)
                 {
@@ -2861,6 +2882,7 @@ private:
             for (auto& t : helpers) t.join();
         }
         else rows(0, r.height);
+        PhysUnguard(dest, r.size);                 // the pages no texel landed on
         dirty_.Sync(dest, r.size);
         r.seq = dirty_.Current();
         r.cpuCoherent = true;
@@ -3086,6 +3108,8 @@ template <typename F>
 inline bool Guarded(const char* what, F&& f)
 {
     std::lock_guard<std::recursive_mutex> lock(g_backendMutex);
+    // A guarded page the backend itself touches must not write back (phys_mirror.cpp GuardVeh).
+    BackendScope scope;
     try { f(); return true; }
     catch (const std::exception& e)
     {

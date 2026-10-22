@@ -51,6 +51,8 @@ bool GpuHwDumpResolved(uint32_t destBase, const char* bmpPath);   // diagnostics
 // Write GPU-only resolves overlapping [start, start + size) into guest memory before the CPU
 // reads them (callable from any thread; the backend serialises itself).
 void GpuHwWriteBackRange(uint32_t start, uint32_t size);
+// True on a thread inside the backend (its lock held): phys_mirror.cpp's guards open, no writeback.
+bool GpuHwThreadInBackend();
 
 // Fetch-constant slots sampled by a pixel shader (diagnostics; 0 if not analysable).
 uint32_t GpuPixelShaderTextureSlots(uint32_t addr, uint32_t sizeDwords);

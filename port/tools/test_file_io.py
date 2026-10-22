@@ -31,6 +31,7 @@ struct PPCContext { Register r1{},r3{},r4{},r5{},r6{},r7{},r8{},r9{},r10{}; };
 #define PPC_FUNC(name) void name(PPCContext& ctx,uint8_t* base)
 constexpr uint32_t STATUS_SUCCESS=0,STATUS_UNSUCCESSFUL=0xC0000001u;
 void KTrace(const char*) {}
+void PhysPrepareHostAccess(uint32_t,uint32_t) {}   // no resolve guards here (test_resolve_guard.py)
 bool ResolveSaveFile(const std::string&,std::filesystem::path&,std::filesystem::path&,uint32_t&) { return false; }
 bool XamGuestRange(uint32_t a,uint64_t n,uint32_t align=4) {return a&&!(a&(align-1))&&uint64_t(a)+n<=0x100000000ull;}
 uint32_t GRead32(uint8_t* p,uint32_t a) { return __builtin_bswap32(*reinterpret_cast<uint32_t*>(p+a)); }
@@ -211,7 +212,7 @@ int main(int argc,char** argv) {
 
 def main():
     source = (ROOT / "port/src/runtime/kernel/kernel_io.cpp").read_text(encoding="utf-8-sig")
-    for name in ("kernel_shared.h", "kernel_trace.h", "kernel_objects.h", "save_store.h", "kernel_content.h"):
+    for name in ("kernel_shared.h", "kernel_trace.h", "kernel_objects.h", "save_store.h", "kernel_content.h", "phys_mirror.h"):
         source = source.replace(f'#include "{name}"', "")
     assert "TTT2_NO_BADREAD" not in source
     with tempfile.TemporaryDirectory(prefix="ttt2-file-io-") as temp:

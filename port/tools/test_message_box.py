@@ -45,6 +45,7 @@ bool KernelSignalEventHandle(uint32_t h){if(!KernelIsEventHandle(h))return false
 std::mutex notifyMutex;
 std::vector<uint32_t> notifications;
 void XamNotifyEnqueueEvent(uint32_t id,uint32_t value){std::lock_guard l(notifyMutex);if(id!=9)std::abort();notifications.push_back(value);}
+void PhysPrepareHostAccess(uint32_t,uint32_t){}   // no resolve guards here (test_resolve_guard.py)
 @SYSUI@
 std::mutex boxMutex;
 std::vector<SysUiMessageBox> boxes;

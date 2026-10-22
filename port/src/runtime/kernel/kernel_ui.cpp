@@ -6,6 +6,7 @@
 #include "kernel_content.h"
 #include "kernel_trace.h"
 #include "sys_ui.h"
+#include "phys_mirror.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <algorithm>
@@ -26,6 +27,7 @@ constexpr uint32_t kPending = 997, kInvalidParameter = 87;
 bool ReadGuestBytes(uint8_t* base, uint32_t address, void* out, size_t size,
                     uint32_t alignment = 1) {
     if (!XamGuestRange(address, size, alignment)) return false;
+    PhysPrepareHostAccess(address, uint32_t(size));      // ReadProcessMemory fails on a guard page
     SIZE_T read = 0;
     return ReadProcessMemory(GetCurrentProcess(), base + address, out, size, &read)
         && read == size;

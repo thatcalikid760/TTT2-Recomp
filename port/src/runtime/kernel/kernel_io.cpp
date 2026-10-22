@@ -5,6 +5,7 @@
 #include "kernel_objects.h"
 #include "save_store.h"
 #include "kernel_content.h"
+#include "phys_mirror.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <atomic>
@@ -403,6 +404,7 @@ PPC_FUNC(__imp__NtReadFile)
                 else effOff = original.QuadPart;
                 if (status == STATUS_SUCCESS)
                 {
+                    PhysPrepareHostAccess(buffer, length);   // ReadFile fails on a guard page
                     if (!ReadFile(file->handle, base + buffer, length, &read, nullptr))
                         status = FileErrorStatus(GetLastError());
                     else if (read == 0)

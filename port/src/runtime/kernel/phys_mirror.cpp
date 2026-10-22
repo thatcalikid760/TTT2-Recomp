@@ -16,6 +16,18 @@
 // 64 KB chunk has the GPU backend write back any resolve covering it, copies the A bytes in
 // and opens the chunk. A resolve into the A view, or a frame swap, closes chunks again,
 // first copying any page the CPU wrote through the C view back to the A view.
+//
+// Some CPU reads of resolves go straight through the A view: the customization screen's card of
+// a new custom character (its thumbnail is compressed on the CPU from a resolve; every byte came
+// out zero, a black card - MEASURED 2026-10-21: TTT2_GPU_HW_WRITEBACK=1 made it appear). So a
+// GPU-only resolve's A-view pages are also PAGE_GUARD (PhysGuardResolve): the first CPU touch of
+// one raises STATUS_GUARD_PAGE_VIOLATION - Windows lifts that page's guard - and GuardVeh writes
+// the resolve back before the access is retried. Pages are guarded only while unflagged, so a
+// resolve repeated every frame that nothing on the CPU reads costs no protection change. The
+// backend's own touches (under its lock, Scatter's helper threads included) just open the page,
+// so while it writes a resolve back the other guest threads fault and wait for it; it drops the
+// rest of the guards after. Windows calls given guest memory (ReadFile, ReadProcessMemory) fail
+// on a guard page instead of faulting, so their callers make the range coherent first.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "phys_mirror.h"
@@ -138,6 +150,108 @@ LONG CALLBACK MirrorVeh(EXCEPTION_POINTERS* ep)
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 }
+
+// ---- A-view guards (phys_mirror.h) -----------------------------------------------------------
+constexpr uint32_t A_PAGES = VIEW_SIZE / PAGE;
+std::mutex g_guardMutex;
+std::vector<uint8_t> g_guarded;              // per A-view page: 1 = PAGE_GUARD set by us
+std::atomic<uint32_t> g_guardedPages{ 0 };
+std::atomic<uint64_t> g_guardFaults{ 0 };
+
+bool GuardsOn()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_RESOLVE_GUARD"); return !(e && *e == '0'); }();
+    return on && g_mirrorBase;
+}
+
+// The A-view pages [first, end) a guest range touches; false outside the A view.
+bool PageRange(uint32_t start, uint32_t size, uint32_t& first, uint32_t& end)
+{
+    if (!size || start < VIEW_A || start >= VIEW_A + VIEW_SIZE) return false;
+    const uint64_t phys = start - VIEW_A;
+    first = uint32_t(phys / PAGE);
+    end = uint32_t((std::min<uint64_t>)((phys + size + PAGE - 1) / PAGE, A_PAGES));
+    return first < end;
+}
+
+// Pages [first, end) whose flag differs from `guard` get the protection and the flag, in runs.
+// Caller holds g_guardMutex.
+void SetGuards(uint32_t first, uint32_t end, bool guard)
+{
+    DWORD old;
+    for (uint32_t p = first; p < end;)
+    {
+        if (g_guarded[p] == uint8_t(guard)) { ++p; continue; }
+        uint32_t q = p;
+        while (q < end && g_guarded[q] != uint8_t(guard)) g_guarded[q++] = uint8_t(guard);
+        VirtualProtect(g_mirrorBase + VIEW_A + size_t(p) * PAGE, size_t(q - p) * PAGE,
+                       guard ? PAGE_READWRITE | PAGE_GUARD : PAGE_READWRITE, &old);
+        if (guard) g_guardedPages.fetch_add(q - p, std::memory_order_relaxed);
+        else g_guardedPages.fetch_sub(q - p, std::memory_order_relaxed);
+        p = q;
+    }
+}
+
+LONG CALLBACK GuardVeh(EXCEPTION_POINTERS* ep)
+{
+    const EXCEPTION_RECORD* r = ep->ExceptionRecord;
+    if (r->ExceptionCode != STATUS_GUARD_PAGE_VIOLATION || r->NumberParameters < 2 || !g_mirrorBase)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const uint64_t lo = reinterpret_cast<uint64_t>(g_mirrorBase) + VIEW_A;
+    const uint64_t fault = r->ExceptionInformation[1];
+    if (fault < lo || fault >= lo + VIEW_SIZE) return EXCEPTION_CONTINUE_SEARCH;
+    const uint32_t page = uint32_t((fault - lo) / PAGE);
+    {
+        // Windows has already lifted this page's guard.
+        std::lock_guard<std::mutex> lock(g_guardMutex);
+        if (!g_guarded[page]) return EXCEPTION_CONTINUE_EXECUTION;   // another thread's fault got it
+        g_guarded[page] = 0;
+        g_guardedPages.fetch_sub(1, std::memory_order_relaxed);
+    }
+    const uint64_t n = g_guardFaults.fetch_add(1, std::memory_order_relaxed);
+    // The GPU backend's own reads (texture decodes under its lock) keep today's behaviour: the
+    // page opens without a writeback, so the backend never waits on itself.
+    if (GpuHwThreadInBackend()) return EXCEPTION_CONTINUE_EXECUTION;
+    GpuHwWriteBackRange(VIEW_A + page * PAGE, PAGE);   // the resolve(s) on this page, whole
+    if (n < 40 || (n & 1023) == 0)
+    {
+        const uint64_t module = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+        std::fprintf(stderr, "[phys-guard] cpu %s of resolved page %08X (fault #%llu, pc RVA=0x%llX)\n",
+                     r->ExceptionInformation[0] ? "write" : "read", VIEW_A + page * PAGE, (unsigned long long)n + 1,
+                     (unsigned long long)(reinterpret_cast<uint64_t>(r->ExceptionAddress) - module));
+    }
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+}
+
+void PhysGuardResolve(uint32_t start, uint32_t size)
+{
+    uint32_t first, end;
+    if (!GuardsOn() || !PageRange(start, size, first, end)) return;
+    std::lock_guard<std::mutex> lock(g_guardMutex);
+    SetGuards(first, end, true);
+}
+
+void PhysUnguard(uint32_t start, uint32_t size)
+{
+    uint32_t first, end;
+    if (!GuardsOn() || !g_guardedPages.load(std::memory_order_relaxed) || !PageRange(start, size, first, end)) return;
+    std::lock_guard<std::mutex> lock(g_guardMutex);
+    SetGuards(first, end, false);
+}
+
+void PhysPrepareHostAccess(uint32_t start, uint32_t size)
+{
+    uint32_t first, end;
+    if (!GuardsOn() || !g_guardedPages.load(std::memory_order_relaxed) || !PageRange(start, size, first, end)) return;
+    bool any = false;
+    {
+        std::lock_guard<std::mutex> lock(g_guardMutex);
+        for (uint32_t p = first; p < end && !any; ++p) any = g_guarded[p] != 0;
+    }
+    if (!any) return;
+    if (!GpuHwThreadInBackend()) GpuHwWriteBackRange(start, size);   // writes back and unguards
+    PhysUnguard(start, size);                                         // what no live resolve covers
 }
 
 void PhysMirrorInit(uint8_t* base)
@@ -153,6 +267,9 @@ void PhysMirrorInit(uint8_t* base)
         return;
     }
     AddVectoredExceptionHandler(1, MirrorVeh);
+    g_guarded.assign(A_PAGES, 0);
+    AddVectoredExceptionHandler(1, GuardVeh);
+    std::fprintf(stderr, "[phys-guard] A-view resolve guards %s\n", GuardsOn() ? "on" : "off (TTT2_RESOLVE_GUARD=0)");
 }
 
 void PhysMirrorInvalidate(uint32_t start, uint32_t size)

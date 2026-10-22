@@ -2,6 +2,7 @@
 #include "kernel_shared.h"
 #include "guest_heap.h"
 #include "kernel_trace.h"
+#include "phys_mirror.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -79,7 +80,15 @@ PPC_FUNC(__imp__MmFreePhysicalMemory)
     KTrace("MmFreePhysicalMemory");
     // r3 = type, r4 = address (Xbox signature); free the physical allocation.
     uint32_t addr = ctx.r4.u32;
-    if (addr) { void* h = base + addr; if (g_physicalHeap.Owns(h)) g_physicalHeap.Free(h); }
+    if (addr)
+    {
+        void* h = base + addr;
+        if (g_physicalHeap.Owns(h))
+        {
+            PhysUnguard(addr, uint32_t(g_physicalHeap.Size(h)));   // a resolve's guards die with it
+            g_physicalHeap.Free(h);
+        }
+    }
 }
 
 // GPU sees the same flat memory: physical address == virtual offset.
