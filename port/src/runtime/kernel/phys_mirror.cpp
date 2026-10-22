@@ -301,7 +301,7 @@ LONG CALLBACK GuardVeh(EXCEPTION_POINTERS* ep)
     // The GPU backend's own reads (texture decodes under its lock) keep today's behaviour: the
     // page opens without a writeback, so the backend never waits on itself.
     if (GpuHwThreadInBackend()) return EXCEPTION_CONTINUE_EXECUTION;
-    GpuHwWriteBackRange(VIEW_A + page * PAGE, PAGE);   // the resolve(s) on this page, whole
+    GpuHwWriteBackRange(VIEW_A + page * PAGE, PAGE, true);   // the resolve(s) on this page, whole
     static const bool trace = [] { const char* e = std::getenv("TTT2_RESOLVE_TRACE"); return e && *e == '1'; }();
     if (n < 40 || (n & 1023) == 0 || trace)
     {

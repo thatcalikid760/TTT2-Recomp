@@ -39,7 +39,7 @@ void PhysUnguard(uint32_t start, uint32_t size);
 #include <mutex>
 std::recursive_mutex backendLock;
 uint32_t resolveStart = 0, resolveSize = 0;
-void GpuHwWriteBackRange(uint32_t start, uint32_t size) {
+void GpuHwWriteBackRange(uint32_t start, uint32_t size, bool = false) {
     std::lock_guard l(backendLock);
     if (!resolveSize || start >= resolveStart + resolveSize || start + size <= resolveStart) return;
     ++writebacks;

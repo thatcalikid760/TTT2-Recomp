@@ -121,7 +121,7 @@ struct BackendScope
 class DirtyTracker
 {
 public:
-    uint32_t Sync(uint32_t start, uint32_t size)
+    uint32_t Sync(uint32_t start, uint32_t size, const char* tag = "?")
     {
         if (!size) return seq_;
         const uint64_t first = start >> 12, last = (uint64_t(start) + size + 4095) >> 12;
@@ -144,10 +144,12 @@ public:
         if (count)
         {
             ++seq_;
+            if (ResolveTraceOn() && pageTag_.empty()) pageTag_.assign(1u << 20, nullptr);
             for (ULONG_PTR i = 0; i < count; ++i)
             {
                 const uint64_t page = (static_cast<uint8_t*>(addresses_[i]) - g_base) >> 12;
                 if (page < pageSeq_.size()) pageSeq_[page] = seq_;
+                if (!pageTag_.empty() && page < pageTag_.size()) pageTag_[page] = tag;
             }
         }
         return seq_;
@@ -162,6 +164,21 @@ public:
         return newest;
     }
     uint32_t Current() const { return seq_; }
+    // TTT2_RESOLVE_TRACE: the range's pages written after `seq`, with the Sync that saw each.
+    std::string DirtyAfter(uint32_t start, uint32_t size, uint32_t seq) const
+    {
+        std::string s;
+        int n = 0;
+        for (uint64_t p = start >> 12, e = (uint64_t(start) + size + 4095) >> 12; p < e && p < pageSeq_.size(); ++p)
+            if (pageSeq_[p] > seq && n++ < 8)
+            {
+                char one[96];
+                std::snprintf(one, sizeof(one), " %08llX@%u(%s)", (unsigned long long)(p << 12), pageSeq_[p],
+                              !pageTag_.empty() && pageTag_[p] ? pageTag_[p] : "?");
+                s += one;
+            }
+        return s + (n > 8 ? " ..." : "");
+    }
 private:
     void MarkAll(uint64_t first, uint64_t last)
     {
@@ -169,6 +186,7 @@ private:
         for (uint64_t p = first; p < last && p < pageSeq_.size(); ++p) pageSeq_[p] = seq_;
     }
     std::vector<uint32_t> pageSeq_;
+    std::vector<const char*> pageTag_;     // TTT2_RESOLVE_TRACE only
     std::vector<PVOID> addresses_;
     uint32_t seq_ = 1;
     bool usable_ = true;
@@ -815,7 +833,7 @@ public:
         // The resolve owns its destination from now on; any older decode of these bytes is
         // stale. Consume earlier CPU writes so only LATER ones invalidate this entry.
         r.size = ResolveBytes(pitch, height);
-        dirty_.Sync(dest, r.size);
+        dirty_.Sync(dest, r.size, "resolve");
         r.seq = dirty_.Current();
         r.valid = true;
         r.cpuCoherent = false;
@@ -862,8 +880,9 @@ public:
     // so the command processor keeps drawing and presenting while this thread waits for the GPU
     // (it used to hold the lock for the whole wait: the fight intro's reads stalled presents by
     // up to ~15 ms each, MEASURED 2026-10-14). `block` waits in Map instead (the caller's last resort).
-    bool WriteBackRange(uint32_t start, uint32_t size, bool block = false)
+    bool WriteBackRange(uint32_t start, uint32_t size, bool block = false, bool fromGuard = false)
     {
+        static const bool trustGuard = [] { const char* e = std::getenv("TTT2_GUARD_TRUST"); return e && *e == '1'; }();
         bool pending = false;
         pendingFence_ = 0;
         for (auto& [rs, r] : resolved_)
@@ -876,11 +895,19 @@ public:
                                  r.pitch, r.height, !r.valid ? "invalid" : "no texture");
                 continue;
             }
-            dirty_.Sync(rs, r.size);
+            dirty_.Sync(rs, r.size, "cpu-read writeback");
+            if (dirty_.Newest(rs, r.size) > r.seq && fromGuard && trustGuard)
+            {
+                if (ResolveTraceOn())
+                    std::fprintf(stderr, "[rtrace] writeback trusted dest=%08X %ux%u (guard fault; write watch says written: seq %u, now %u):%s\n",
+                                 rs, r.pitch, r.height, r.seq, dirty_.Current(), dirty_.DirtyAfter(rs, r.size, r.seq).c_str());
+                r.seq = dirty_.Current();
+            }
             if (dirty_.Newest(rs, r.size) > r.seq)   // the CPU overwrote it
             {
                 if (ResolveTraceOn())
-                    std::fprintf(stderr, "[rtrace] writeback skipped dest=%08X %ux%u (cpu read): the CPU wrote it after the resolve\n", rs, r.pitch, r.height);
+                    std::fprintf(stderr, "[rtrace] writeback skipped dest=%08X %ux%u (cpu read): the CPU wrote it after the resolve (seq %u, now %u):%s\n",
+                                 rs, r.pitch, r.height, r.seq, dirty_.Current(), dirty_.DirtyAfter(rs, r.size, r.seq).c_str());
                 r.valid = false;
                 continue;
             }
@@ -2580,7 +2607,7 @@ private:
                 t.width <= it->second.pitch && t.height <= it->second.height)
             {
                 Resolved& r = it->second;
-                dirty_.Sync(t.base, r.size);
+                dirty_.Sync(t.base, r.size, "depth fetch");
                 if (dirty_.Newest(t.base, r.size) <= r.seq)
                 {
                     ++stats_.depthHits;
@@ -2611,11 +2638,12 @@ private:
             if (!r.valid) continue;
             const uint32_t rs = it->first;
             if (!(uint64_t(t.base) < uint64_t(rs) + r.size && uint64_t(rs) < uint64_t(t.base) + bytes)) continue;
-            dirty_.Sync(rs, r.size);
+            dirty_.Sync(rs, r.size, "texture fetch");
             if (dirty_.Newest(rs, r.size) > r.seq)   // the CPU overwrote it
             {
                 if (ResolveTraceOn())
-                    std::fprintf(stderr, "[rtrace] writeback skipped dest=%08X %ux%u (texture fetch): the CPU wrote it after the resolve\n", rs, r.pitch, r.height);
+                    std::fprintf(stderr, "[rtrace] writeback skipped dest=%08X %ux%u (texture fetch): the CPU wrote it after the resolve (seq %u, now %u):%s\n",
+                                 rs, r.pitch, r.height, r.seq, dirty_.Current(), dirty_.DirtyAfter(rs, r.size, r.seq).c_str());
                 r.valid = false;
                 continue;
             }
@@ -2645,7 +2673,7 @@ private:
                           t.format == FMT_DXT1 || t.format == FMT_DXT2_3 || t.format == FMT_DXT4_5;
         TexKey key{ t.base, t.format, t.width, t.height, t.pitch, t.tiled ? 1u : 0u, t.endian, fast ? 0xFFFFFFFFu : t.swizzle,
                     slices | (array ? 0x100u : 0u) };
-        dirty_.Sync(t.base, bytes);
+        dirty_.Sync(t.base, bytes, "texture");
         if (CensusOn()) CensusTexture(t, resolveBytes ? CensusResolveBytes : CensusUpload);
         auto it = textures_.find(key);
         if (it != textures_.end() && dirty_.Newest(t.base, bytes) <= it->second.seq)
@@ -2926,7 +2954,7 @@ private:
         if (ResolveTraceOn())
             std::fprintf(stderr, "[rtrace] writeback dest=%08X %ux%u (%s)\n", dest, r.pitch, r.height, traceCause_);
         traceCause_ = "env";
-        dirty_.Sync(dest, r.size);
+        dirty_.Sync(dest, r.size, "scatter");
         r.seq = dirty_.Current();
         r.cpuCoherent = true;
         ++stats_.writebacks;
@@ -3020,7 +3048,7 @@ private:
         auto it = resolved_.find(fb);
         if (it != resolved_.end() && it->second.valid && it->second.pitch >= 1280 && it->second.height >= 720)
         {
-            dirty_.Sync(fb, it->second.size);
+            dirty_.Sync(fb, it->second.size, "front buffer");
             if (dirty_.Newest(fb, it->second.size) <= it->second.seq)
             {
                 storedSwap = it->second.swapRB;

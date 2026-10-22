@@ -37,7 +37,7 @@ static bool g_gpuOnly = false;                 // a resolve at A0100000..A012000
 static std::vector<std::pair<uint32_t, uint32_t>> g_writeBackCalls;
 uint32_t WatchGuestLrOf(DWORD) { return 0; }   // TTT2_GUARD_WATCH (diagnostics)
 bool GpuHwThreadInBackend() { return false; }   // A-view guards: test_resolve_guard.py
-void GpuHwWriteBackRange(uint32_t start, uint32_t size)
+void GpuHwWriteBackRange(uint32_t start, uint32_t size, bool)
 {
     g_writeBackCalls.push_back({ start, size });
     if (g_gpuOnly && start < 0xA0120000u && 0xA0100000u < start + size)

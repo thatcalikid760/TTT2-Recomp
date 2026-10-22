@@ -50,7 +50,9 @@ void GpuHwSetWindow(void* window);
 bool GpuHwDumpResolved(uint32_t destBase, const char* bmpPath);   // diagnostics
 // Write GPU-only resolves overlapping [start, start + size) into guest memory before the CPU
 // reads them (callable from any thread; the backend serialises itself).
-void GpuHwWriteBackRange(uint32_t start, uint32_t size);
+// `fromGuard`: the first CPU touch of an A-view guarded page (phys_mirror.cpp), with
+// TTT2_GUARD_TRUST=1 written back even when write watch reports the range written since.
+void GpuHwWriteBackRange(uint32_t start, uint32_t size, bool fromGuard = false);
 // True on a thread inside the backend (its lock held): phys_mirror.cpp's guards open, no writeback.
 bool GpuHwThreadInBackend();
 

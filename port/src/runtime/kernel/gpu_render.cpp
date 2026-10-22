@@ -2569,7 +2569,7 @@ bool GpuHwDumpResolved(uint32_t destBase, const char* path)
     return ok;
 }
 
-void GpuHwWriteBackRange(uint32_t start, uint32_t size)
+void GpuHwWriteBackRange(uint32_t start, uint32_t size, bool fromGuard)
 {
 #if defined(TTT2_GPU_HW_BACKEND)
     // The backend answers "still copying" instead of waiting under its lock; wait with the lock
@@ -2586,7 +2586,7 @@ void GpuHwWriteBackRange(uint32_t start, uint32_t size)
         Microsoft::WRL::ComPtr<ID3D11Fence> fence;
         uint64_t fenceValue = 0;
         if (!ttt2_hw::Guarded("writeback", [&] {
-                pending = ttt2_hw::Get().WriteBackRange(start, size, block);
+                pending = ttt2_hw::Get().WriteBackRange(start, size, block, fromGuard);
                 if (pending) fence = ttt2_hw::Get().PendingFence(fenceValue);
             })) break;
         if (!pending) break;
@@ -2606,7 +2606,7 @@ void GpuHwWriteBackRange(uint32_t start, uint32_t size)
             std::fprintf(stderr, "[frame] cpu-read fault %08X: %.2f ms (%u polls) thread %lu\n", start, total, polls, GetCurrentThreadId());
     }
 #else
-    (void)start; (void)size;
+    (void)start; (void)size; (void)fromGuard;
 #endif
 }
 
