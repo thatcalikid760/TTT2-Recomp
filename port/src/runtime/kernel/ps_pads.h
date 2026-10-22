@@ -20,6 +20,7 @@ constexpr int Slots = 4;   // host pads 4-7 of the poll thread (0-3 are the XInp
 struct Pad
 {
     bool connected = false;
+    bool ps5 = false;                 // a DualSense (Create, not Share: button_prompts.h)
     XINPUT_GAMEPAD gamepad{};
 };
 

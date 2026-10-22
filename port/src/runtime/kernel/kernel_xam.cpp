@@ -11,6 +11,7 @@
 #include "keyboard_keys.h"
 #include "xlive.h"
 #include "ps_pads.h"
+#include "button_prompts.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -558,6 +559,10 @@ struct PadPollState
     // which TTT2 treats as signed out - no profile, no save, no title-storage unlock. Pads not
     // claimed yet fill the free users in host order, so a lone pad is user 0 before any press.
     int guestOf[kHostPads]{ -1, -1, -1, -1, -1, -1, -1, -1 };
+    // Button prompts (button_prompts.h) follow the device player 1 last pressed something on.
+    bool hostPs5[kHostPads]{};
+    uint16_t prevPressed[kHostPads]{};        // buttons + triggers (0x0400 / 0x0800) last poll
+    bool keyboardDown = false, promptNoted = false;
 };
 
 // What XInputGetCapabilities reports for a wired Xbox 360 pad, minus rumble (none is played).
@@ -752,6 +757,7 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
     {
         const DWORD i = kXInputPads + k;
         polling.physicalConnected[i] = playStation[k].connected;
+        polling.hostPs5[i] = playStation[k].ps5;
         sampled[i].Gamepad = playStation[k].gamepad;
         if (playStation[k].connected) hostCaps[i] = PlayStationCaps();
     }
@@ -780,6 +786,23 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
             if (source[user] < 0 && !claimed(user)) { source[user] = int(i); break; }
     }
 
+    {
+        // Player 1's last device picks the prompt icons: a new key, or a new button / trigger on the
+        // pad that is player 1 (sticks drift and do not count). Before any press, that pad decides.
+        using button_prompts::Device;
+        const bool keyNow = keyboard.buttons || keyboard.leftTrigger || keyboard.rightTrigger;
+        if (keyNow && !polling.keyboardDown) { button_prompts::NoteInput(Device::Keyboard); polling.promptNoted = true; }
+        polling.keyboardDown = keyNow;
+        if (const int s = source[0]; s >= 0)
+        {
+            const XINPUT_GAMEPAD& g = sampled[s].Gamepad;
+            const uint16_t pressed = uint16_t(g.wButtons | (g.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD ? 0x0400 : 0) |
+                                              (g.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD ? 0x0800 : 0));
+            const Device device = DWORD(s) < kXInputPads ? Device::Xbox : polling.hostPs5[s] ? Device::PlayStation5 : Device::PlayStation4;
+            if ((pressed & ~polling.prevPressed[s]) || !polling.promptNoted) { button_prompts::NoteInput(device); polling.promptNoted = true; }
+            polling.prevPressed[s] = pressed;
+        }
+    }
     for (DWORD user = 0; user < 4; ++user)
     {
         XINPUT_STATE state{};

@@ -19,6 +19,10 @@ Bluetooth: Cross / Circle / Square / Triangle are A / B / X / Y, L1 / R1 the bum
 triggers, Options is START and Share / Create or a touchpad click is BACK. If you use DS4Windows
 or Steam Input (which already turn the pad into an Xbox controller), set PlayStationNative=0 in
 the [Input] section of settings.ini so each press is not read twice.
+On-screen button icons follow the controller player 1 last used: Xbox, PlayStation (with
+OPTIONS / SHARE, or CREATE on a DualSense) or the keyboard (showing your bound keys). To fix one
+style, set ButtonPrompts=Xbox, PlayStation, PS5 or Keyboard in the [Input] section of
+settings.ini (Auto follows the controller).
 The keyboard also works as player 1:
 
     Arrow keys      D-pad                 A / S / Z / X   A / B / X / Y buttons

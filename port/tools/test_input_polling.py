@@ -31,6 +31,9 @@ CHECKER = r'''
 #include <mutex>
 #include <thread>
 #include "ps_pads.h"
+#include "button_prompts.h"
+int notedDevice=-1;
+void button_prompts::NoteInput(button_prompts::Device d) { notedDevice=int(d); }
 std::array<bool,256> keys{};
 ps_pads::Pad psHost[ps_pads::Slots]{};
 unsigned psPolls=0;
@@ -341,7 +344,25 @@ int main() {
     psHost[2].connected=true;psHost[2].gamepad.wButtons=0x1000;PollPadsOnce(poll,false,32);
     CHECK(poll.guestOf[kXInputPads+2]==-1);
     for(unsigned u=0;u<4;++u) CHECK((g_pads[u].state.Gamepad.wButtons&0x1000)==0);
-    std::printf("PASS %u input checks: focused keyboard/controller combination, hotplug, packet edges, START timing, player 1 = first pad used, text entry, key settings, PlayStation pads\n",checks);
+    // Button prompts follow player 1's last device: the pad that is player 1 before any press, then
+    // each new press (a key, a pad button or trigger; not the sticks).
+    {
+        using button_prompts::Device;
+        Reset();poll={};notedDevice=-1;psHost[0].connected=true;psHost[0].ps5=true;
+        PollPadsOnce(poll,false,0);CHECK(notedDevice==int(Device::PlayStation5));   // a lone DualSense
+        keys['A']=true;PollPadsOnce(poll,false,8);CHECK(notedDevice==int(Device::Keyboard));
+        keys['A']=false;PollPadsOnce(poll,false,16);CHECK(notedDevice==int(Device::Keyboard));
+        psHost[0].gamepad.sThumbLX=20000;PollPadsOnce(poll,false,24);CHECK(notedDevice==int(Device::Keyboard));   // stick: no
+        psHost[0].gamepad.bRightTrigger=200;PollPadsOnce(poll,false,32);CHECK(notedDevice==int(Device::PlayStation5));
+        Reset();poll={};notedDevice=-1;physical[1]=true;psHost[2].connected=true;
+        host[1].Gamepad.wButtons=0x1000;PollPadsOnce(poll,false,0);CHECK(notedDevice==int(Device::Xbox));
+        host[1].Gamepad.wButtons=0;PollPadsOnce(poll,false,8);
+        psHost[2].gamepad.wButtons=0x2000;PollPadsOnce(poll,false,16);   // player 2's press: prompts stay
+        CHECK(poll.guestOf[kXInputPads+2]==1 && notedDevice==int(Device::Xbox));
+        Reset();poll={};notedDevice=-1;psHost[1].connected=true;psHost[1].gamepad.wButtons=0x1000;
+        PollPadsOnce(poll,false,0);CHECK(notedDevice==int(Device::PlayStation4));
+    }
+    std::printf("PASS %u input checks: focused keyboard/controller combination, hotplug, packet edges, START timing, player 1 = first pad used, text entry, key settings, PlayStation pads, prompt device\n",checks);
 }
 '''
 

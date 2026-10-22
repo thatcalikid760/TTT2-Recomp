@@ -19,6 +19,7 @@
 #include "gpu_hw_translate.h"
 #include "display_settings.h"
 #include "phys_mirror.h"
+#include "button_prompts.h"
 #include <d3d11_1.h>
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
@@ -1467,6 +1468,9 @@ private:
         ComPtr<ID3D11Texture2D> tex; ComPtr<ID3D11ShaderResourceView> srv;
         uint32_t mode = 0, rangeStart = 0, rangeSize = 0, seq = 0, allocW = 1, allocH = 1, slices = 1;
         bool genericSwizzled = false;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        bool promptFont = false;           // the menu font: its button icons follow the controller
+        uint32_t promptGeneration = 0;     // button_prompts::Generation() it was painted for
     };
     struct Bound { ID3D11ShaderResourceView* srv; uint32_t swizzle, mode, width, height; float scaleX, scaleY; uint32_t slices = 1; };
     struct Stats { uint64_t draws = 0, triangles = 0, skippedDraws = 0, emptyDraws = 0, resolves = 0, presents = 0,
@@ -2682,7 +2686,8 @@ private:
         dirty_.Sync(t.base, bytes, "texture");
         if (CensusOn()) CensusTexture(t, resolveBytes ? CensusResolveBytes : CensusUpload);
         auto it = textures_.find(key);
-        if (it != textures_.end() && dirty_.Newest(t.base, bytes) <= it->second.seq)
+        if (it != textures_.end() && dirty_.Newest(t.base, bytes) <= it->second.seq &&
+            !(it->second.promptFont && it->second.promptGeneration != button_prompts::Generation()))
         {
             const CachedTexture& c = it->second;
             return { c.srv.Get(), c.genericSwizzled ? 0x688u : t.swizzle, c.mode, t.width, t.height,
@@ -2751,6 +2756,23 @@ private:
                     auto* dst = reinterpret_cast<uint32_t*>(&data[size_t(by) * rowPitch + size_t(bx) * blockBytes]);
                     for (uint32_t k = 0; k < blockBytes / 4; ++k) dst[k] = TextureWord(addr + k * 4, t.endian);
                 }
+            // The menu font: paint the current controller's button icons over it (button_prompts.h).
+            c.promptFont = button_prompts::IsPromptFont(t.format, t.width, t.height, t.tiled, g_base + t.base,
+                                                        size_t(bw) * blocksY * blockBytes);
+            if (c.promptFont)
+            {
+                c.promptGeneration = button_prompts::Generation();
+                const button_prompts::Style style = button_prompts::Current();
+                if (style != button_prompts::Style::Xbox)
+                {
+                    std::vector<uint8_t> rgba(size_t(allocW) * allocH * 4);
+                    button_prompts::DecodeBc2(data.data(), blocksX, blocksY, rgba.data(), allocW * 4);
+                    button_prompts::Paint(style, rgba.data(), allocW, allocH, allocW * 4);
+                    data.swap(rgba);
+                    format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    rowPitch = allocW * 4;
+                }
+            }
         }
         else
         {
@@ -2794,7 +2816,7 @@ private:
         D3D11_TEXTURE2D_DESC d{};
         d.Width = allocW; d.Height = allocH; d.MipLevels = 1; d.ArraySize = slices; d.Format = format;
         d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (!c.tex || c.allocW != allocW || c.allocH != allocH || c.slices != slices)
+        if (!c.tex || c.allocW != allocW || c.allocH != allocH || c.slices != slices || c.format != format)
         {
             c.tex.Reset(); c.srv.Reset();
             std::vector<D3D11_SUBRESOURCE_DATA> init(slices);
@@ -2814,7 +2836,7 @@ private:
         else
             for (uint32_t s = 0; s < slices; ++s)
                 context_->UpdateSubresource(c.tex.Get(), D3D11CalcSubresource(0, s, 1), nullptr, faces[s].data(), rowPitch, 0);
-        c.allocW = allocW; c.allocH = allocH; c.slices = slices;
+        c.allocW = allocW; c.allocH = allocH; c.slices = slices; c.format = format;
         ++stats_.uploads;
         stats_.uploadBytes += total;
         auto& f = uploadByFormat_[t.format | (t.tiled ? 0x100u : 0u) | (slices > 1 ? 0x200u : 0u)];

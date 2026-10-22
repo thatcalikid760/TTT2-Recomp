@@ -56,6 +56,7 @@ struct Slot
 {
     SDL_Gamepad* pad = nullptr;
     SDL_JoystickID id = 0;
+    bool ps5 = false;
     std::string serial;          // the last pad in this slot, kept after it disconnects
 };
 Slot g_slots[Slots];
@@ -132,7 +133,7 @@ void Scan()
         for (int k = 0; k < Slots && slot < 0; ++k)
             if (!g_slots[k].pad) slot = k;
         if (slot < 0) { SDL_CloseGamepad(pad); continue; }
-        g_slots[slot] = { pad, id, serial };
+        g_slots[slot] = { pad, id, SDL_GetGamepadTypeForID(id) == SDL_GAMEPAD_TYPE_PS5, serial };
         const SDL_JoystickConnectionState link = SDL_GetGamepadConnectionState(pad);
         const char* name = SDL_GetGamepadName(pad);
         std::fprintf(stderr, "[input] PlayStation pad connected: %s (%s), host pad %d\n", name ? name : "?",
@@ -175,6 +176,7 @@ void Poll(Pad out[Slots])
         int16_t axes[6];
         for (int a = 0; a < 6; ++a) axes[a] = SDL_GetGamepadAxis(s.pad, SDL_GamepadAxis(a));
         out[k].connected = true;
+        out[k].ps5 = s.ps5;
         out[k].gamepad = ToXInput(down, axes);
     }
 #endif
