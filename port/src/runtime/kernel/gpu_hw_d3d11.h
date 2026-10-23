@@ -21,6 +21,7 @@
 #include "phys_mirror.h"
 #include "button_prompts.h"
 #include "voice_chat.h"
+#include "toast.h"
 #include <d3d11_1.h>
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
@@ -1380,7 +1381,7 @@ private:
     //   after AMD's CAS) -> FPS counter.
     // With none of them and no downscale, prep draws straight into the viewport (bilinear).
     ComPtr<ID3D11VertexShader> presentVs_;
-    ComPtr<ID3D11PixelShader> presentPs_[4], fxaaPs_, downsamplePs_, sharpenPs_, fpsPs_, voicePs_;
+    ComPtr<ID3D11PixelShader> presentPs_[4], fxaaPs_, downsamplePs_, sharpenPs_, fpsPs_, voicePs_, toastPs_;
     ComPtr<ID3D11SamplerState> presentSampler_;
     ComPtr<ID3D11Buffer> postCb_;
     struct PostCB { float srcSize[4]; float dstSize[4]; float params[4]; };   // params: brightness exponent, sharpness, fps
@@ -1480,6 +1481,143 @@ private:
             "  if (icon == 0) return (flags & 1) ? float4(0.2, 1, 0.3, 1) : float4(0.3, 0.3, 0.3, 1);\n"
             "  if (flags & 4) return float4(1, 0.2, 0.15, 1);\n"
             "  return (flags & 2) ? float4(1, 0.85, 0.1, 1) : float4(0.3, 0.3, 0.3, 1); }\n", "ttt2 voice ps");
+        // Notifications: the premultiplied texture, its alpha scaled by the fade (params.x).
+        toastPs_ = PostShader(
+            "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+            "  float4 c = src.SampleLevel(smp, uv, 0);\n"
+            "  return float4(c.rgb, c.a * params.x); }\n", "ttt2 toast ps");
+    }
+    // ---- notifications (toast.h): the note drawn with GDI into a premultiplied BGRA texture, made
+    // again when the note or the output size changes, and blended over the top right corner.
+    ComPtr<ID3D11Texture2D> toastTex_;
+    ComPtr<ID3D11ShaderResourceView> toastSrv_;
+    ComPtr<ID3D11BlendState> toastBlend_;
+    uint32_t toastGeneration_ = ~0u;
+    UINT toastW_ = 0, toastH_ = 0, toastFor_ = 0;
+    static std::wstring Wide(const std::string& s)
+    {
+        std::wstring w(s.size() + 1, L'\0');
+        const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), int(w.size()));
+        w.resize(n > 0 ? size_t(n - 1) : 0);
+        return w;
+    }
+    bool MakeToast(const toast::Note& note, float outH)
+    {
+        const int scale = std::max(1, int(outH / 720.0f + 0.5f));
+        const int pad = 14 * scale, titleH = 26 * scale, lineH = 21 * scale, accentW = 5 * scale;
+        HDC dc = CreateCompatibleDC(nullptr);
+        if (!dc) return false;
+        HFONT title = CreateFontW(-titleH, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                  CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        HFONT body = CreateFontW(-lineH, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                 CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        // Measure.
+        int textW = 0;
+        auto measure = [&](HFONT f, const std::wstring& t) {
+            SelectObject(dc, f);
+            SIZE sz{};
+            GetTextExtentPoint32W(dc, t.c_str(), int(t.size()), &sz);
+            textW = std::max(textW, int(sz.cx));
+        };
+        measure(title, Wide(note.title));
+        for (const std::string& l : note.lines) measure(body, Wide(l));
+        const int w = accentW + pad * 2 + textW, h = pad * 2 + titleH + int(note.lines.size()) * (lineH + 4 * scale);
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+        bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h; bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+        void* bits = nullptr;
+        HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        bool ok = false;
+        if (bmp && bits)
+        {
+            SelectObject(dc, bmp);
+            std::memset(bits, 0, size_t(w) * h * 4);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, RGB(255, 255, 255));        // coverage in every channel, coloured below
+            int y = pad;
+            SelectObject(dc, title);
+            const std::wstring t = Wide(note.title);
+            TextOutW(dc, accentW + pad, y, t.c_str(), int(t.size()));
+            const int titleBottom = y + titleH;
+            y += titleH + 6 * scale;
+            SelectObject(dc, body);
+            for (const std::string& l : note.lines)
+            {
+                const std::wstring lw = Wide(l);
+                TextOutW(dc, accentW + pad, y, lw.c_str(), int(lw.size()));
+                y += lineH + 4 * scale;
+            }
+            GdiFlush();
+            // Compose premultiplied BGRA: a dark translucent panel, an accent bar on the left,
+            // the title in the accent colour and the lines in white.
+            const float ar = note.highlight ? 1.0f : 0.25f, ag = note.highlight ? 0.55f : 0.78f, ab = note.highlight ? 0.1f : 1.0f;
+            auto* px = static_cast<uint8_t*>(bits);
+            for (int yy = 0; yy < h; ++yy)
+                for (int xx = 0; xx < w; ++xx)
+                {
+                    uint8_t* p = px + (size_t(yy) * w + xx) * 4;
+                    const float cov = p[1] / 255.0f;
+                    float r = 0.03f, g = 0.05f, b = 0.09f, a = 0.86f;         // panel
+                    if (xx < accentW) { r = ar; g = ag; b = ab; a = 1.0f; }
+                    else if (yy == 0 || yy == h - 1 || xx == w - 1) { r = ar * 0.6f; g = ag * 0.6f; b = ab * 0.6f; a = 1.0f; }
+                    const bool inTitle = yy < titleBottom;
+                    const float tr = inTitle ? ar : 1.0f, tg = inTitle ? ag : 1.0f, tb = inTitle ? ab : 1.0f;
+                    r = r * (1 - cov) + tr * cov; g = g * (1 - cov) + tg * cov; b = b * (1 - cov) + tb * cov;
+                    a = a * (1 - cov) + cov;
+                    p[0] = uint8_t(std::clamp(b * a, 0.0f, 1.0f) * 255.0f + 0.5f);
+                    p[1] = uint8_t(std::clamp(g * a, 0.0f, 1.0f) * 255.0f + 0.5f);
+                    p[2] = uint8_t(std::clamp(r * a, 0.0f, 1.0f) * 255.0f + 0.5f);
+                    p[3] = uint8_t(std::clamp(a, 0.0f, 1.0f) * 255.0f + 0.5f);
+                }
+            D3D11_TEXTURE2D_DESC d{};
+            d.Width = UINT(w); d.Height = UINT(h); d.MipLevels = d.ArraySize = 1; d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_IMMUTABLE; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            D3D11_SUBRESOURCE_DATA init{ bits, UINT(w) * 4, 0 };
+            toastTex_.Reset(); toastSrv_.Reset();
+            ok = SUCCEEDED(device_->CreateTexture2D(&d, &init, &toastTex_)) &&
+                 SUCCEEDED(device_->CreateShaderResourceView(toastTex_.Get(), nullptr, &toastSrv_));
+            toastW_ = UINT(w); toastH_ = UINT(h);
+        }
+        if (bmp) DeleteObject(bmp);
+        DeleteObject(title);
+        DeleteObject(body);
+        DeleteDC(dc);
+        return ok;
+    }
+    void DrawToast(ID3D11RenderTargetView* rtv, const D3D11_VIEWPORT& vp, PostCB cb)
+    {
+        toast::Note note;
+        float opacity = 0;
+        uint32_t generation = 0;
+        if (!toast::Current(note, opacity, generation)) return;
+        const UINT forH = UINT(vp.Height);
+        if (generation != toastGeneration_ || forH != toastFor_)
+        {
+            toastGeneration_ = generation;
+            toastFor_ = forH;
+            if (!MakeToast(note, vp.Height)) return;
+        }
+        if (!toastSrv_) return;
+        if (!toastBlend_)
+        {
+            D3D11_BLEND_DESC bd{};
+            auto& t = bd.RenderTarget[0];
+            t.BlendEnable = TRUE;
+            t.SrcBlend = D3D11_BLEND_BLEND_FACTOR; t.DestBlend = D3D11_BLEND_INV_SRC_ALPHA; t.BlendOp = D3D11_BLEND_OP_ADD;
+            t.SrcBlendAlpha = D3D11_BLEND_ONE; t.DestBlendAlpha = D3D11_BLEND_ZERO; t.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+            t.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+            Check(device_->CreateBlendState(&bd, &toastBlend_), "CreateToastBlend");
+        }
+        // Premultiplied colour scaled by the fade (blend factor), destination kept by alpha x fade
+        // (the shader scales the source alpha).
+        cb.params[0] = opacity;
+        const float margin = std::floor(vp.Height / 40.0f);
+        const float slide = (1.0f - opacity) * margin * 2;
+        const D3D11_VIEWPORT box{ vp.TopLeftX + vp.Width - float(toastW_) - margin + slide, vp.TopLeftY + margin, float(toastW_), float(toastH_), 0, 1 };
+        const float factor[4] = { opacity, opacity, opacity, opacity };
+        context_->OMSetBlendState(toastBlend_.Get(), factor, 0xFFFFFFFF);
+        PostPass(toastPs_.Get(), toastSrv_.Get(), rtv, box, cb);
+        context_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
     }
     void PostPass(ID3D11PixelShader* ps, ID3D11ShaderResourceView* srv, ID3D11RenderTargetView* rtv, const D3D11_VIEWPORT& vp,
                   const PostCB& cb)
@@ -1617,6 +1755,7 @@ private:
             cb.params[2] = float(std::min(fpsShown_, 999u));
             PostPass(fpsPs_.Get(), nullptr, rtv, D3D11_VIEWPORT{ vp.TopLeftX + cell * 2, vp.TopLeftY + cell * 2, cell * 13, cell * 7, 0, 1 }, cb);
         }
+        DrawToast(rtv, vp, cb);
         const uint32_t voice = (voice_chat::LocalTalking() ? 1u : 0u) | (voice_chat::RemoteTalking() ? 2u : 0u) |
                                (voice_chat::AllMuted() ? 4u : 0u);
         if (voice)

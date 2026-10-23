@@ -37,6 +37,7 @@
 #include "discord_presence.h"
 #include "voice_chat.h"
 #include "updater.h"
+#include "toast.h"
 #include "button_prompts.h"
 
 extern "C" PPC_FUNC(__imp__sub_82346060);
@@ -1100,8 +1101,44 @@ void Finish(PPCContext& ctx, uint8_t* base, Ui& ui)
     SignInAndClose(ctx, base, ui, index);
 }
 
+// A profile signs in (Select Profile, or the game's own sign-in): check for an update and show
+// the build and the answer as a notification, top right (toast.h). Once per sign-in.
+void SignInNotice()
+{
+    static bool signedIn = false, waiting = false;
+    const bool now = profiles::SignedIn();
+    if (now && !signedIn)
+    {
+        updater::Check();
+        waiting = true;
+    }
+    signedIn = now;
+    if (!waiting) return;
+    const updater::Status st = updater::Get();
+    using S = updater::State;
+    if (st.state == S::Checking || st.state == S::Idle) return;
+    waiting = false;
+    toast::Note note;
+    const std::string build = std::string("Build ") + updater::CurrentVersion();
+    if (st.state == S::Available || st.state == S::Downloaded)
+    {
+        note.title = "UPDATE AVAILABLE";
+        note.lines = { "Version " + st.latest + " is ready to download.", build + "  -  Options > Updates" };
+        note.highlight = true;
+        toast::Show(note, 12000);
+    }
+    else
+    {
+        note.title = std::string("TTT2 RECOMP ") + updater::CurrentVersion();
+        note.lines = { st.state == S::UpToDate ? "You are on the latest update." : "Could not check for updates." };
+        toast::Show(note, 6000);
+    }
+    std::fprintf(stderr, "[update] sign-in notice: %s\n", note.title.c_str());
+}
+
 void Frame(PPCContext& ctx, uint8_t* base)
 {
+    SignInNotice();
     BoxFrame(ctx, base);
     KeyboardFrame(ctx, base);
     VoicePanelFrame(ctx, base);
