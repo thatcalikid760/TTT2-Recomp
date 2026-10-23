@@ -22,6 +22,7 @@ struct Player
     std::string name;           // Steam name ("PLAYER" until Steam knows it)
     bool muted = false;
     bool talking = false;
+    bool inSession = false;     // game packets from them in the last few seconds
 };
 // The players met this session (most recent first, at most 6).
 std::vector<Player> Players();
@@ -30,5 +31,8 @@ std::vector<Player> Players();
 bool LocalTalking();
 bool RemoteTalking();
 bool AllMuted();
+
+// Opens `peer`'s Steam profile in the Steam client (the web page when steam:// is not handled).
+void OpenSteamProfile(uint64_t peer);
 
 } // namespace voice_chat

@@ -934,9 +934,10 @@ void KeyboardFrame(PPCContext& ctx, uint8_t* base)
 // 2026-10-22: 16 the main menu and its submenus, Options included; 29 Online Mode's menus; 35 the
 // online session room;
 // 8 character select, 9 a fight). UP / DOWN choose a line, LEFT / RIGHT or A change it (a
-// player's line mutes / unmutes), B closes. The lines follow voice_chat as players come and go.
+// player's line mutes / unmutes, X opens their Steam profile), B closes. The lines follow voice_chat as players come and go.
 constexpr uint32_t kVoicePanelTextId = 0x7F06;
-constexpr uint16_t kRightStick = 0x0080;
+constexpr uint16_t kRightStick = 0x0080, kX = 0x4000;
+uint8_t* g_baseForPanel = nullptr;                     // guest memory, for the panel text's mode check
 struct VoicePanel
 {
     bool showing = false, releasing = false;
@@ -957,8 +958,12 @@ std::string VoicePanelText(VoicePanel& vp)
         "VOICE VOLUME: " + std::to_string(v.volume),
     };
     vp.peers.clear();
+    // In the session room only the players in this session; elsewhere everyone met lately.
+    const uint32_t manager = g_baseForPanel ? GRead32(g_baseForPanel, 0x82F30B94) : 0;
+    const bool room = manager && GRead32(g_baseForPanel, manager + 12) == 35;
     for (const voice_chat::Player& p : voice_chat::Players())
     {
+        if (room && !p.inSession) continue;
         std::string name = p.name;
         for (char& c : name)
             if (c < 0x20 || c > 0x7E || c == '~') c = '?';
@@ -975,7 +980,18 @@ std::string VoicePanelText(VoicePanel& vp)
     }
     if (vp.peers.empty()) m += "\n\nNo players yet.";
     if (voice_chat::AllMuted()) m += "\n\nF8: everyone is muted.";
-    m += "\n\nUP / DOWN: choose   LEFT / RIGHT: change   B: close";
+    // The buttons as the current prompt style names them (keyboard: player 1's keys).
+    const button_prompts::Style style = button_prompts::Current();
+    auto name = [&](int control, const char* xbox, const char* ps) {
+        if (style == button_prompts::Style::Keyboard) return keyboard_keys::KeyName(keyboard_keys::Key(control));
+        return std::string(style == button_prompts::Style::Xbox ? xbox : ps);
+    };
+    const std::string a = name(keyboard_keys::A, "A", "CROSS"), b = name(keyboard_keys::B, "B", "CIRCLE"),
+                      x = name(keyboard_keys::X, "X", "SQUARE");
+    if (vp.cursor >= 2 && !vp.peers.empty())
+        m += "\n\n" + a + ": mute / unmute   " + x + ": Steam profile   " + b + ": close";
+    else
+        m += "\n\nUP / DOWN: choose   LEFT / RIGHT: change   " + b + ": close";
     return m;
 }
 void ShowVoicePanel(PPCContext& ctx, uint8_t* base, VoicePanel& vp)
@@ -1006,6 +1022,7 @@ void UpdateVoicePanel(PPCContext& ctx, uint8_t* base, VoicePanel& vp)
 }
 void VoicePanelFrame(PPCContext& ctx, uint8_t* base)
 {
+    g_baseForPanel = base;
     VoicePanel& vp = g_vp;
     static uint16_t prev = 0;
     static bool prevF7 = false;
@@ -1054,6 +1071,11 @@ void VoicePanelFrame(PPCContext& ctx, uint8_t* base)
             display_settings::SetVoiceMuted(peer, !display_settings::IsVoiceMuted(peer));
         }
         MenuSound(ctx, base, kSoundCursor);
+    }
+    else if ((pressed & kX) && vp.cursor >= 2 && size_t(vp.cursor - 2) < vp.peers.size())
+    {
+        MenuSound(ctx, base, kSoundDecide);
+        voice_chat::OpenSteamProfile(vp.peers[size_t(vp.cursor - 2)]);
     }
     else if ((pressed & (kB | kRightStick)) || f7Pressed)
     {

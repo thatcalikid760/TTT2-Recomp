@@ -2,6 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <xaudio2.h>
+#include <shellapi.h>
 #include "voice_chat.h"
 #include "display_settings.h"
 #include "steam_net.h"
@@ -9,10 +10,12 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 
 namespace voice_chat {
@@ -117,8 +120,11 @@ void Tick()
 {
     bool recording = false, f8 = false;
     std::vector<uint64_t> sentPeers;
+    // TTT2_VOICE_FAKE_PEER=<SteamID64 hex> (tests): that player counts as in our session.
+    static const uint64_t fake = [] { const char* e = std::getenv("TTT2_VOICE_FAKE_PEER"); return e ? std::strtoull(e, nullptr, 16) : 0ull; }();
     for (;;)
     {
+        if (fake) NotePeer(fake);
         const display_settings::Voice settings = display_settings::GetVoice();
         const bool front = GameInFront();
         const bool f8Now = front && (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
@@ -198,6 +204,7 @@ std::vector<Player> Players()
             pl.peer = id;
             pl.name = p.name.empty() ? "PLAYER" : p.name;
             pl.talking = now - p.lastVoice < kTalkHold;
+            pl.inSession = now - p.lastPacket < kPeerTimeout;
             all.push_back({ (std::max)(p.lastPacket, p.lastVoice), pl });
         }
     }
@@ -230,5 +237,19 @@ bool RemoteTalking()
 }
 
 bool AllMuted() { return g_allMuted.load(); }
+
+void OpenSteamProfile(uint64_t peer)
+{
+    const std::wstring id = std::to_wstring(peer);
+    const std::wstring steam = L"steam://url/SteamIDPage/" + id;
+    if (reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", steam.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) > 32)
+    {
+        std::fprintf(stderr, "[voice] Steam profile %016llX opened in Steam\n", (unsigned long long)peer);
+        return;
+    }
+    const std::wstring web = L"https://steamcommunity.com/profiles/" + id;
+    ShellExecuteW(nullptr, L"open", web.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    std::fprintf(stderr, "[voice] Steam profile %016llX opened in the browser\n", (unsigned long long)peer);
+}
 
 } // namespace voice_chat
