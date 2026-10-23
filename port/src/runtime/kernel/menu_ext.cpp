@@ -239,7 +239,8 @@ struct Ui
     bool releasing = false;         // closed: keep the controller until every button is up
     bool continueAfter = false;     // then press START for the game (the title continues)
     int cursor = 0;
-    std::vector<Row> rows, shown;   // wanted / last written
+    int top = 0;                    // the first row on screen (pages longer than kRows scroll)
+    std::vector<Row> rows, shown;   // wanted / last written (shown: the rows on screen)
     int shownCursor = -1;
     int frameRows = 0;              // FrameSysMenu<N> on screen (0 = none yet)
     int settle = 0;                 // frames until the cursor is drawn again (after the menu's OnFocus)
@@ -382,20 +383,37 @@ void HideDialog(PPCContext& ctx, uint8_t* base)
 }
 
 // ---- Options -> GRAPHICS SETTINGS (display_settings::Graphics): the page's rows, in order.
-enum GraphicsRow { kVsync, kRenderScale, kAntiAliasing, kFiltering, kSharpen, kBrightness, kFps, kDefault, kGraphicsRows };
+// More rows than the frame's 9 scroll (Draw).
+enum GraphicsRow
+{
+    kPreset, kVsync, kRenderScale, kUpscaler, kFsrMode, kAntiAliasing, kFiltering, kSharpen, kMotionBlur, kBrightness, kFps,
+    kDefault, kGraphicsRows
+};
 void BuildGraphics(Ui& ui)
 {
     const display_settings::Graphics g = display_settings::GetGraphics();
+    static const char* const presets[] = { "LOW", "MEDIUM", "HIGH", "ULTRA" };
     static const char* const sharpen[] = { "OFF", "LOW", "MEDIUM", "HIGH" };
+    static const char* const fsrModes[] = { "NATIVE", "ULTRA QUALITY", "QUALITY", "BALANCED", "PERFORMANCE" };
+    static const char* const aa[] = { "OFF", "FXAA", "SMAA" };
+    const int preset = display_settings::PresetOf(g);
     const int aniso = display_settings::Anisotropies()[size_t(g.anisotropy)];
     ui.rows = {
+        { "PRESET", preset < 0 ? "CUSTOM" : presets[preset],
+          "Set the picture options below at once. LOW and MEDIUM render below the resolution." },
         { "V-SYNC", g.vsync ? "ON" : "OFF", "ON: no tearing. OFF: lowest latency; the picture may tear." },
         { "RENDER SCALE", std::to_string(display_settings::RenderScales()[size_t(g.renderScale)]) + "%",
           "Render above the resolution and scale down for a cleaner image. Demanding." },
-        { "ANTI-ALIASING", g.fxaa ? "FXAA" : "OFF", "FXAA smooths jagged edges on the final image." },
+        { "UPSCALER", g.upscaler ? "FSR 1" : "OFF",
+          "FSR 1 enlarges the picture with sharp edges where the window is bigger than the image." },
+        { "FSR MODE", fsrModes[g.fsrMode],
+          g.upscaler ? "Render below the resolution and let FSR 1 enlarge it. Never below 720p."
+                     : "Needs UPSCALER: FSR 1." },
+        { "ANTI-ALIASING", aa[g.antiAliasing], "Smooth jagged edges. SMAA keeps the picture sharper than FXAA." },
         { "TEXTURE FILTERING", aniso > 1 ? std::to_string(aniso) + "X ANISOTROPIC" : "STANDARD",
           "Anisotropic filtering keeps floors and walls sharp at an angle." },
-        { "SHARPENING", sharpen[g.sharpen], "Sharpen the final image." },
+        { "SHARPENING", sharpen[g.sharpen], g.upscaler ? "Sharpen the final image (FSR 1's RCAS when it enlarges)." : "Sharpen the final image." },
+        { "MOTION BLUR", g.motionBlur ? "ON" : "OFF", "The game's blur on fast moves. OFF keeps every frame crisp." },
         { "BRIGHTNESS", std::to_string(g.brightness), "Adjust the brightness of the picture." },
         { "FPS COUNTER", g.fpsCounter ? "ON" : "OFF", "Show frames per second in the corner. The game runs at a fixed 60." },
         { "DEFAULT", "", "Reset to default settings." },
@@ -408,11 +426,20 @@ void ChangeGraphics(int row, int dir)
     auto step = [dir](int v, int count) { return (v + dir + count) % count; };
     switch (row)
     {
+    case kPreset:
+    {
+        const int now = display_settings::PresetOf(g);
+        g = display_settings::Preset(now < 0 ? (dir > 0 ? 0 : display_settings::kPresets - 1) : step(now, display_settings::kPresets), g);
+        break;
+    }
     case kVsync: g.vsync = !g.vsync; break;
     case kRenderScale: g.renderScale = step(g.renderScale, int(display_settings::RenderScales().size())); break;
-    case kAntiAliasing: g.fxaa = !g.fxaa; break;
+    case kUpscaler: g.upscaler = !g.upscaler; break;
+    case kFsrMode: g.fsrMode = step(g.fsrMode, int(display_settings::FsrModes().size())); break;
+    case kAntiAliasing: g.antiAliasing = step(g.antiAliasing, 3); break;
     case kFiltering: g.anisotropy = step(g.anisotropy, int(display_settings::Anisotropies().size())); break;
     case kSharpen: g.sharpen = step(g.sharpen, 4); break;
+    case kMotionBlur: g.motionBlur = !g.motionBlur; break;
     case kBrightness: g.brightness = std::clamp(g.brightness + dir, 0, 10); break;
     case kFps: g.fpsCounter = !g.fpsCounter; break;
     case kDefault: if (dir > 0) g = {}; break;
@@ -565,6 +592,7 @@ void Open(Ui& ui, int cursor, Screen screen = Screen::Profiles)
 {
     ui.screen = screen;
     ui.cursor = cursor;
+    ui.top = 0;
     ui.setupFrames = 1;
     ui.shown.clear();
     ui.shownCursor = -1;
@@ -617,9 +645,14 @@ void Draw(PPCContext& ctx, uint8_t* base, Ui& ui)
     else if (ui.screen == Screen::Voice) BuildVoice(ui);
     else if (ui.screen == Screen::Update) BuildUpdate(ui);
     else BuildProfiles(ui);
-    const int count = std::clamp(int(ui.rows.size()), 2, kRows);
-    ui.rows.resize(size_t(count), Row{ "-", "", "-" });
-    ui.cursor = std::clamp(ui.cursor, 0, count - 1);
+    const int total = (std::max)(int(ui.rows.size()), 2);
+    ui.rows.resize(size_t(total), Row{ "-", "", "-" });
+    ui.cursor = std::clamp(ui.cursor, 0, total - 1);
+    // At most kRows on screen: the window follows the cursor.
+    const int count = (std::min)(total, kRows);
+    ui.top = std::clamp(ui.top, (std::max)(0, ui.cursor - count + 1), (std::min)(ui.cursor, total - count));
+    const std::vector<Row> visible(ui.rows.begin() + ui.top, ui.rows.begin() + ui.top + count);
+    const int cursor = ui.cursor - ui.top;
     if (count != ui.frameRows)
     {
         // The frame with exactly this many rows (its bars follow its icon arrays); write the
@@ -642,7 +675,7 @@ void Draw(PPCContext& ctx, uint8_t* base, Ui& ui)
     const std::string n = std::to_string(count) + "_";
     for (int i = 0; i < count; ++i)
     {
-        const Row& row = ui.rows[size_t(i)];
+        const Row& row = visible[size_t(i)];
         const bool fresh = i >= int(ui.shown.size());
         const Row old = fresh ? Row{} : ui.shown[size_t(i)];
         const std::string k = n + Two(i + 1);
@@ -651,15 +684,15 @@ void Draw(PPCContext& ctx, uint8_t* base, Ui& ui)
         if (fresh || old.help != row.help) MenuSetText(ctx, base, "StaticSysMenu" + k, row.help);
     }
     if (ui.shown.empty()) ui.settle = 8;
-    ui.shown = ui.rows;
-    if (ui.cursor != ui.shownCursor)
+    ui.shown = visible;
+    if (cursor != ui.shownCursor)
     {
         // Select Profile shows the main menu's PROFILE icon, GRAPHICS SETTINGS Display Settings' monitor.
-        DrawCursor(ctx, base, count, ui.cursor, ui.shownCursor < 0,
+        DrawCursor(ctx, base, count, cursor, ui.shownCursor < 0,
                    ui.screen == Screen::Graphics || ui.screen == Screen::Update ? "icon_s_046"
                    : ui.screen == Screen::Voice                                  ? "icon_s_000"
                                                                                  : "icon_s_006");
-        ui.shownCursor = ui.cursor;
+        ui.shownCursor = cursor;
     }
 }
 
@@ -958,6 +991,8 @@ std::string VoicePanelText(VoicePanel& vp)
         std::string("VOICE CHAT: ") + modes[v.mode] + (v.mode == display_settings::VoicePushToTalk ? " (" + keyboard_keys::KeyName(v.pushToTalkKey) + ")" : ""),
         "VOICE VOLUME: " + std::to_string(v.volume),
     };
+    // The cursor stays on its player when players come and go.
+    const uint64_t selected = vp.cursor >= 2 && size_t(vp.cursor - 2) < vp.peers.size() ? vp.peers[size_t(vp.cursor - 2)] : 0;
     vp.peers.clear();
     // In the session room only the players in this session; elsewhere everyone met lately.
     const uint32_t manager = g_baseForPanel ? GRead32(g_baseForPanel, 0x82F30B94) : 0;
@@ -970,6 +1005,7 @@ std::string VoicePanelText(VoicePanel& vp)
             if (c < 0x20 || c > 0x7E || c == '~') c = '?';
         if (name.size() > 20) name.resize(20);
         lines.push_back(name + ": " + (p.muted ? "MUTED" : p.talking ? "TALKING" : "ON"));
+        if (p.peer == selected) vp.cursor = int(lines.size()) - 1;
         vp.peers.push_back(p.peer);
     }
     vp.cursor = std::clamp(vp.cursor, 0, int(lines.size()) - 1);

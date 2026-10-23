@@ -4,6 +4,11 @@
 
 1 ICON "@TTT2_SETUP_ICON@"
 
+// Post-processing shader sources (gpu_hw_d3d11.h: kSmaaHlsl, kFfxA, kFfxFsr1).
+201 RCDATA "@TTT2_SMAA_DIR@/SMAA.hlsl"
+202 RCDATA "@TTT2_FSR1_DIR@/ffx_a.h"
+203 RCDATA "@TTT2_FSR1_DIR@/ffx_fsr1.h"
+
 1 VERSIONINFO
 FILEVERSION    @TTT2_VERSION_COMMAS@
 PRODUCTVERSION @TTT2_VERSION_COMMAS@

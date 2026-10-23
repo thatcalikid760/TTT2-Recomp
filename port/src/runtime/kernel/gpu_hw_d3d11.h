@@ -22,6 +22,8 @@
 #include "button_prompts.h"
 #include "voice_chat.h"
 #include "toast.h"
+#include "AreaTex.h"                  // SMAA's lookup textures (third_party/smaa, MIT)
+#include "SearchTex.h"
 #include <d3d11_1.h>
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
@@ -715,6 +717,15 @@ public:
         if (st.writeMask && depth) depthWithColor_[st.colorBase] = st.depthBase;
         if (st.writeMask) Grow(color, st.colorBase, needW, needH, sc);
         if (depth) Grow(*depth, st.depthBase, needW, needH, sc);
+        // MOTION BLUR OFF: the velocity pass (16_16_FLOAT colour, format 6) is skipped and its
+        // target held at zero velocity, so the game's blur samples every pixel in place.
+        if (!gfx_.motionBlur && st.writeMask && ((st.colorBase >> 12) & 0xF) == 6)
+        {
+            const float zero[4] = {};
+            context_->ClearRenderTargetView(color.rtv.Get(), zero);
+            ++stats_.skippedDraws;
+            return true;
+        }
         ID3D11RenderTargetView* rtv = st.writeMask ? color.rtv.Get() : nullptr;
         ID3D11DepthStencilView* dsv = depth ? depth->dsv.Get() : nullptr;
         context_->OMSetRenderTargets(rtv ? 1 : 0, rtv ? &rtv : nullptr, dsv);
@@ -1376,17 +1387,23 @@ private:
     // The game image into the back buffer, letterboxed to its own aspect. The first pass exchanges
     // red / blue when the stored order differs from the display swizzle, applies the guest's gamma
     // ramp and BRIGHTNESS (variants: [swap | gamma << 1]). GRAPHICS SETTINGS add passes:
-    //   prep (source size) -> FXAA (source size) -> resample to the viewport (an area filter when
-    //   RENDER SCALE / RESOLUTION render above it, bilinear below) -> sharpen (contrast-adaptive,
-    //   after AMD's CAS) -> FPS counter.
-    // With none of them and no downscale, prep draws straight into the viewport (bilinear).
+    //   prep (source size) -> FXAA or SMAA (source size) -> resample to the viewport (an area
+    //   filter when RENDER SCALE / RESOLUTION render above it; below it FSR 1's EASU with UPSCALER
+    //   FSR 1, else bilinear) -> sharpen (FSR 1's RCAS after EASU, else contrast-adaptive after
+    //   AMD's CAS) -> FPS counter.
+    // With none of them and no resize, prep draws straight into the viewport (bilinear).
     ComPtr<ID3D11VertexShader> presentVs_;
     ComPtr<ID3D11PixelShader> presentPs_[4], fxaaPs_, downsamplePs_, sharpenPs_, fpsPs_, voicePs_, toastPs_;
+    // SMAA 1x (iryoku, MIT) and FSR 1 (AMD FidelityFX, MIT): their sources are game.rc's RCDATA
+    // 201-203, compiled the first time the setting is on (a failure logs and leaves it off).
+    ComPtr<ID3D11PixelShader> smaaEdgePs_, smaaWeightPs_, smaaBlendPs_, easuPs_, rcasPs_;
+    ComPtr<ID3D11ShaderResourceView> smaaArea_, smaaSearch_;
+    bool smaaTried_ = false, fsrTried_ = false;
     ComPtr<ID3D11SamplerState> presentSampler_;
     ComPtr<ID3D11Buffer> postCb_;
     struct PostCB { float srcSize[4]; float dstSize[4]; float params[4]; };   // params: brightness exponent, sharpness, fps
     struct PostTarget { ComPtr<ID3D11Texture2D> tex; ComPtr<ID3D11RenderTargetView> rtv; ComPtr<ID3D11ShaderResourceView> srv; UINT w = 0, h = 0; };
-    PostTarget post_[3];
+    PostTarget post_[5];                     // prep, anti-aliased, resized, SMAA edges, SMAA weights
     PostTarget& Post(int slot, UINT w, UINT h)
     {
         PostTarget& t = post_[slot];
@@ -1401,15 +1418,119 @@ private:
         t.w = w; t.h = h;
         return t;
     }
-    ComPtr<ID3D11PixelShader> PostShader(const std::string& body, const char* name)
+    ComPtr<ID3D11PixelShader> PostShader(const std::string& body, const char* name, bool header = true)
     {
-        const std::string header =
+        const std::string head = !header ? "" :
             "Texture2D<float4> src : register(t0); Texture2D<float4> lut : register(t1); SamplerState smp : register(s0);\n"
             "cbuffer Post : register(b0) { float4 srcSize; float4 dstSize; float4 params; };\n";
-        auto code = Compile(header + body, "ps_5_0", name);
+        auto code = Compile(head + body, "ps_5_0", name);
         ComPtr<ID3D11PixelShader> ps;
         Check(device_->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &ps), name);
         return ps;
+    }
+    // An RCDATA resource of the executable (game.rc.in) as text.
+    static std::string ResourceText(int id)
+    {
+        HRSRC r = FindResourceA(nullptr, MAKEINTRESOURCEA(id), MAKEINTRESOURCEA(10));
+        HGLOBAL g = r ? LoadResource(nullptr, r) : nullptr;
+        const void* p = g ? LockResource(g) : nullptr;
+        if (!p) throw std::runtime_error("shader source resource " + std::to_string(id) + " missing");
+        return std::string(static_cast<const char*>(p), SizeofResource(nullptr, r));
+    }
+    ComPtr<ID3D11ShaderResourceView> LookupTexture(const unsigned char* bytes, UINT w, UINT h, UINT pitch, DXGI_FORMAT format)
+    {
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = w; d.Height = h; d.MipLevels = d.ArraySize = 1; d.Format = format;
+        d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_IMMUTABLE; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        const D3D11_SUBRESOURCE_DATA init{ bytes, pitch, 0 };
+        ComPtr<ID3D11Texture2D> tex;
+        Check(device_->CreateTexture2D(&d, &init, &tex), "CreateSmaaLookup");
+        ComPtr<ID3D11ShaderResourceView> srv;
+        Check(device_->CreateShaderResourceView(tex.Get(), nullptr, &srv), "CreateSmaaLookupSrv");
+        return srv;
+    }
+    // SMAA 1x, HIGH preset, luma edges: three passes over the anti-aliasing input. LinearSampler
+    // is the present sampler (s0), PointSampler the point clamp (s1).
+    bool SmaaReady()
+    {
+        if (smaaTried_) return smaaBlendPs_ != nullptr;
+        smaaTried_ = true;
+        try
+        {
+            const std::string head =
+                "cbuffer Post : register(b0) { float4 srcSize; float4 dstSize; float4 params; };\n"
+                "SamplerState LinearSampler : register(s0); SamplerState PointSampler : register(s1);\n"
+                "#define SMAA_CUSTOM_SL 1\n#define SMAA_PRESET_HIGH 1\n"
+                "#define SMAA_RT_METRICS float4(srcSize.zw, srcSize.xy)\n"
+                "#define SMAATexture2D(tex) Texture2D tex\n#define SMAATexturePass2D(tex) tex\n"
+                "#define SMAASampleLevelZero(tex, coord) tex.SampleLevel(LinearSampler, coord, 0)\n"
+                "#define SMAASampleLevelZeroPoint(tex, coord) tex.SampleLevel(PointSampler, coord, 0)\n"
+                "#define SMAASampleLevelZeroOffset(tex, coord, offset) tex.SampleLevel(LinearSampler, coord, 0, offset)\n"
+                "#define SMAASample(tex, coord) tex.Sample(LinearSampler, coord)\n"
+                "#define SMAASamplePoint(tex, coord) tex.Sample(PointSampler, coord)\n"
+                "#define SMAASampleOffset(tex, coord, offset) tex.Sample(LinearSampler, coord, offset)\n"
+                "#define SMAA_FLATTEN [flatten]\n#define SMAA_BRANCH [branch]\n"
+                "#define SMAAGather(tex, coord) tex.Gather(LinearSampler, coord, 0)\n" +
+                ResourceText(201) + "\n";
+            smaaEdgePs_ = PostShader(head +
+                "Texture2D colorTex : register(t0);\n"
+                "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+                "  float4 offset[3]; SMAAEdgeDetectionVS(uv, offset);\n"
+                "  return float4(SMAALumaEdgeDetectionPS(uv, offset, colorTex), 0, 0); }\n", "ttt2 smaa edges ps", false);
+            smaaWeightPs_ = PostShader(head +
+                "Texture2D edgesTex : register(t0); Texture2D areaTex : register(t2); Texture2D searchTex : register(t3);\n"
+                "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+                "  float2 pixcoord; float4 offset[3]; SMAABlendingWeightCalculationVS(uv, pixcoord, offset);\n"
+                "  return SMAABlendingWeightCalculationPS(uv, pixcoord, offset, edgesTex, areaTex, searchTex, 0); }\n",
+                "ttt2 smaa weights ps", false);
+            smaaBlendPs_ = PostShader(head +
+                "Texture2D colorTex : register(t0); Texture2D blendTex : register(t2);\n"
+                "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+                "  float4 offset; SMAANeighborhoodBlendingVS(uv, offset);\n"
+                "  return float4(SMAANeighborhoodBlendingPS(uv, offset, colorTex, blendTex).rgb, 1); }\n", "ttt2 smaa blend ps", false);
+            smaaArea_ = LookupTexture(areaTexBytes, AREATEX_WIDTH, AREATEX_HEIGHT, AREATEX_PITCH, DXGI_FORMAT_R8G8_UNORM);
+            smaaSearch_ = LookupTexture(searchTexBytes, SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, SEARCHTEX_PITCH, DXGI_FORMAT_R8_UNORM);
+            std::fprintf(stderr, "[gpu-hw] SMAA ready\n");
+        }
+        catch (const std::exception& e)
+        {
+            smaaEdgePs_.Reset(); smaaWeightPs_.Reset(); smaaBlendPs_.Reset();
+            std::fprintf(stderr, "[gpu-hw] SMAA unavailable: %s\n", e.what());
+        }
+        return smaaBlendPs_ != nullptr;
+    }
+    // FSR 1: EASU enlarges srcSize to dstSize (pixel positions in a target at the origin); RCAS
+    // sharpens at 1:1, params.y (SHARPENING 0.3 / 0.6 / 1) as 1 .. 0.1 stops below its maximum.
+    bool FsrReady()
+    {
+        if (fsrTried_) return rcasPs_ != nullptr;
+        fsrTried_ = true;
+        try
+        {
+            const std::string ffx = "#define A_GPU 1\n#define A_HLSL 1\n" + ResourceText(202) + "\n";
+            easuPs_ = PostShader("#define FSR_EASU_F 1\n" + ffx +
+                "AF4 FsrEasuRF(AF2 p) { return src.GatherRed(smp, p); }\n"
+                "AF4 FsrEasuGF(AF2 p) { return src.GatherGreen(smp, p); }\n"
+                "AF4 FsrEasuBF(AF2 p) { return src.GatherBlue(smp, p); }\n" + ResourceText(203) + "\n"
+                "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+                "  AU4 c0, c1, c2, c3; FsrEasuCon(c0, c1, c2, c3, srcSize.x, srcSize.y, srcSize.x, srcSize.y, dstSize.x, dstSize.y);\n"
+                "  AF3 c; FsrEasuF(c, AU2(pos.xy), c0, c1, c2, c3);\n"
+                "  return float4(c, 1); }\n", "ttt2 fsr easu ps");
+            rcasPs_ = PostShader("#define FSR_RCAS_F 1\n" + ffx +
+                "AF4 FsrRcasLoadF(ASU2 p) { return src.Load(int3(clamp(p, 0, int2(srcSize.xy) - 1), 0)); }\n"
+                "void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}\n" + ResourceText(203) + "\n"
+                "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+                "  AU4 con = AU4(asuint(exp2(-lerp(1.0, 0.1, params.y))), 0, 0, 0);\n"
+                "  AF1 r, g, b; FsrRcasF(r, g, b, AU2(uv * srcSize.xy), con);\n"
+                "  return float4(r, g, b, 1); }\n", "ttt2 fsr rcas ps");
+            std::fprintf(stderr, "[gpu-hw] FSR 1 ready\n");
+        }
+        catch (const std::exception& e)
+        {
+            easuPs_.Reset(); rcasPs_.Reset();
+            std::fprintf(stderr, "[gpu-hw] FSR 1 unavailable: %s\n", e.what());
+        }
+        return rcasPs_ != nullptr;
     }
     void MakePostShaders()
     {
@@ -1631,8 +1752,9 @@ private:
         PostPass(toastPs_.Get(), toastSrv_.Get(), rtv, box, cb);
         context_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
     }
+    // `extra0` / `extra1`: textures at t2 / t3 (SMAA's lookups and intermediate results).
     void PostPass(ID3D11PixelShader* ps, ID3D11ShaderResourceView* srv, ID3D11RenderTargetView* rtv, const D3D11_VIEWPORT& vp,
-                  const PostCB& cb)
+                  const PostCB& cb, ID3D11ShaderResourceView* extra0 = nullptr, ID3D11ShaderResourceView* extra1 = nullptr)
     {
         D3D11_MAPPED_SUBRESOURCE m{};
         if (SUCCEEDED(context_->Map(postCb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
@@ -1647,11 +1769,11 @@ private:
         const D3D11_RECT clip{ LONG(vp.TopLeftX), LONG(vp.TopLeftY), LONG(std::ceil(vp.TopLeftX + vp.Width)), LONG(std::ceil(vp.TopLeftY + vp.Height)) };
         context_->RSSetScissorRects(1, &clip);
         context_->PSSetShader(ps, nullptr, 0);
-        ID3D11ShaderResourceView* v[2] = { srv, gammaSrv_.Get() };
-        context_->PSSetShaderResources(0, 2, v);
+        ID3D11ShaderResourceView* v[4] = { srv, gammaSrv_.Get(), extra0, extra1 };
+        context_->PSSetShaderResources(0, 4, v);
         context_->Draw(3, 0);
-        ID3D11ShaderResourceView* none[2] = { nullptr, nullptr };
-        context_->PSSetShaderResources(0, 2, none);
+        ID3D11ShaderResourceView* none[4] = {};
+        context_->PSSetShaderResources(0, 4, none);
     }
     void PresentScaled(ID3D11Texture2D* source, ID3D11Texture2D* back, bool swap)
     {
@@ -1717,8 +1839,8 @@ private:
         context_->IASetInputLayout(nullptr);
         context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         context_->VSSetShader(presentVs_.Get(), nullptr, 0);
-        ID3D11SamplerState* smp = presentSampler_.Get();
-        context_->PSSetSamplers(0, 1, &smp);
+        ID3D11SamplerState* smp[2] = { presentSampler_.Get(), pointClamp_.Get() };
+        context_->PSSetSamplers(0, 2, smp);
         ID3D11Buffer* cbs = postCb_.Get();
         context_->PSSetConstantBuffers(0, 1, &cbs);
 
@@ -1730,9 +1852,11 @@ private:
         static const float kSharpness[4] = { 0.0f, 0.3f, 0.6f, 1.0f };
         cb.params[0] = std::pow(2.0f, float(5 - gfx_.brightness) / 10.0f);
         cb.params[1] = kSharpness[std::clamp(gfx_.sharpen, 0, 3)];
-        const bool fxaa = gfx_.fxaa, sharpen = gfx_.sharpen > 0;
+        const bool fxaa = gfx_.antiAliasing == 1, smaa = gfx_.antiAliasing == 2 && SmaaReady(), sharpen = gfx_.sharpen > 0;
         const bool downscale = float(sd.Width) > vw * 1.01f || float(sd.Height) > vh * 1.01f;
-        if (!fxaa && !sharpen && !downscale)
+        const bool upscale = float(sd.Width) < vw * 0.99f || float(sd.Height) < vh * 0.99f;
+        const bool fsr = gfx_.upscaler && upscale && FsrReady();
+        if (!fxaa && !smaa && !sharpen && !downscale && !fsr)
         {
             sizes(sd.Width, sd.Height, vw, vh);
             PostPass(ps.Get(), srv.Get(), rtv, vp, cb);
@@ -1750,8 +1874,30 @@ private:
                 PostPass(fxaaPs_.Get(), cur->srv.Get(), aa.rtv.Get(), full, cb);
                 cur = &aa;
             }
+            else if (smaa)
+            {
+                // Edges (non-edge pixels discarded, so cleared first), blend weights, blending.
+                PostTarget& edges = Post(3, sd.Width, sd.Height);
+                PostTarget& weights = Post(4, sd.Width, sd.Height);
+                PostTarget& aa = Post(1, sd.Width, sd.Height);
+                const float clear[4] = {};
+                context_->ClearRenderTargetView(edges.rtv.Get(), clear);
+                PostPass(smaaEdgePs_.Get(), cur->srv.Get(), edges.rtv.Get(), full, cb);
+                PostPass(smaaWeightPs_.Get(), edges.srv.Get(), weights.rtv.Get(), full, cb, smaaArea_.Get(), smaaSearch_.Get());
+                PostPass(smaaBlendPs_.Get(), cur->srv.Get(), aa.rtv.Get(), full, cb, weights.srv.Get());
+                cur = &aa;
+            }
             sizes(sd.Width, sd.Height, float(outW), float(outH));
-            if (sharpen)
+            if (fsr)
+            {
+                // EASU into a target at the origin (its pixel positions), then RCAS or a 1:1 copy.
+                PostTarget& scaled = Post(2, outW, outH);
+                PostPass(easuPs_.Get(), cur->srv.Get(), scaled.rtv.Get(), D3D11_VIEWPORT{ 0, 0, float(outW), float(outH), 0, 1 }, cb);
+                sizes(outW, outH, float(outW), float(outH));
+                PostPass(sharpen ? rcasPs_.Get() : downsamplePs_.Get(), scaled.srv.Get(), rtv,
+                         D3D11_VIEWPORT{ vp.TopLeftX, vp.TopLeftY, float(outW), float(outH), 0, 1 }, cb);
+            }
+            else if (sharpen)
             {
                 PostTarget& scaled = Post(2, outW, outH);
                 PostPass(downsamplePs_.Get(), cur->srv.Get(), scaled.rtv.Get(), D3D11_VIEWPORT{ 0, 0, float(outW), float(outH), 0, 1 }, cb);
@@ -2563,7 +2709,10 @@ private:
             return std::clamp(float(std::atof(e)), 1.0f, 4.0f);
         // RESOLUTION, times GRAPHICS SETTINGS' RENDER SCALE (supersampling, filtered down when presented).
         const display_settings::Resolution r = display_settings::GetResolution();
-        const float extra = float(display_settings::RenderScales()[size_t(display_settings::GetGraphics().renderScale)]) / 100.0f;
+        // With UPSCALER FSR 1, FSR MODE renders below that (EASU enlarges it when presented).
+        const display_settings::Graphics g = display_settings::GetGraphics();
+        const float extra = float(display_settings::RenderScales()[size_t(g.renderScale)]) / 100.0f *
+                            (g.upscaler ? float(display_settings::FsrModes()[size_t(g.fsrMode)]) / 100.0f : 1.0f);
         return std::clamp(std::min(float(r.width) / 1280.0f, float(r.height) / 720.0f) * extra, 1.0f, 4.0f);
     }
     // Follow the RESOLUTION setting (checked once per change of the settings generation).

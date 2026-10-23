@@ -24,7 +24,7 @@ struct Player
     bool talking = false;
     bool inSession = false;     // game packets from them in the last few seconds
 };
-// The players met this session (most recent first, at most 6).
+// The players met this session (the 6 heard from most recently, in the order they were met).
 std::vector<Player> Players();
 
 // For the overlay: our microphone is sending / somebody unmuted is heard / F8 mutes everyone.

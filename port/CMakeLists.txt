@@ -186,8 +186,15 @@ target_compile_definitions(tekken_recomp PRIVATE TTT2_VERSION_STR="${TTT2_VERSIO
 target_link_libraries(tekken_recomp PRIVATE winhttp)
 # Original art (port/tools/make_icon.py), not the game's.
 set(TTT2_SETUP_ICON "${CMAKE_SOURCE_DIR}/src/setup/ttt2.ico")
+# GRAPHICS SETTINGS' SMAA (iryoku, MIT) and FSR 1 (AMD FidelityFX, MIT) shader sources ride in
+# game.rc as RCDATA; the renderer compiles them when first switched on. SMAA's lookup textures
+# are C arrays (third_party/smaa/*Tex.h).
+set(TTT2_SMAA_DIR "${CMAKE_SOURCE_DIR}/third_party/smaa")
+set(TTT2_FSR1_DIR "${CMAKE_SOURCE_DIR}/third_party/fsr1")
+target_include_directories(tekken_recomp PRIVATE "${TTT2_SMAA_DIR}")
 configure_file(src/runtime/game.rc.in "${CMAKE_BINARY_DIR}/game.rc" @ONLY)
-set_source_files_properties("${CMAKE_BINARY_DIR}/game.rc" PROPERTIES OBJECT_DEPENDS "${TTT2_SETUP_ICON}")
+set_source_files_properties("${CMAKE_BINARY_DIR}/game.rc" PROPERTIES OBJECT_DEPENDS
+    "${TTT2_SETUP_ICON};${TTT2_SMAA_DIR}/SMAA.hlsl;${TTT2_FSR1_DIR}/ffx_a.h;${TTT2_FSR1_DIR}/ffx_fsr1.h")
 target_sources(tekken_recomp PRIVATE "${CMAKE_BINARY_DIR}/game.rc")
 
 # --- Installer (ttt2_setup) ------------------------------------------------------------------

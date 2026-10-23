@@ -35,14 +35,23 @@ struct Graphics
 {
     bool vsync = true;          // OFF: tearing allowed (lowest latency)
     int renderScale = 0;        // index into RenderScales(): supersampling on top of RESOLUTION
-    bool fxaa = false;          // FXAA on the final image
+    int upscaler = 1;           // 0 OFF (bilinear), 1 FSR 1 (EASU, RCAS for SHARPENING) when the image is enlarged
+    int fsrMode = 0;            // index into FsrModes(): with FSR 1, render that far below RESOLUTION (never below 720p)
+    int antiAliasing = 0;       // 0 OFF, 1 FXAA, 2 SMAA (1x, on the final image)
     int anisotropy = 0;         // index into Anisotropies(): 0 = the game's own (bilinear / trilinear)
     int sharpen = 0;            // 0 OFF, 1 LOW, 2 MEDIUM, 3 HIGH (contrast-adaptive)
+    bool motionBlur = true;     // OFF: the game's velocity pass is skipped, so its blur moves nothing
     int brightness = 5;         // 0..10, 5 = unchanged
     bool fpsCounter = false;    // frames per second in the top-left corner
 };
 const std::vector<int>& RenderScales();      // percent: 100 125 150 200
 const std::vector<int>& Anisotropies();      // 1 (off) 2 4 8 16
+const std::vector<int>& FsrModes();          // percent of RESOLUTION: 100 77 67 59 50
+// The GRAPHICS SETTINGS presets (LOW .. ULTRA): render scale, upscaler, FSR mode, anti-aliasing,
+// filtering and sharpening; the other settings stay. PresetOf: the preset `g` matches, or -1.
+constexpr int kPresets = 4;
+Graphics Preset(int preset, Graphics g);
+int PresetOf(const Graphics& g);
 Graphics GetGraphics();
 void SetGraphics(const Graphics& g);         // clamps, persists, bumps Generation()
 

@@ -194,7 +194,8 @@ void NotePeer(uint64_t peer)
 
 std::vector<Player> Players()
 {
-    std::vector<std::pair<clock::time_point, Player>> all;
+    struct Entry { clock::time_point last, met; Player player; };
+    std::vector<Entry> all;
     {
         std::lock_guard l(g_mutex);
         const auto now = clock::now();
@@ -205,16 +206,21 @@ std::vector<Player> Players()
             pl.name = p.name.empty() ? "PLAYER" : p.name;
             pl.talking = now - p.lastVoice < kTalkHold;
             pl.inSession = now - p.lastPacket < kPeerTimeout;
-            all.push_back({ (std::max)(p.lastPacket, p.lastVoice), pl });
+            all.push_back({ (std::max)(p.lastPacket, p.lastVoice), p.met, pl });
         }
     }
-    std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    // The 6 heard from most recently, listed in the order they were met: sorting the list itself by
+    // the last packet reshuffled it many times a second (every peer's packets keep arriving).
+    std::sort(all.begin(), all.end(), [](const Entry& a, const Entry& b) { return a.last > b.last; });
+    if (all.size() > 6) all.resize(6);
+    std::sort(all.begin(), all.end(), [](const Entry& a, const Entry& b) {
+        return a.met != b.met ? a.met < b.met : a.player.peer < b.player.peer;
+    });
     std::vector<Player> out;
-    for (auto& [t, p] : all)
+    for (Entry& e : all)
     {
-        if (out.size() == 6) break;
-        p.muted = display_settings::IsVoiceMuted(p.peer);
-        out.push_back(std::move(p));
+        e.player.muted = display_settings::IsVoiceMuted(e.player.peer);
+        out.push_back(std::move(e.player));
     }
     return out;
 }

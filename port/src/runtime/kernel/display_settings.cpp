@@ -5,8 +5,9 @@
 //   [Game]
 //   InputDelay=0|1        (the game's 2-frame offline input delay: removed / original)
 //   [Graphics]
-//   VSync=0|1  RenderScale=100|125|150|200  FXAA=0|1  Anisotropy=1|2|4|8|16
-//   Sharpen=0..3  Brightness=0..10  FpsCounter=0|1
+//   VSync=0|1  RenderScale=100|125|150|200  Upscaler=0|1  FsrMode=100|77|67|59|50
+//   AntiAliasing=0|1|2 (FXAA=0|1 before it)  Anisotropy=1|2|4|8|16  Sharpen=0..3  MotionBlur=0|1
+//   Brightness=0..10  FpsCounter=0|1
 // in %LOCALAPPDATA%\TTT2Recomp\settings.ini, read once at first use.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -54,6 +55,9 @@ Graphics Clamped(Graphics g)
 {
     g.renderScale = std::clamp(g.renderScale, 0, int(RenderScales().size()) - 1);
     g.anisotropy = std::clamp(g.anisotropy, 0, int(Anisotropies().size()) - 1);
+    g.upscaler = std::clamp(g.upscaler, 0, 1);
+    g.fsrMode = std::clamp(g.fsrMode, 0, int(FsrModes().size()) - 1);
+    g.antiAliasing = std::clamp(g.antiAliasing, 0, 2);
     g.sharpen = std::clamp(g.sharpen, 0, 3);
     g.brightness = std::clamp(g.brightness, 0, 10);
     return g;
@@ -80,9 +84,13 @@ void LoadLocked()
     Graphics& g = g_graphics;
     g.vsync = GetPrivateProfileIntA("Graphics", "VSync", d.vsync, ini.c_str()) != 0;
     g.renderScale = IndexOf(RenderScales(), GetPrivateProfileIntA("Graphics", "RenderScale", 100, ini.c_str()));
-    g.fxaa = GetPrivateProfileIntA("Graphics", "FXAA", d.fxaa, ini.c_str()) != 0;
+    g.upscaler = GetPrivateProfileIntA("Graphics", "Upscaler", d.upscaler, ini.c_str());
+    g.fsrMode = IndexOf(FsrModes(), GetPrivateProfileIntA("Graphics", "FsrMode", 100, ini.c_str()));
+    g.antiAliasing = GetPrivateProfileIntA("Graphics", "AntiAliasing",
+                                           GetPrivateProfileIntA("Graphics", "FXAA", d.antiAliasing, ini.c_str()), ini.c_str());
     g.anisotropy = IndexOf(Anisotropies(), GetPrivateProfileIntA("Graphics", "Anisotropy", 1, ini.c_str()));
     g.sharpen = GetPrivateProfileIntA("Graphics", "Sharpen", d.sharpen, ini.c_str());
+    g.motionBlur = GetPrivateProfileIntA("Graphics", "MotionBlur", d.motionBlur, ini.c_str()) != 0;
     g.brightness = GetPrivateProfileIntA("Graphics", "Brightness", d.brightness, ini.c_str());
     g.fpsCounter = GetPrivateProfileIntA("Graphics", "FpsCounter", d.fpsCounter, ini.c_str()) != 0;
     g = Clamped(g);
@@ -122,9 +130,13 @@ void SaveLocked()
     };
     put("VSync", g.vsync);
     put("RenderScale", RenderScales()[size_t(g.renderScale)]);
-    put("FXAA", g.fxaa);
+    put("Upscaler", g.upscaler);
+    put("FsrMode", FsrModes()[size_t(g.fsrMode)]);
+    put("AntiAliasing", g.antiAliasing);
+    WritePrivateProfileStringA("Graphics", "FXAA", nullptr, ini.c_str());
     put("Anisotropy", Anisotropies()[size_t(g.anisotropy)]);
     put("Sharpen", g.sharpen);
+    put("MotionBlur", g.motionBlur);
     put("Brightness", g.brightness);
     put("FpsCounter", g.fpsCounter);
     auto putVoice = [&](const char* key, int v) {
@@ -163,6 +175,40 @@ const std::vector<int>& Anisotropies()
 {
     static const std::vector<int> list = { 1, 2, 4, 8, 16 };
     return list;
+}
+
+const std::vector<int>& FsrModes()
+{
+    static const std::vector<int> list = { 100, 77, 67, 59, 50 };
+    return list;
+}
+
+// LOW / MEDIUM let FSR 1 render below RESOLUTION; HIGH / ULTRA aim for the sharpest picture.
+// Columns: render scale, upscaler, FSR mode, anti-aliasing, anisotropy, sharpen (indices).
+static const int kPresetValues[kPresets][6] = {
+    { 0, 1, 4, 1, 1, 1 },     // LOW:    100%, FSR 1 PERFORMANCE, FXAA, 2x, LOW
+    { 0, 1, 2, 1, 3, 1 },     // MEDIUM: 100%, FSR 1 QUALITY, FXAA, 8x, LOW
+    { 0, 1, 0, 2, 4, 2 },     // HIGH:   100%, FSR 1 NATIVE, SMAA, 16x, MEDIUM
+    { 3, 1, 0, 2, 4, 1 },     // ULTRA:  200%, FSR 1 NATIVE, SMAA, 16x, LOW
+};
+
+Graphics Preset(int preset, Graphics g)
+{
+    const int* v = kPresetValues[std::clamp(preset, 0, kPresets - 1)];
+    g.renderScale = v[0]; g.upscaler = v[1]; g.fsrMode = v[2]; g.antiAliasing = v[3]; g.anisotropy = v[4]; g.sharpen = v[5];
+    return g;
+}
+
+int PresetOf(const Graphics& g)
+{
+    for (int p = 0; p < kPresets; ++p)
+    {
+        const int* v = kPresetValues[p];
+        if (g.renderScale == v[0] && g.upscaler == v[1] && g.fsrMode == v[2] && g.antiAliasing == v[3] &&
+            g.anisotropy == v[4] && g.sharpen == v[5])
+            return p;
+    }
+    return -1;
 }
 
 int GetMode() { std::lock_guard<std::mutex> l(g_mutex); LoadLocked(); return g_mode; }
@@ -214,14 +260,16 @@ void SetGraphics(const Graphics& wanted)
     LoadLocked();
     const Graphics g = Clamped(wanted);
     const Graphics& o = g_graphics;
-    if (g.vsync == o.vsync && g.renderScale == o.renderScale && g.fxaa == o.fxaa && g.anisotropy == o.anisotropy &&
-        g.sharpen == o.sharpen && g.brightness == o.brightness && g.fpsCounter == o.fpsCounter)
+    if (g.vsync == o.vsync && g.renderScale == o.renderScale && g.upscaler == o.upscaler && g.fsrMode == o.fsrMode &&
+        g.antiAliasing == o.antiAliasing && g.anisotropy == o.anisotropy && g.sharpen == o.sharpen &&
+        g.motionBlur == o.motionBlur && g.brightness == o.brightness && g.fpsCounter == o.fpsCounter)
         return;
     g_graphics = g;
     SaveLocked();
     g_generation.fetch_add(1);
-    std::fprintf(stderr, "[display] graphics: vsync %d, render scale %d%%, fxaa %d, anisotropy %dx, sharpen %d, brightness %d, fps %d\n",
-                 g.vsync, RenderScales()[size_t(g.renderScale)], g.fxaa, Anisotropies()[size_t(g.anisotropy)], g.sharpen,
+    std::fprintf(stderr, "[display] graphics: vsync %d, render scale %d%%, upscaler %d (fsr %d%%), aa %d, anisotropy %dx, sharpen %d, motion blur %d, brightness %d, fps %d\n",
+                 g.vsync, RenderScales()[size_t(g.renderScale)], g.upscaler, FsrModes()[size_t(g.fsrMode)], g.antiAliasing,
+                 Anisotropies()[size_t(g.anisotropy)], g.sharpen, g.motionBlur,
                  g.brightness, g.fpsCounter);
 }
 
