@@ -1102,10 +1102,48 @@ void Finish(PPCContext& ctx, uint8_t* base, Ui& ui)
 }
 
 // A profile signs in (Select Profile, or the game's own sign-in): check for an update and show
-// the build and the answer as a notification, top right (toast.h). Once per sign-in.
+// the build and the answer as a notification, top right (toast.h). Once per sign-in. A newer
+// release keeps the notification up and clickable: a left click downloads it (the progress shows
+// in the note), the next one installs it (the game closes and starts again); a right click
+// dismisses it.
+toast::Note UpdateNote(const updater::Status& st)
+{
+    using S = updater::State;
+    toast::Note note;
+    note.highlight = true;
+    note.clickable = st.state != S::Downloading;
+    const std::string build = std::string("Build ") + updater::CurrentVersion();
+    switch (st.state)
+    {
+    case S::Downloading:
+        note.title = "DOWNLOADING UPDATE";
+        note.lines = { "Version " + st.latest + "  -  " + std::to_string(st.percent) + "%", build };
+        break;
+    case S::Downloaded:
+        note.title = "UPDATE READY";
+        if (updater::CanInstall())
+            note.lines = { "Version " + st.latest + " is downloaded.", "Click to install - the game restarts." };
+        else
+            note.lines = { "Version " + st.latest + " is downloaded, but this copy", "is not an installed one: run the installer." };
+        break;
+    case S::Failed:
+        note.title = "UPDATE FAILED";
+        note.lines = { st.error.empty() ? std::string("Something went wrong.") : st.error, "Click to try again  -  right-click to dismiss" };
+        break;
+    default:
+        note.title = "UPDATE AVAILABLE";
+        note.lines = { "Version " + st.latest + " is ready to download.", build,
+                       "Click here to update  -  right-click to dismiss" };
+        break;
+    }
+    return note;
+}
+
 void SignInNotice()
 {
-    static bool signedIn = false, waiting = false;
+    using S = updater::State;
+    static bool signedIn = false, waiting = false, interactive = false;
+    static std::string shown;                       // the clickable note's text as last shown
     const bool now = profiles::SignedIn();
     if (now && !signedIn)
     {
@@ -1113,27 +1151,59 @@ void SignInNotice()
         waiting = true;
     }
     signedIn = now;
-    if (!waiting) return;
-    const updater::Status st = updater::Get();
-    using S = updater::State;
-    if (st.state == S::Checking || st.state == S::Idle) return;
-    waiting = false;
-    toast::Note note;
-    const std::string build = std::string("Build ") + updater::CurrentVersion();
-    if (st.state == S::Available || st.state == S::Downloaded)
+    if (waiting)
     {
-        note.title = "UPDATE AVAILABLE";
-        note.lines = { "Version " + st.latest + " is ready to download.", build + "  -  Options > Updates" };
-        note.highlight = true;
-        toast::Show(note, 12000);
+        const updater::Status st = updater::Get();
+        if (st.state == S::Checking || st.state == S::Idle) return;
+        waiting = false;
+        if (st.state == S::Available || st.state == S::Downloaded)
+        {
+            const toast::Note note = UpdateNote(st);
+            toast::Show(note, 0);                     // until used or dismissed
+            shown = note.title + note.lines.front();
+            interactive = true;
+        }
+        else
+        {
+            toast::Note note;
+            note.title = std::string("TTT2 RECOMP ") + updater::CurrentVersion();
+            note.lines = { st.state == S::UpToDate ? "You are on the latest update." : "Could not check for updates." };
+            toast::Show(note, 6000);
+        }
+        std::fprintf(stderr, "[update] sign-in notice: state %d\n", int(st.state));
+        return;
     }
-    else
+    if (!interactive) return;
+    if (!toast::Showing()) { interactive = false; return; }
+    const int click = toast::TakeClick();
+    if (click == 2)
     {
-        note.title = std::string("TTT2 RECOMP ") + updater::CurrentVersion();
-        note.lines = { st.state == S::UpToDate ? "You are on the latest update." : "Could not check for updates." };
-        toast::Show(note, 6000);
+        toast::Hide();
+        interactive = false;
+        std::fprintf(stderr, "[update] notice dismissed\n");
+        return;
     }
-    std::fprintf(stderr, "[update] sign-in notice: %s\n", note.title.c_str());
+    updater::Status st = updater::Get();
+    if (click == 1)
+    {
+        std::fprintf(stderr, "[update] notice clicked (state %d)\n", int(st.state));
+        if (st.state == S::Available || st.state == S::Failed) updater::Download();
+        else if (st.state == S::Downloaded && updater::CanInstall())
+        {
+            std::string error;
+            if (updater::Install(error)) { QuitForUpdate(); return; }
+            toast::Note note = UpdateNote(st);
+            note.title = "UPDATE FAILED";
+            note.lines = { "The installer could not start:", error };
+            toast::Update(note);
+            shown.clear();
+            return;
+        }
+        st = updater::Get();
+    }
+    const toast::Note note = UpdateNote(st);
+    const std::string text = note.title + note.lines.front();
+    if (text != shown) { toast::Update(note); shown = text; }
 }
 
 void Frame(PPCContext& ctx, uint8_t* base)

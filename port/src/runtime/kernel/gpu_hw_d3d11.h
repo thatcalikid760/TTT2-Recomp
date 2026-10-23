@@ -1485,6 +1485,7 @@ private:
         toastPs_ = PostShader(
             "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
             "  float4 c = src.SampleLevel(smp, uv, 0);\n"
+            "  c.rgb = c.rgb + params.y * 0.12 * c.a;\n"                     // hovered
             "  return float4(c.rgb, c.a * params.x); }\n", "ttt2 toast ps");
     }
     // ---- notifications (toast.h): the note drawn with GDI into a premultiplied BGRA texture, made
@@ -1614,6 +1615,17 @@ private:
         const float margin = std::floor(vp.Height / 40.0f);
         const float slide = (1.0f - opacity) * margin * 2;
         const D3D11_VIEWPORT box{ vp.TopLeftX + vp.Width - float(toastW_) - margin + slide, vp.TopLeftY + margin, float(toastW_), float(toastH_), 0, 1 };
+        toast::SetRect(int(box.TopLeftX), int(box.TopLeftY), int(box.TopLeftX + box.Width), int(box.TopLeftY + box.Height));
+        // A clickable note brightens under the mouse pointer.
+        cb.params[1] = 0;
+        if (note.clickable)
+            if (const HWND w = window_.load())
+            {
+                POINT p{};
+                GetCursorPos(&p);
+                ScreenToClient(w, &p);
+                if (toast::Hovered(p.x, p.y)) cb.params[1] = 1;
+            }
         const float factor[4] = { opacity, opacity, opacity, opacity };
         context_->OMSetBlendState(toastBlend_.Get(), factor, 0xFFFFFFFF);
         PostPass(toastPs_.Get(), toastSrv_.Get(), rtv, box, cb);

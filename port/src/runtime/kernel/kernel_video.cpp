@@ -27,6 +27,8 @@
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <windowsx.h>
+#include "toast.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -219,6 +221,18 @@ static LRESULT CALLBACK GameWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         break;
     case WM_SETCURSOR:
         if (g_cursorHidden && LOWORD(lp) == HTCLIENT) { SetCursor(nullptr); return TRUE; }
+        if (LOWORD(lp) == HTCLIENT)
+        {
+            POINT p{};
+            GetCursorPos(&p);
+            ScreenToClient(wnd, &p);
+            if (toast::Hovered(p.x, p.y)) { SetCursor(LoadCursorA(nullptr, reinterpret_cast<LPCSTR>(IDC_HAND))); return TRUE; }
+        }
+        break;
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+        // A click on a clickable notification (toast.h) is the notification's.
+        if (toast::OnClick(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), msg == WM_RBUTTONDOWN)) return 0;
         break;
     case WM_SYSCHAR:
         return 0;                               // no beep for Alt+Enter or Alt+letter (Alt can be a game key)
