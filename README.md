@@ -8,15 +8,34 @@ A patched build of the native PC static recompilation of *Tekken Tag Tournament 
 
 This project is built on **[shihabal3amri/tekken-tag-tournament-2-pc](https://github.com/shihabal3amri/tekken-tag-tournament-2-pc)**, the original native Windows port by static recompilation. All credit for the port itself goes to that project and the tools it builds on ([XenonRecomp](https://github.com/hedge-dev/XenonRecomp), with [Unleashed Recompiled](https://github.com/hedge-dev/UnleashedRecomp) and [Xenia](https://github.com/xenia-project/xenia) as references).
 
-## What's changed in TTT2 Recomp
+## Patch notes
 
+### 0.1.9
+- **Update notifications:** when you pick your profile, the game checks for a newer version and shows your build number in the top right. If an update is out, click the notification to download it, then click again to install (right-click dismisses it).
+- **Voice chat in the lobby:** press **R3** (or **F7** on keyboard) in the menus or an online lobby to change voice mode and volume and to mute players without leaving the lobby. The lobby's button bar shows the shortcut for your controller.
+- **Steam profiles:** in that panel, select a player and press **X** (Square on PlayStation) to open their Steam profile.
+- The mouse cursor hides when you're not using the mouse.
+- **Fix:** with FXAA or sharpening on, the picture could be cut off at large render scales.
+
+### 0.1.8
+- **Graphics Settings:** V-Sync, render scale (supersampling), FXAA, anisotropic filtering, sharpening, brightness, FPS counter.
+- **Voice Chat:** open mic or push-to-talk in online lobbies and matches, voice volume, mute players (F8 mutes everyone).
+- **Updates:** check for and install new versions from inside the game (Options > Updates).
+- **Fix:** Discord Join now works for friends-only sessions.
+
+### 0.1.7 (+ hotfix)
+- **PS4 / PS5 controllers:** native DualShock 4 and DualSense support.
+- **Button prompts** switch between PlayStation, Xbox and keyboard icons across all menus and in-game UI (menu setting).
+- **Discord Join:** join a friend's open lobby straight from Discord, no lobby search needed.
+- **Text chat** in online custom lobbies, for players without a microphone.
+- **Installer update mode:** updates an existing install and keeps your progress.
+- **Fix:** custom character portraits no longer show as a black box.
+
+### Earlier
 - **Online lobby fix** ([upstream issue #30](https://github.com/shihabal3amri/tekken-tag-tournament-2-pc/issues/30)): after the first online match, the guest could no longer find the host's lobby until both players restarted. The Steam helper now recovers if it exits mid-game, and lobbies are republished so they can be found again.
 - Launcher and installer branded "TTT2 Recomp by ThatCaliKid760".
 
-### Planned
-
-- Native PS4/PS5 controller support with PlayStation button prompts
-- Discord invite/join
+Steam must be running in the background for online play.
 
 ## Install
 
