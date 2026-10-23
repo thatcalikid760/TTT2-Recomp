@@ -1,0 +1,1080 @@
+// Xam user/profile, XConfig, XMsg, and misc system imports. These return real
+// "retail US console, user 0 signed in locally" data (values modeled on UnleashedRecomp)
+// so engine init that branches on region/language/profile gets sane values, not stub zeros.
+#include "kernel_shared.h"
+#include "kernel_trace.h"
+#include "guest_heap.h"
+#include "kernel_content.h"
+#include "title_server.h"
+#include "profiles.h"
+#include "sys_ui.h"
+#include "keyboard_keys.h"
+#include "xlive.h"
+#include "ps_pads.h"
+#include "button_prompts.h"
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <string>
+#include <vector>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <Xinput.h>
+
+// --- ExGetXConfigSetting(category, setting, buffer, bufferSize, requiredSize) ---
+PPC_FUNC(__imp__ExGetXConfigSetting)
+{
+    KTrace("ExGetXConfigSetting");
+    uint32_t category = ctx.r3.u32 & 0xFFFF, setting = ctx.r4.u32 & 0xFFFF;
+    uint32_t buffer = ctx.r5.u32, size = ctx.r6.u32 & 0xFFFF, required = ctx.r7.u32;
+    uint32_t value = 0;
+    bool known = false;
+    if (category == 0x0002)                                          // XCONFIG_SECURED_CATEGORY
+    {
+        if (setting == 0x0002) { value = 0x00001000; known = true; } // AV region: USA/Canada
+    }
+    else if (category == 0x0003)                                     // XCONFIG_USER_CATEGORY
+    {
+        switch (setting)
+        {
+        case 0x0001: case 0x0002: case 0x0003: case 0x0004:          // time-zone fields: zero
+        case 0x0005: case 0x0006: case 0x0007:
+            value = 0; known = true; break;
+        case 0x0009: value = 1;          known = true; break;        // language: English
+        case 0x000A: value = 0x00040000; known = true; break;        // video flags: widescreen
+        case 0x000C: value = 1;          known = true; break;        // retail flags
+        case 0x000E: value = 103;        known = true; break;        // country: United States
+        }
+    }
+    if (!known)
+    {
+        std::fprintf(stderr, "[xconfig] unknown query category=%04X setting=%04X size=%u\n",
+                     category, setting, size);
+        ctx.r3.u32 = 1;
+        return;
+    }
+    for (uint32_t i = 0; i < size && i < 16; ++i) GWrite8(base, buffer + i, 0);
+    if (size >= 4) GWrite32(base, buffer, value);
+    GWrite32(base, required, 4);
+    ctx.r3.u32 = 0;
+}
+
+// --- console identity ---
+PPC_FUNC(__imp__XGetGameRegion)
+{
+    KTrace("XGetGameRegion"); ctx.r3.u32 = 0x03FF; }                 // region-free
+PPC_FUNC(__imp__XGetLanguage)
+{
+    KTrace("XGetLanguage"); ctx.r3.u32 = 1; }                        // English
+PPC_FUNC(__imp__XGetAVPack)
+{
+    KTrace("XGetAVPack"); ctx.r3.u32 = 0; }
+PPC_FUNC(__imp__XamGetSystemVersion)
+{
+    KTrace("XamGetSystemVersion"); ctx.r3.u32 = 0; }
+
+// --- user 0: the signed-in local profile (profiles.cpp: name = gamertag, offline XUID; nobody
+// at boot until the Select Profile screen signs one in). With TTT2_TITLE_SERVER=1 the profile
+// reports a Live sign-in (state 2), which TTT2's title-storage download requires
+// (title_server.cpp); its online XUID is stable and distinct from the offline one, because
+// the profile monitor sub_82B37080 compares both every poll. ---
+static bool User0SignedIn() { return profiles::SignedIn(); }
+
+// TTT2_XAM_TRACE=1: each new (function, caller, user, result) of the user queries, timestamped.
+static void UserTrace(const char* fn, uint32_t lr, uint32_t user, uint32_t result)
+{
+    static const bool on = std::getenv("TTT2_XAM_TRACE") != nullptr;
+    if (!on) return;
+    static std::mutex m;
+    static std::unordered_map<uint64_t, int> seen;
+    const uint64_t key = (uint64_t(lr) << 32) ^ (uint64_t(user) << 24) ^ result ^ (uint64_t(uintptr_t(fn)) << 8);
+    std::lock_guard l(m);
+    if (seen[key]++) return;
+    std::fprintf(stderr, "[xam-user] %llu ms %s user %u lr %08X -> %08X\n",
+                 (unsigned long long)GetTickCount64(), fn, user, lr, result);
+}
+
+PPC_FUNC(__imp__XamUserGetSigninState)
+{
+    KTrace("XamUserGetSigninState");
+    const uint32_t user = ctx.r3.u32;
+    ctx.r3.u32 = user == 0 && User0SignedIn() ? (TitleServerEnabled() ? 2 : 1) : 0;
+    UserTrace("GetSigninState", uint32_t(ctx.lr), user, ctx.r3.u32);
+}
+
+// Xenia Canary's GetXUID uses a profile-type mask (type 1|2), independently
+// from GetSigninInfo's online/offline XUID flags. This does not sign in online.
+// https://github.com/xenia-canary/xenia-canary/blob/canary_experimental/src/xenia/kernel/xam/xam_user.cc
+// A profile signed in to LIVE answers the online bit (2; XUserGetXUID asks 7) with its online
+// XUID, as on the console: TTT2's match code (NACE) identifies players by it, and every
+// player's first profile shares the offline XUID B13EBABEBABEBABE (MEASURED 2026-10-12: two
+// such players replaced each other in the session room).
+PPC_FUNC(__imp__XamUserGetXUID)
+{
+    KTrace("XamUserGetXUID");
+    const uint32_t user=ctx.r3.u32, mask=ctx.r4.u32, out=ctx.r5.u32;
+    if(!XamGuestRange(out,8)){ctx.r3.u32=0x80070057u;return;}
+    GWrite32(base,out,0);GWrite32(base,out+4,0);
+    if(user>=4 || (mask!=1&&mask!=2&&mask!=3&&mask!=4&&mask!=7))
+    {ctx.r3.u32=0x80070057u;return;}
+    if(user!=0 || !(mask&3) || !User0SignedIn()){ctx.r3.u32=0x80070525u;UserTrace("GetXUID",uint32_t(ctx.lr),user,ctx.r3.u32);return;}
+    const uint64_t xuid=(mask&2) && TitleServerEnabled() ? xlive::OnlineXuid() : profiles::ActiveXuid();
+    GWrite32(base,out,uint32_t(xuid>>32));GWrite32(base,out+4,uint32_t(xuid));
+    ctx.r3.u32=0;
+}
+
+PPC_FUNC(__imp__XamUserGetSigninInfo)
+{
+    KTrace("XamUserGetSigninInfo");
+    uint32_t user = ctx.r3.u32, flags = ctx.r4.u32, info = ctx.r5.u32;
+    if (!info) { ctx.r3.u32 = 0x80070057u; return; }               // E_INVALIDARG
+    std::memset(base + info, 0, 0x28);
+    if (user != 0 || !User0SignedIn())                                 // HRESULT: no such user
+    {
+        ctx.r3.u32 = 0x80070525u;
+        UserTrace("GetSigninInfo", uint32_t(ctx.lr), user, ctx.r3.u32);
+        return;
+    }
+    // Bit 1 requests the offline identity; bit 0 requests an online identity.
+    // There is no online profile. Returning the local XUID for both makes the
+    // game's profile monitor (82B37080) detect a sign-in transition every frame.
+    // Matches Xenia Canary XamUserGetSigninInfo's offline-only behavior.
+    const bool live = TitleServerEnabled();
+    const profiles::Profile profile = profiles::Active();
+    if (!flags || (flags & 2))
+    {
+        GWrite32(base, info + 0, uint32_t(profile.xuid >> 32));    // XUID (hi)
+        GWrite32(base, info + 4, uint32_t(profile.xuid));          // XUID (lo)
+    }
+    else if (live)
+    {
+        const uint64_t online = xlive::OnlineXuid();               // unique per machine and profile
+        GWrite32(base, info + 0, uint32_t(online >> 32));
+        GWrite32(base, info + 4, uint32_t(online));
+    }
+    if (live) GWrite32(base, info + 8, 1);                          // XUSER_INFO_FLAG_LIVE_ENABLED
+    GWrite32(base, info + 12, live ? 2 : 1);                         // SigninState: Live / local
+    const size_t n = (std::min)(profile.name.size(), size_t(15));    // gamertag (ASCII, 16 bytes)
+    std::memcpy(base + info + 24, profile.name.data(), n);
+    GWrite8(base, info + 24 + uint32_t(n), 0);
+    ctx.r3.u32 = 0;
+}
+
+PPC_FUNC(__imp__XamUserGetName)
+{
+    KTrace("XamUserGetName");
+    uint32_t user = ctx.r3.u32, buf = ctx.r4.u32, size = ctx.r5.u32;
+    if (user != 0 || !buf || !size || !User0SignedIn()) { ctx.r3.u32 = 0x525; return; }
+    const std::string name = profiles::Active().name;
+    const uint32_t n = (std::min)(uint32_t(name.size()), size - 1);
+    std::memcpy(base + buf, name.data(), n);
+    GWrite8(base, buf + n, 0);
+    ctx.r3.u32 = 0;
+}
+
+// (titleId, userIndex, xuidCount, xuids, settingCount, settingIds, bufferSize, buffer, overlapped)
+// Query pass (buffer null): report 4 bytes needed. Read pass: zero the buffer; the game
+// tolerates all-zero profile settings (Unleashed behavior).
+PPC_FUNC(__imp__XamUserReadProfileSettings)
+{
+    KTrace("XamUserReadProfileSettings");
+    uint32_t bufferSize = ctx.r9.u32, buffer = ctx.r10.u32;
+    if (std::getenv("TTT2_XLIVE_TRACE"))
+    {
+        const uint32_t xuidCount = ctx.r5.u32, xuids = ctx.r6.u32, settingCount = ctx.r7.u32, ids = ctx.r8.u32;
+        std::fprintf(stderr, "[xam] XamUserReadProfileSettings(user %u, %u xuids first %08X%08X, %u settings first %08X, buffer %08X) lr=%08X\n",
+                     ctx.r4.u32, xuidCount, xuids && xuidCount ? GRead32(base, xuids) : 0u, xuids && xuidCount ? GRead32(base, xuids + 4) : 0u,
+                     settingCount, ids && settingCount ? GRead32(base, ids) : 0u, buffer, uint32_t(ctx.lr));
+    }
+    if (buffer)
+    {
+        uint32_t n = bufferSize ? GRead32(base, bufferSize) : 0;
+        if (n) std::memset(base + buffer, 0, n);
+    }
+    else if (bufferSize)
+    {
+        GWrite32(base, bufferSize, 4);
+    }
+    ctx.r3.u32 = 0;
+}
+
+// --- Xam notification listeners. A listener has an area mask and a FIFO of (id, param)
+// pairs; XNotifyGetNext is a non-blocking poll (r4 = exact-id filter, 0 = any). Nothing is
+// queued at boot (reference-runtime behavior); UI shims post XN_SYS_UI (9) when invoked. ---
+namespace {
+struct XamListener { uint64_t areas; std::deque<std::pair<uint32_t, uint32_t>> queue; };
+std::mutex g_lnMutex;
+std::unordered_map<uint32_t, XamListener> g_listeners;
+uint32_t g_nextListener = 0xD0000001;
+} // namespace
+
+void XamNotifyEnqueueEvent(uint32_t id, uint32_t param)
+{
+    std::lock_guard lk(g_lnMutex);
+    // Area formula matches the game's own dispatcher: (id >> 25) & 0x3F.
+    for (auto& [h, l] : g_listeners)
+        if ((1ull << ((id >> 25) & 0x3F)) & l.areas)
+            l.queue.emplace_back(id, param);
+}
+
+PPC_FUNC(__imp__XamNotifyCreateListener)
+{
+    KTrace("XamNotifyCreateListener");
+    std::lock_guard lk(g_lnMutex);
+    uint32_t h = g_nextListener++;
+    auto& l = g_listeners[h];
+    l.areas = ctx.r3.u64 ? ctx.r3.u64 : ~0ull;
+    // Real XAM broadcasts the current sign-in state to every new listener that watches
+    // the system area: XN_SYS_SIGNINCHANGED (0x0000000A) with param = mask of changed
+    // user slots. Bit 0 set = user 0 - the handler then queries XamUserGetSigninState(0)
+    // and records the locally signed-in profile (the boot save-check requires it).
+    if (l.areas & 1ull)
+        l.queue.emplace_back(0x0000000Au, 1u);
+    // A LIVE listener learns the connection state at once (Xenia's netplay fork: some titles
+    // wait for it in their online menus): XN_LIVE_CONNECTIONCHANGED, logon established.
+    if ((l.areas & 2ull) && xlive::Enabled())
+        l.queue.emplace_back(0x02000001u, 0x001510F0u);
+    ctx.r3.u32 = h;
+}
+
+// XamAlloc(flags, size, pOut): allocate XAM-owned memory from the guest heap. The save
+// system calls this and DEREFERENCES the out pointer - a stub that returns success
+// without writing it hands the game a garbage pointer (boot save-check wedge).
+PPC_FUNC(__imp__XamAlloc)
+{
+    KTrace("XamAlloc");
+    uint32_t size = ctx.r4.u32 ? ctx.r4.u32 : 16, out = ctx.r5.u32;
+    void* p = g_virtualHeap.Alloc(size, 16);
+    if (!p || !out) { ctx.r3.u32 = 0x8007000Eu; return; }   // E_OUTOFMEMORY
+    std::memset(p, 0, size);
+    GWrite32(base, out, static_cast<uint32_t>(static_cast<uint8_t*>(p) - base));
+    ctx.r3.u32 = 0;
+}
+
+PPC_FUNC(__imp__XamFree)
+{
+    KTrace("XamFree");
+    if (ctx.r3.u32) g_virtualHeap.Free(base + ctx.r3.u32);
+    ctx.r3.u32 = 0;
+}
+
+// XamShowDeviceSelectorUI(user, contentType, contentFlags, cbData, pDeviceId, pOverlapped):
+// Select the virtual HDD (device 1). An overlapped call returns ERROR_IO_PENDING,
+// even when completion is immediate: the game's save worker explicitly requires
+// 997 before polling the completion record. Xenia xam_ui.cc has the same contract.
+PPC_FUNC(__imp__XamShowDeviceSelectorUI)
+{
+    KTrace("XamShowDeviceSelectorUI");
+    uint32_t pDeviceId = ctx.r7.u32, ovl = ctx.r8.u32;
+    if (!XamGuestRange(pDeviceId, 4)) { ctx.r3.u32 = 87; return; }
+    if (ctx.r3.u32 != 0) { ctx.r3.u32 = 1317; return; }
+    if (const uint32_t error = XamValidateOverlapped(base, ovl))
+    { ctx.r3.u32 = error; return; }
+    GWrite32(base, pDeviceId, 1);
+    XamNotifyEnqueueEvent(9, 1);           // XN_SYS_UI open
+    ctx.r3.u32 = XamCompleteOverlapped(base, ovl, 0, 0, 0);
+    XamNotifyEnqueueEvent(9, 0);           // XN_SYS_UI closed
+}
+
+// XamContentGetDeviceState(deviceId, pOverlapped): device 1 (virtual HDD) is always ready.
+PPC_FUNC(__imp__XamContentGetDeviceState)
+{
+    KTrace("XamContentGetDeviceState");
+    uint32_t ovl = ctx.r4.u32;
+    if (const uint32_t error = XamValidateOverlapped(base, ovl))
+    { ctx.r3.u32 = error; return; }
+    if (ctx.r3.u32 != 1)
+    {
+        // Xenia xam_content_device.cc: disconnected devices report the specific
+        // error synchronously, or FUNCTION_FAILED plus the extended error async.
+        ctx.r3.u32 = ovl ? XamCompleteOverlapped(base, ovl, 1627, 0, 1167) : 1167;
+        return;
+    }
+    ctx.r3.u32 = XamCompleteOverlapped(base, ovl, 0, 0, 0);
+}
+
+// XamShowSigninUI: with a profile signed in there is nothing to choose - report the same
+// notifications the console produces (UI opened, closed, sign-in changed). With nobody signed in
+// the system UI (menu_ext.cpp) signs the last used profile in and posts them: the game asks from
+// MainMenuMode's sign-in states, which draw nothing. (Players choose on the title logo instead,
+// where START / A open Select Profile before the game sees them.)
+PPC_FUNC(__imp__XamShowSigninUI)
+{
+    KTrace("XamShowSigninUI");
+    std::fprintf(stderr, "[xam] XamShowSigninUI(panes=%u, flags=%08X) lr=%08X signed-in=%d\n", ctx.r3.u32, ctx.r4.u32,
+                 (uint32_t)ctx.lr, int(User0SignedIn()));
+    if (!User0SignedIn() && SysUiRequestSignIn())
+    {
+        ctx.r3.u32 = 0;
+        return;
+    }
+    XamNotifyEnqueueEvent(9, 1);            // XN_SYS_UI open
+    XamNotifyEnqueueEvent(9, 0);            // XN_SYS_UI closed
+    XamNotifyEnqueueEvent(0x0000000Au, 1);  // XN_SYS_SIGNINCHANGED, user 0 changed
+    ctx.r3.u32 = 0;
+}
+
+PPC_FUNC(__imp__XNotifyGetNext)
+{
+    KTrace("XNotifyGetNext");
+    uint32_t handle = ctx.r3.u32, filter = ctx.r4.u32;
+    uint32_t idOut = ctx.r5.u32, paramOut = ctx.r6.u32;
+    XLivePollInvites();                                     // a Steam "Join Game" -> invite accepted
+    std::lock_guard lk(g_lnMutex);
+    auto it = g_listeners.find(handle);
+    ctx.r3.u32 = 0;
+    if (it == g_listeners.end()) return;
+    auto& q = it->second.queue;
+    for (size_t i = 0; i < q.size(); ++i)
+    {
+        if (filter == 0 || q[i].first == filter)
+        {
+            GWrite32(base, idOut, q[i].first);
+            GWrite32(base, paramOut, q[i].second);
+            q.erase(q.begin() + i);
+            ctx.r3.u32 = 1;
+            return;
+        }
+    }
+}
+
+// --- XMsg in-process calls (XAM app messages). 0x7001B = XGI/Live query whose param
+// block's second dword points at an 8-byte output the game expects zeroed. ---
+PPC_FUNC(__imp__XMsgInProcessCall)
+{
+    KTrace("XMsgInProcessCall");
+    uint32_t app = ctx.r3.u32, message = ctx.r4.u32, param1 = ctx.r5.u32;
+    static int logged = 0;
+    if (logged < 40 || message != 0x7001B)
+    {
+        ++logged;
+        std::fprintf(stderr, "[xam] XMsgInProcessCall app=%08X msg=%08X lr=%08X\n", app, message, (uint32_t)ctx.lr);
+    }
+    // One-shot guest backtrace of the polling thread: walk the PPC backchain
+    // ([r1] = caller frame; saved LR at [callerFrame - 8]) to find the boot loop.
+    static std::atomic<int> calls{0};
+    if (++calls == 500)
+    {
+        char line[512];
+        int n = std::snprintf(line, sizeof(line), "[xam] poll backtrace: lr=%08X", (uint32_t)ctx.lr);
+        uint32_t frame = ctx.r1.u32;
+        for (int i = 0; i < 12 && frame && frame < 0xFFFFFFF0u; ++i)
+        {
+            uint32_t prev = GRead32(g_base, frame);
+            if (!prev || prev <= frame || prev - frame > 0x10000) break;
+            uint32_t savedLr = GRead32(g_base, prev - 8);
+            n += std::snprintf(line + n, sizeof(line) - n, " %08X", savedLr);
+            frame = prev;
+        }
+        std::snprintf(line + n, sizeof(line) - n, "\n");
+        std::fputs(line, stderr);
+    }
+    if (app == 0xFC && message == 0x00058035)
+    {
+        // XStorageBuildServerPath, marshalled by the XDK library (sub_828546C0): param block
+        // {+0 user, +8 xuid, +0x10 facility, +0x14 save-game ptr, +0x18 size, +0x1C item name
+        // (wide), +0x20 out path (wide), +0x24 out length}. The path only has to round-trip
+        // to XStorageDownloadToMemory, which matches on the item name (title_server.cpp).
+        const uint32_t facility = GRead32(base, param1 + 0x10), item = GRead32(base, param1 + 0x1C);
+        const uint32_t out = GRead32(base, param1 + 0x20), outLength = GRead32(base, param1 + 0x24);
+        if (!item || !out) { ctx.r3.u32 = 0x80070057u; return; }
+        char prefix[48];
+        std::snprintf(prefix, sizeof(prefix), "/storage/%08X/%u/", 0x4E4D0859u, facility);
+        std::u16string path;
+        for (const char* c = prefix; *c; ++c) path += char16_t(*c);
+        for (uint32_t i = 0; i < 96; ++i)
+        {
+            const uint16_t c = GRead16(base, item + i * 2);
+            if (!c) break;
+            path += char16_t(c);
+        }
+        constexpr size_t CAPACITY = 128;                            // the game clears 256 bytes
+        if (path.size() + 1 > CAPACITY) { ctx.r3.u32 = 0x8007007Au; return; }
+        for (size_t i = 0; i < path.size(); ++i) GWrite16(base, out + uint32_t(i * 2), uint16_t(path[i]));
+        GWrite16(base, out + uint32_t(path.size() * 2), 0);
+        if (outLength) GWrite32(base, outLength, uint32_t(path.size() + 1));
+        ctx.r3.u32 = 0;
+        return;
+    }
+    if (app == 0xFB || app == 0xFC || app == 0xFE)
+    {
+        // The port's Xbox LIVE (xlive.cpp): logon status, NAT type, mute list, deployment type...
+        bool handled = false;
+        const uint32_t hr = XLiveDispatch(base, app, message, param1, ctx.r6.u32, handled);
+        if (handled) { ctx.r3.u32 = hr; return; }
+        std::fprintf(stderr, "[xam] XMsgInProcessCall app=%02X msg=%08X not handled\n", app, message);
+    }
+    if (message == 0x7001B)
+    {
+        // XMP (app 0xFA, the music player) "get playback controller" - not Live (the online recon,
+        // 2026-10-12, corrected the old reading). Answer with a hard
+        // error: Live is absent, take the offline path (we target LAN, not Live).
+        ctx.r3.u32 = 0xFFFFFFFF;
+        return;
+    }
+    ctx.r3.u32 = 0;
+}
+
+// --- RtlTimeToTimeFields(time, fields): 100ns-since-1601 -> {Year,Month,Day,Hour,Min,Sec,Ms,Weekday} ---
+// RtlFillMemoryUlong(r3=dest, r4=length bytes, r5=32-bit pattern)
+PPC_FUNC(__imp__RtlFillMemoryUlong)
+{
+    KTrace("RtlFillMemoryUlong");
+    uint32_t dst = ctx.r3.u32, len = ctx.r4.u32 & ~3u, pat = ctx.r5.u32;
+    for (uint32_t i = 0; i < len; i += 4) GWrite32(base, dst + i, pat);
+}
+
+PPC_FUNC(__imp__RtlTimeToTimeFields)
+{
+    KTrace("RtlTimeToTimeFields");
+    uint32_t tp = ctx.r3.u32, fp = ctx.r4.u32;
+    uint64_t t = (static_cast<uint64_t>(GRead32(base, tp)) << 32) | GRead32(base, tp + 4);
+    uint32_t ms  = static_cast<uint32_t>((t / 10000ull) % 1000ull);
+    uint64_t secs = t / 10000000ull;
+    uint32_t sec = static_cast<uint32_t>(secs % 60), min = static_cast<uint32_t>((secs / 60) % 60);
+    uint32_t hour = static_cast<uint32_t>((secs / 3600) % 24);
+    int64_t days1601 = static_cast<int64_t>(secs / 86400);
+    int32_t weekday = static_cast<int32_t>((days1601 + 1) % 7);      // 1601-01-01 was a Monday
+    // Civil-from-days (Hinnant), shifted from the 1601 epoch to 1970 then to era days.
+    int64_t z = days1601 - 134774 + 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    int64_t doe = z - era * 146097;
+    int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t y = yoe + era * 400;
+    int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int64_t mp = (5 * doy + 2) / 153;
+    int64_t d = doy - (153 * mp + 2) / 5 + 1;
+    int64_t m = mp + (mp < 10 ? 3 : -9);
+    y += (m <= 2);
+    GWrite16(base, fp + 0,  static_cast<uint16_t>(y));
+    GWrite16(base, fp + 2,  static_cast<uint16_t>(m));
+    GWrite16(base, fp + 4,  static_cast<uint16_t>(d));
+    GWrite16(base, fp + 6,  static_cast<uint16_t>(hour));
+    GWrite16(base, fp + 8,  static_cast<uint16_t>(min));
+    GWrite16(base, fp + 10, static_cast<uint16_t>(sec));
+    GWrite16(base, fp + 12, static_cast<uint16_t>(ms));
+    GWrite16(base, fp + 14, static_cast<uint16_t>(weekday));
+}
+
+// --- RtlRaiseException: log and continue. 0x406D1388 is the MS thread-naming exception,
+// raised routinely at thread start; a debugger would swallow it and resume. ---
+PPC_FUNC(__imp__RtlRaiseException)
+{
+    KTrace("RtlRaiseException");
+    uint32_t rec = ctx.r3.u32;
+    uint32_t code = rec ? GRead32(base, rec) : 0;
+    if (code != 0x406D1388)
+        std::fprintf(stderr, "[kernel] RtlRaiseException code=%08X (continuing)\n", code);
+}
+
+PPC_FUNC(__imp__ExRegisterTitleTerminateNotification)
+{
+    KTrace("ExRegisterTitleTerminateNotification"); ctx.r3.u32 = 0; }
+
+// --- input: host XInput and PlayStation pads, plus focused keyboard controls for player 0 ---
+// Guest users 0-3 are the host pads (big-endian gamepad struct; the Xbox 360 XAMINPUT layouts
+// and button masks match PC XInput exactly): host pads 0-3 are the XInput slots, 4-7 the
+// DualShock 4 / DualSense pads SDL3 reads (ps_pads.h), already mapped to XINPUT_GAMEPAD. Users
+// are assigned by use rather than by slot: the first pad to press a button or trigger becomes
+// user 0, the only signed-in profile, the next one user 1, and so on (see PadPollState::guestOf).
+//
+// IMPORTANT: the guest polls input from inside a critical section its main loop also
+// takes, and host XInputGetState/GetCapabilities on DISCONNECTED pads can each take
+// hundreds of ms (driver enumeration) - calling them inline throttled the entire game
+// loop to ~0.5 Hz. A host poll thread keeps a snapshot (connected pads and the keyboard every
+// ~1 ms - a press reaches the game at most ~1 ms later than it could, it was 8 ms; disconnected
+// pads retried every 2 s per XInput guidance); guest calls read it instantly.
+#pragma comment(lib, "xinput9_1_0.lib")
+
+namespace {
+struct PadSnapshot
+{
+    std::atomic<bool> connected{false};
+    std::mutex m;
+    XINPUT_STATE state{};
+    XINPUT_CAPABILITIES caps{};
+    bool physical = false; // protected by m; separate from logical connected state
+};
+PadSnapshot g_pads[4];
+std::atomic<bool> g_padThreadStarted{false};
+
+// Keyboard controls augment player 0 even when a controller is connected. Physical
+// analog controls remain intact. Only accept keys while our game is foreground,
+// so typing in another application cannot operate the game.
+// Every control has the key chosen in Controller Setup -> KEYBOARD (keyboard_keys.h; by default
+// arrows = D-pad, A/S/Z/X = A/B/X/Y, Q/W = shoulders, E/R = triggers, D/F = stick clicks,
+// Enter = START, Backspace = BACK); Space is an extra START while no control has it.
+struct KeyboardPad { uint16_t buttons = 0; bool leftTrigger = false, rightTrigger = false; };
+static KeyboardPad ReadKeyboardPad()
+{
+    KeyboardPad pad;
+    DWORD foregroundProcess = 0;
+    HWND foreground = GetForegroundWindow();
+    if (!foreground) return pad;
+    GetWindowThreadProcessId(foreground, &foregroundProcess);
+    if (foregroundProcess != GetCurrentProcessId()) return pad;
+    auto down = [](int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    if (SysUiKeyCaptureActive()) return pad;              // the keys are being chosen
+    if (SysUiTextEntryActive())
+    {
+        // Name entry takes typed characters (WM_CHAR); only the arrows still steer.
+        if (down(VK_UP))    pad.buttons |= 0x0001;
+        if (down(VK_DOWN))  pad.buttons |= 0x0002;
+        if (down(VK_LEFT))  pad.buttons |= 0x0004;
+        if (down(VK_RIGHT)) pad.buttons |= 0x0008;
+        return pad;
+    }
+    for (int c = 0; c < keyboard_keys::Count; ++c)
+    {
+        if (!down(keyboard_keys::Key(c))) continue;
+        pad.buttons |= keyboard_keys::Mask(c);
+        pad.leftTrigger |= c == keyboard_keys::LT;
+        pad.rightTrigger |= c == keyboard_keys::RT;
+    }
+    if (down(VK_SPACE) && !keyboard_keys::Bound(VK_SPACE)) pad.buttons |= 0x0010;
+    return pad;
+}
+
+constexpr DWORD kXInputPads = 4, kHostPads = kXInputPads + ps_pads::Slots;
+
+struct PadPollState
+{
+    bool physicalConnected[kHostPads]{};
+    uint64_t retryAtMs[4]{};                  // disconnected: next XInput probe (poll thread clock)
+    XINPUT_CAPABILITIES caps[4]{};            // connected: capabilities, refreshed once a second
+    uint64_t capsAtMs[4]{};
+    bool keyboardEverPressed = false;
+    // Host pad -> guest user, -1 until the pad is first used. A pad claims the lowest user no
+    // other claimed pad holds on its first button or trigger press (sticks drift, so they do
+    // not count), and keeps it across disconnects. Whoever picks up a controller is player 1
+    // whatever its XInput slot: with an idle device on slot 0 the real pad used to be user 1,
+    // which TTT2 treats as signed out - no profile, no save, no title-storage unlock. Pads not
+    // claimed yet fill the free users in host order, so a lone pad is user 0 before any press.
+    int guestOf[kHostPads]{ -1, -1, -1, -1, -1, -1, -1, -1 };
+    // Button prompts (button_prompts.h) follow the device player 1 last pressed something on.
+    bool hostPs5[kHostPads]{};
+    uint16_t prevPressed[kHostPads]{};        // buttons + triggers (0x0400 / 0x0800) last poll
+    bool keyboardDown = false, promptNoted = false;
+};
+
+// What XInputGetCapabilities reports for a wired Xbox 360 pad, minus rumble (none is played).
+static XINPUT_CAPABILITIES PlayStationCaps()
+{
+    XINPUT_CAPABILITIES caps{};
+    caps.Type = XINPUT_DEVTYPE_GAMEPAD;
+    caps.SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
+    caps.Gamepad.wButtons = 0xF3FF;
+    caps.Gamepad.bLeftTrigger = caps.Gamepad.bRightTrigger = 255;
+    caps.Gamepad.sThumbLX = caps.Gamepad.sThumbLY = caps.Gamepad.sThumbRX = caps.Gamepad.sThumbRY = SHORT(0xFFC0);
+    return caps;
+}
+
+// Scripted input for unattended runs (skipping movies, driving menus, two-player fights):
+//   TTT2_INPUT_SCRIPT="8000:START:150,12000:A:150,..."  ms since start : buttons : hold ms
+//   C:/ttt2/port/pad_inject.txt  lines "BUTTONS hold_ms [gap_ms]", consumed then deleted
+//                                (pad_inject<tag>.txt with TTT2_INSTANCE=<tag>)
+// BUTTONS is one or more names joined by '+': START BACK UP DOWN LEFT RIGHT A B X Y LB RB.
+// Presses go to player 1 (user 0); a P2 name sends them to player 2 (user 1), e.g.
+// "60000:P2+START:150" or "P2+DOWN+A 150" - user 1 then stays connected as a virtual pad.
+struct ScriptedPress { uint64_t at = 0, until = 0; uint16_t buttons = 0; int player = 0; };
+struct PadScript
+{
+    std::vector<ScriptedPress> presses;
+    bool active = false, player2 = false;
+    uint64_t injectBusyUntil = 0, nextInjectPoll = 0;
+};
+
+static uint16_t ParseButtons(const std::string& names, int* player = nullptr)
+{
+    static const std::pair<const char*, uint16_t> map[] = {
+        { "START", 0x0010 }, { "BACK", 0x0020 }, { "UP", 0x0001 }, { "DOWN", 0x0002 },
+        { "LEFT", 0x0004 }, { "RIGHT", 0x0008 }, { "A", 0x1000 }, { "B", 0x2000 },
+        { "X", 0x4000 }, { "Y", 0x8000 }, { "LB", 0x0100 }, { "RB", 0x0200 }, { "LS", 0x0040 }, { "RS", 0x0080 } };
+    uint16_t b = 0;
+    size_t pos = 0;
+    while (pos <= names.size())
+    {
+        const size_t end = (std::min)(names.find('+', pos), names.size());
+        const std::string name = names.substr(pos, end - pos);
+        for (const auto& [n, v] : map)
+            if (name == n) b |= v;
+        if (name == "P2" && player) *player = 1;
+        pos = end + 1;
+    }
+    return b;
+}
+
+static void LoadScript(PadScript& s, const char* text)
+{
+    if (!text || !*text) return;
+    std::string all(text);
+    size_t pos = 0;
+    while (pos < all.size())
+    {
+        const size_t end = (std::min)(all.find(',', pos), all.size());
+        const std::string item = all.substr(pos, end - pos);
+        const size_t c1 = item.find(':'), c2 = item.find(':', c1 == std::string::npos ? 0 : c1 + 1);
+        if (c1 != std::string::npos && c2 != std::string::npos)
+        {
+            ScriptedPress p;
+            p.at = std::strtoull(item.c_str(), nullptr, 10);
+            p.buttons = ParseButtons(item.substr(c1 + 1, c2 - c1 - 1), &p.player);
+            p.until = p.at + std::strtoull(item.c_str() + c2 + 1, nullptr, 10);
+            if (p.buttons) s.presses.push_back(p);
+            s.player2 |= p.buttons && p.player == 1;
+        }
+        pos = end + 1;
+    }
+    s.active = !s.presses.empty();
+    std::fprintf(stderr, "[input] script: %zu timed presses\n", s.presses.size());
+}
+
+// Queue the injection file's presses back to back from `now`, then delete the file.
+static void PollInjectFile(PadScript& s, uint64_t now)
+{
+    if (now < s.nextInjectPoll) return;
+    s.nextInjectPoll = now + 100;
+    // TTT2_INSTANCE=<tag>: pad_inject<tag>.txt, so two instances can be driven separately.
+    static const std::string injectPath = [] {
+        const char* tag = std::getenv("TTT2_INSTANCE");
+        return std::string("C:/ttt2/port/pad_inject") + (tag ? tag : "") + ".txt";
+    }();
+    const char* path = injectPath.c_str();
+    FILE* f = std::fopen(path, "r");
+    if (!f) return;
+    std::erase_if(s.presses, [now](const ScriptedPress& p) { return p.until < now; });
+    char line[128];
+    uint64_t at = (std::max)(now, s.injectBusyUntil), previous = at;
+    static int logged = 0;
+    while (std::fgets(line, sizeof(line), f))
+    {
+        char names[96] = {};
+        unsigned hold = 150, gap = 250;
+        if (std::sscanf(line, "%95s %u %u", names, &hold, &gap) < 1) continue;
+        // "&BUTTONS ..." starts together with the line before (both players at once).
+        const bool together = names[0] == '&';
+        int player = 0;
+        const uint16_t b = ParseButtons(names + together, &player);
+        if (!b) continue;
+        const uint64_t start = together ? previous : at;
+        s.presses.push_back({ start, start + hold, b, player });
+        s.player2 |= player == 1;
+        if (logged < 2000 && ++logged)
+            std::fprintf(stderr, "[input] inject %s at +%llums hold %u\n", names,
+                         (unsigned long long)(start - now), hold);
+        previous = start;
+        at = (std::max)(at, start + hold + gap);
+    }
+    std::fclose(f);
+    std::remove(path);
+    s.injectBusyUntil = at;
+    s.active = true;
+}
+
+static uint16_t ScriptButtons(PadScript& s, uint64_t now, int player = 0)
+{
+    if (player == 0) PollInjectFile(s, now);
+    uint16_t b = 0;
+    for (const ScriptedPress& p : s.presses)
+        if (p.player == player && now >= p.at && now < p.until) b |= p.buttons;
+    return b;
+}
+
+void PublishPad(DWORD index, bool connected, bool physical,
+                const XINPUT_STATE& state, const XINPUT_CAPABILITIES& caps)
+{
+    auto& pad = g_pads[index];
+    std::lock_guard lk(pad.m);
+    // One guest packet sequence spans keyboard and physical input. Raw host and
+    // keyboard packet counters may coincide at a source change, hiding a button
+    // release or press from consumers that skip unchanged packet numbers.
+    DWORD packet = pad.state.dwPacketNumber;
+    if (connected != pad.connected.load() || physical != pad.physical ||
+        std::memcmp(&state.Gamepad, &pad.state.Gamepad, sizeof(state.Gamepad)) != 0)
+        ++packet;
+    pad.state = state;
+    pad.state.dwPacketNumber = packet;
+    pad.caps = caps;
+    pad.physical = physical;
+    pad.connected.store(connected);
+}
+
+void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, PadScript* script = nullptr)
+{
+    // AUTOSTART is an explicit unattended test mode. Apply its START pulse to
+    // controller 0 even when a physical pad is present or the window is inactive.
+    const bool startPulse = autoStart && elapsedMs > 45000 && (elapsedMs % 9000) < 300;
+    // Scripted presses join the keyboard's (controller 0, foreground not required).
+    const KeyboardPad keyboard = ReadKeyboardPad();
+    const uint16_t keyboardButtons = keyboard.buttons | (script ? ScriptButtons(*script, elapsedMs) : 0);
+    {
+        // Input latency tests: when player 1's buttons change, on the [burst] lines' clock.
+        static uint16_t shown = 0;
+        if (keyboardButtons != shown && script && script->active)
+            std::fprintf(stderr, "[input] buttons %04X visible at %.1f ms\n", keyboardButtons,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        shown = keyboardButtons;
+    }
+    const uint16_t player2Buttons = script ? ScriptButtons(*script, elapsedMs, 1) : 0;
+    if (script && script->active) autoStart = true;        // keep pad 0 connected for the script
+    polling.keyboardEverPressed |= keyboardButtons != 0 || keyboard.leftTrigger || keyboard.rightTrigger;
+    XINPUT_STATE sampled[kHostPads]{};
+    XINPUT_CAPABILITIES hostCaps[kHostPads]{};
+    for (DWORD i = 0; i < kXInputPads; ++i)
+    {
+        // Sampling depends only on the physical device, never on a synthesized
+        // keyboard pad's published connection flag. Probe slot 0 on startup too.
+        if (polling.physicalConnected[i] || elapsedMs >= polling.retryAtMs[i])
+        {
+            if (XInputGetState(i, &sampled[i]) == ERROR_SUCCESS)
+            {
+                if (!polling.physicalConnected[i] || elapsedMs >= polling.capsAtMs[i])
+                {
+                    XInputGetCapabilities(i, 0, &polling.caps[i]);
+                    polling.capsAtMs[i] = elapsedMs + 1000;
+                }
+                hostCaps[i] = polling.caps[i];
+                polling.physicalConnected[i] = true;
+                polling.retryAtMs[i] = 0;
+                continue;
+            }
+            sampled[i] = {};
+            polling.physicalConnected[i] = false;
+            polling.retryAtMs[i] = elapsedMs + 2000; // retry physical discovery in 2 s
+        }
+    }
+    ps_pads::Pad playStation[ps_pads::Slots];
+    ps_pads::Poll(playStation);
+    for (DWORD k = 0; k < ps_pads::Slots; ++k)
+    {
+        const DWORD i = kXInputPads + k;
+        polling.physicalConnected[i] = playStation[k].connected;
+        polling.hostPs5[i] = playStation[k].ps5;
+        sampled[i].Gamepad = playStation[k].gamepad;
+        if (playStation[k].connected) hostCaps[i] = PlayStationCaps();
+    }
+
+    auto claimed = [&](int user) {
+        for (DWORD j = 0; j < kHostPads; ++j)
+            if (polling.guestOf[j] == user) return true;
+        return false;
+    };
+    for (DWORD i = 0; i < kHostPads; ++i)
+    {
+        const XINPUT_GAMEPAD& g = sampled[i].Gamepad;
+        const bool used = g.wButtons || g.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD ||
+                          g.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
+        if (!polling.physicalConnected[i] || polling.guestOf[i] >= 0 || !used) continue;
+        for (int user = 0; user < 4; ++user)
+            if (!claimed(user)) { polling.guestOf[i] = user; break; }
+    }
+    int source[4]{ -1, -1, -1, -1 };   // guest user -> host pad
+    for (DWORD i = 0; i < kHostPads; ++i)
+        if (polling.guestOf[i] >= 0 && polling.physicalConnected[i]) source[polling.guestOf[i]] = int(i);
+    for (DWORD i = 0; i < kHostPads; ++i)
+    {
+        if (polling.guestOf[i] >= 0 || !polling.physicalConnected[i]) continue;
+        for (int user = 0; user < 4; ++user)
+            if (source[user] < 0 && !claimed(user)) { source[user] = int(i); break; }
+    }
+
+    {
+        // Player 1's last device picks the prompt icons: a new key, or a new button / trigger on the
+        // pad that is player 1 (sticks drift and do not count). Before any press, that pad decides.
+        using button_prompts::Device;
+        const bool keyNow = keyboard.buttons || keyboard.leftTrigger || keyboard.rightTrigger;
+        if (keyNow && !polling.keyboardDown) { button_prompts::NoteInput(Device::Keyboard); polling.promptNoted = true; }
+        polling.keyboardDown = keyNow;
+        if (const int s = source[0]; s >= 0)
+        {
+            const XINPUT_GAMEPAD& g = sampled[s].Gamepad;
+            const uint16_t pressed = uint16_t(g.wButtons | (g.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD ? 0x0400 : 0) |
+                                              (g.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD ? 0x0800 : 0));
+            const Device device = DWORD(s) < kXInputPads ? Device::Xbox : polling.hostPs5[s] ? Device::PlayStation5 : Device::PlayStation4;
+            if ((pressed & ~polling.prevPressed[s]) || !polling.promptNoted) { button_prompts::NoteInput(device); polling.promptNoted = true; }
+            polling.prevPressed[s] = pressed;
+        }
+    }
+    for (DWORD user = 0; user < 4; ++user)
+    {
+        XINPUT_STATE state{};
+        XINPUT_CAPABILITIES caps{};
+        const bool physical = source[user] >= 0;
+        bool connected = physical;
+        if (physical)
+        {
+            state = sampled[source[user]];
+            caps = hostCaps[source[user]];
+        }
+        if (user == 1 && script && script->player2)
+        {
+            state.Gamepad.wButtons |= player2Buttons;
+            caps.Gamepad.wButtons |= 0xF33F;
+            if (!physical)
+            {
+                connected = true;
+                caps.Type = XINPUT_DEVTYPE_GAMEPAD;
+                caps.SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
+            }
+        }
+        if (user == 0)
+        {
+            uint16_t buttons = keyboardButtons;
+            // Preserve unattended START pulses: after 45 s, 300 ms down every 9 s.
+            if (startPulse)
+                buttons |= 0x0010;
+            state.Gamepad.wButtons |= buttons;
+            if (keyboard.leftTrigger) state.Gamepad.bLeftTrigger = 255;
+            if (keyboard.rightTrigger) state.Gamepad.bRightTrigger = 255;
+            caps.Gamepad.wButtons |= 0xF3FF; // supported mapped controls, independent of current presses
+            caps.Gamepad.bLeftTrigger = caps.Gamepad.bRightTrigger = 255;
+            if (!physical)
+            {
+                polling.keyboardEverPressed |= buttons != 0 || keyboard.leftTrigger || keyboard.rightTrigger;
+                connected = polling.keyboardEverPressed || autoStart;
+                caps.Type = XINPUT_DEVTYPE_GAMEPAD;
+                caps.SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
+            }
+        }
+        PublishPad(user, connected, physical, state, caps);
+    }
+}
+
+static bool AutoStartEnabled(const char* value)
+{
+    // Require the documented opt-in value. An empty inherited environment entry
+    // (including one left by PowerShell) must not skip movies or title screens.
+    return value && std::strcmp(value, "1") == 0;
+}
+
+void PadPollThread()
+{
+    PadPollState polling;
+    const bool autoStart = AutoStartEnabled(std::getenv("TTT2_AUTOSTART"));
+    std::fprintf(stderr, "[input] automatic Start %s\n", autoStart ? "enabled" : "disabled");
+    PadScript script;
+    LoadScript(script, std::getenv("TTT2_INPUT_SCRIPT"));
+    const auto started = std::chrono::steady_clock::now();
+    for (;;)
+    {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        PollPadsOnce(polling, autoStart, uint64_t(elapsed), &script);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+void EnsurePadThread()
+{
+    if (!g_padThreadStarted.exchange(true))
+        std::thread(PadPollThread).detach();
+}
+
+std::atomic<int64_t> g_startPulseUntilMs{ 0 };
+int64_t NowMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+} // namespace
+
+// The system UI's view of the controllers (sys_ui.h): every connected pad's buttons (keyboard
+// included) with the left stick as a D-pad - read even while the game is given neutral input.
+uint16_t HostControllerButtons()
+{
+    EnsurePadThread();
+    uint16_t b = 0;
+    for (auto& pad : g_pads)
+    {
+        if (!pad.connected.load()) continue;
+        std::lock_guard lk(pad.m);
+        const XINPUT_GAMEPAD& g = pad.state.Gamepad;
+        b |= g.wButtons;
+        if (g.sThumbLY > 16000) b |= 0x0001;
+        if (g.sThumbLY < -16000) b |= 0x0002;
+        if (g.sThumbLX < -16000) b |= 0x0004;
+        if (g.sThumbLX > 16000) b |= 0x0008;
+    }
+    return b;
+}
+
+// True while a connected pad (keyboard included) holds a trigger past the XInput threshold.
+bool HostTriggerHeld()
+{
+    EnsurePadThread();
+    for (auto& pad : g_pads)
+    {
+        if (!pad.connected.load()) continue;
+        std::lock_guard lk(pad.m);
+        const XINPUT_GAMEPAD& g = pad.state.Gamepad;
+        if (g.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD || g.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) return true;
+    }
+    return false;
+}
+
+// Player 1 presses START for 150 ms (the title continues after a profile signs in).
+void HostPulseStart() { g_startPulseUntilMs = NowMs() + 150; }
+
+PPC_FUNC(__imp__XamInputGetCapabilities)
+{
+    KTrace("XamInputGetCapabilities");
+    // r3=userIndex, r4=flags, r5=XINPUT_CAPABILITIES* out
+    EnsurePadThread();
+    uint32_t user = ctx.r3.u32, out = ctx.r5.u32;
+    XINPUT_CAPABILITIES caps;
+    if (user > 3 || !out || !g_pads[user].connected.load())
+    {
+        ctx.r3.u32 = 0x48F;   // ERROR_DEVICE_NOT_CONNECTED
+        return;
+    }
+    {
+        std::lock_guard lk(g_pads[user].m);
+        caps = g_pads[user].caps;
+    }
+    GWrite8(base, out + 0, caps.Type);
+    GWrite8(base, out + 1, caps.SubType);
+    GWrite16(base, out + 2, caps.Flags);
+    GWrite16(base, out + 4, caps.Gamepad.wButtons);
+    GWrite8(base, out + 6, caps.Gamepad.bLeftTrigger);
+    GWrite8(base, out + 7, caps.Gamepad.bRightTrigger);
+    GWrite16(base, out + 8, (uint16_t)caps.Gamepad.sThumbLX);
+    GWrite16(base, out + 10, (uint16_t)caps.Gamepad.sThumbLY);
+    GWrite16(base, out + 12, (uint16_t)caps.Gamepad.sThumbRX);
+    GWrite16(base, out + 14, (uint16_t)caps.Gamepad.sThumbRY);
+    GWrite16(base, out + 16, caps.Vibration.wLeftMotorSpeed);
+    GWrite16(base, out + 18, caps.Vibration.wRightMotorSpeed);
+    ctx.r3.u32 = 0;
+}
+
+PPC_FUNC(__imp__XamInputGetState)
+{
+    KTrace("XamInputGetState");
+    // r3=userIndex, r4=flags, r5=XINPUT_STATE* out
+    EnsurePadThread();
+    uint32_t user = ctx.r3.u32, out = ctx.r5.u32;
+    XINPUT_STATE st;
+    if (user > 3 || !out || !g_pads[user].connected.load())
+    {
+        ctx.r3.u32 = 0x48F;
+        return;
+    }
+    {
+        std::lock_guard lk(g_pads[user].m);
+        st = g_pads[user].state;
+    }
+    if (SysUiOwnsInput())
+        st.Gamepad = XINPUT_GAMEPAD{};          // a system screen has the controller
+    else if (SysUiTitleWantsProfile())
+        st.Gamepad.wButtons &= ~uint16_t(0x0010 | 0x1000);   // START / A open Select Profile instead
+    else if (const uint16_t mask = SysUiGameButtonMask(); user == 0 && mask != 0xFFFF)
+    {
+        // Controller Setup's KEYBOARD mode takes the other buttons (and the stick's LEFT / RIGHT).
+        st.Gamepad.wButtons &= mask;
+        st.Gamepad.bLeftTrigger = st.Gamepad.bRightTrigger = 0;
+        st.Gamepad.sThumbLX = 0;
+    }
+    else if (user == 0 && NowMs() < g_startPulseUntilMs.load())
+    {
+        st.Gamepad.wButtons |= 0x0010;
+        st.dwPacketNumber += 0x10000;           // a new packet while the pulse lasts
+    }
+    if (user == 0)
+    {
+        // Input latency tests: the first read that returns new buttons (same clock as [burst]).
+        static uint16_t lastRead = 0;
+        static const bool timing = [] { const char* e = std::getenv("TTT2_INPUT_TIMING"); return e && *e == '1'; }();
+        if (timing && st.Gamepad.wButtons != lastRead)
+            std::fprintf(stderr, "[input] game read %04X at %.1f ms\n", st.Gamepad.wButtons,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        lastRead = st.Gamepad.wButtons;
+    }
+    GWrite32(base, out + 0, st.dwPacketNumber);
+    GWrite16(base, out + 4, st.Gamepad.wButtons);
+    GWrite8(base, out + 6, st.Gamepad.bLeftTrigger);
+    GWrite8(base, out + 7, st.Gamepad.bRightTrigger);
+    GWrite16(base, out + 8, (uint16_t)st.Gamepad.sThumbLX);
+    GWrite16(base, out + 10, (uint16_t)st.Gamepad.sThumbLY);
+    GWrite16(base, out + 12, (uint16_t)st.Gamepad.sThumbRX);
+    GWrite16(base, out + 14, (uint16_t)st.Gamepad.sThumbRY);
+    ctx.r3.u32 = 0;
+}
+
+PPC_FUNC(__imp__XamInputGetKeystrokeEx)
+{
+    KTrace("XamInputGetKeystrokeEx");
+    // r3=userIndex* in/out, r4=device flags, r5=XINPUT_KEYSTROKE* out.
+    // This runtime publishes controller state, but has no queued text/key events.
+    // Success would falsely claim an event and make the guest consume stale bytes.
+    // XAM's non-gamepad filter matches Xenia's xam_input.cc contract.
+    uint32_t userPtr = ctx.r3.u32, flags = ctx.r4.u32, out = ctx.r5.u32;
+    if (!userPtr || !out)
+    {
+        ctx.r3.u32 = 160; // ERROR_BAD_ARGUMENTS
+        return;
+    }
+    if ((flags & 0xFF) && !(flags & 1))
+    {
+        ctx.r3.u32 = 1167; // ERROR_DEVICE_NOT_CONNECTED: no raw keyboard device
+        return;
+    }
+    EnsurePadThread();
+    uint32_t user = GRead32(base, userPtr);
+    bool connected = false;
+    if ((user & 0xFF) == 0xFF || (flags & 0x40000000))
+    {
+        for (const auto& pad : g_pads) connected |= pad.connected.load();
+    }
+    else if (user < 4) connected = g_pads[user].connected.load();
+    // Preserve both output buffers on failure, including the in/out user index.
+    ctx.r3.u32 = connected ? 4306 : 1167; // ERROR_EMPTY / ERROR_DEVICE_NOT_CONNECTED
+}
+
+// --- RtlInitAnsiString(out {len16, maxlen16, buf32}, cstr) ---
+PPC_FUNC(__imp__RtlInitAnsiString)
+{
+    KTrace("RtlInitAnsiString");
+    uint32_t s = ctx.r3.u32, cstr = ctx.r4.u32;
+    uint16_t len = 0;
+    if (cstr) { while (g_base[cstr + len] && len < 0xFFFE) ++len; }
+    GWrite16(base, s + 0, len);
+    GWrite16(base, s + 2, cstr ? len + 1 : 0);
+    GWrite32(base, s + 4, cstr);
+}
+
+// RtlMultiByteToUnicodeN(dest, destBytes, pWrittenBytes, src, srcBytes) and the reverse.
+// Same semantics as Xenia xboxkrnl_rtl.cc: each byte widens to one big-endian UCS-2 unit;
+// narrowing maps units above 0xFF to '?'. The game's MultiByteToWideChar wrapper
+// (sub_82BEF1C0) uses it for e.g. the title-storage item name; as a stub it left every
+// converted name empty.
+PPC_FUNC(__imp__RtlMultiByteToUnicodeN)
+{
+    KTrace("RtlMultiByteToUnicodeN");
+    const uint32_t dst = ctx.r3.u32, dstBytes = ctx.r4.u32, written = ctx.r5.u32;
+    const uint32_t src = ctx.r6.u32, srcBytes = ctx.r7.u32;
+    const uint32_t n = (std::min)(dstBytes >> 1, srcBytes);
+    for (uint32_t i = 0; i < n; ++i) GWrite16(base, dst + i * 2, GRead8(base, src + i));
+    if (written) GWrite32(base, written, n * 2);
+    ctx.r3.u32 = 0;
+}
+
+PPC_FUNC(__imp__RtlUnicodeToMultiByteN)
+{
+    KTrace("RtlUnicodeToMultiByteN");
+    const uint32_t dst = ctx.r3.u32, dstBytes = ctx.r4.u32, written = ctx.r5.u32;
+    const uint32_t src = ctx.r6.u32, srcBytes = ctx.r7.u32;
+    const uint32_t n = (std::min)(srcBytes >> 1, dstBytes);
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        const uint16_t c = GRead16(base, src + i * 2);
+        GWrite8(base, dst + i, c < 0x100 ? uint8_t(c) : uint8_t('?'));
+    }
+    if (written) GWrite32(base, written, n);
+    ctx.r3.u32 = 0;
+}

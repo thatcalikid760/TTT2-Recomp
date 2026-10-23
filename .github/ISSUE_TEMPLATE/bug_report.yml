@@ -1,0 +1,82 @@
+name: Bug report
+description: Something in TTT2 Recomp crashes, freezes, looks wrong or doesn't work.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please fill in as much as you can. Check the [open issues](https://github.com/thatcalikid760/TTT2-Recomp/issues) first in case it's already reported.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The build number shown in the top right when you pick your profile, or the installer version you used.
+      placeholder: "0.1.9"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Crash or freeze
+        - Graphics
+        - Online / lobbies / matchmaking
+        - Voice or text chat
+        - Discord
+        - Controller or keyboard input
+        - Installer or in-game updater
+        - Menus / options
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What went wrong, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What were you doing when it happened? Does it happen every time?
+      placeholder: |
+        1. Go to Online > Player Match
+        2. Create a lobby
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log file
+      description: |
+        Press Win+R, type `%LOCALAPPDATA%\TTT2Recomp` and press Enter, then drag `log.txt` into this box.
+        The log is replaced every time the game starts, so grab it **before** launching the game again.
+    validations:
+      required: false
+
+  - type: textarea
+    id: system
+    attributes:
+      label: PC and controller
+      description: Windows version, GPU, and the controller you use (Xbox, PS4, PS5, keyboard).
+      placeholder: "Windows 11, RTX 3060, DualSense"
+    validations:
+      required: false
+
+  - type: textarea
+    id: media
+    attributes:
+      label: Screenshots or video
+      description: Drag images or a clip here if it helps show the problem.
+    validations:
+      required: false
