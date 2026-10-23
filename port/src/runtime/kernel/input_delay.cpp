@@ -14,11 +14,13 @@
 // player 1's input reaches gameplay.
 #include "kernel_shared.h"
 #include "display_settings.h"
+#include "timeline.h"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 
 bool XSessionAnyActive();   // xsession.cpp
+void InputBacktrace(PPCContext& ctx, uint32_t player);   // rollback_probe.cpp (TTT2_INPUT_BT=1)
 
 extern "C" PPC_FUNC(__imp__sub_8225BFC0);
 
@@ -38,6 +40,8 @@ bool Timing()
 PPC_FUNC(sub_8225BFC0)
 {
     const uint32_t obj = ctx.r3.u32, player = ctx.r4.u32;
+    if (player == 0) timeline::Mark(timeline::InputRead, '.');
+    InputBacktrace(ctx, player);
     const uint32_t delay = GRead32(base, obj);
     const int want = Forced() >= 0 ? Forced() : (display_settings::GetInputDelayOn() ? 2 : 0);
     const bool replace = delay == 2 && uint32_t(want) != delay && !XSessionAnyActive();

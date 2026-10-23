@@ -348,6 +348,61 @@ static bool RunUpdate(InstallJob* job) {
 
 struct Planned { const IsoEntry* entry; uint64_t outBytes; bool expand; };
 
+// The game's pixel shaders into the player's shader cache now, so play never waits for one to compile
+// (a cold cache cost a real match 267 builds and dropped it to 28-36 fps in places). The installed game
+// runs once as `--build-shaders`: its own translator and compiler, from the files just installed - a
+// few minutes on all cores. Its "[shaders] <done>/<total>" lines move the bar from `from` to `to` %.
+// Not fatal when it cannot run or fails: the game runs it again in the background at its next start.
+// False: cancelled.
+static bool PrepareShaders(InstallJob* job, int from, int to) {
+    const std::wstring exe = job->dest + L"\\" + kGameExeName;
+    SECURITY_ATTRIBUTES sa = { sizeof sa, nullptr, TRUE };
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return true;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si = { sizeof si };
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr;
+    si.hStdError = wr;
+    PROCESS_INFORMATION pi = {};
+    std::wstring line = L"\"" + exe + L"\" --build-shaders";
+    std::vector<wchar_t> cmd(line.begin(), line.end());
+    cmd.push_back(0);
+    const BOOL started = CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
+                                        nullptr, job->dest.c_str(), &si, &pi);
+    CloseHandle(wr);
+    if (!started) { CloseHandle(rd); return true; }
+    CloseHandle(pi.hThread);
+    job->Set(from, L"Preparing the game's shaders (one time, for smooth play)\x2026");
+    std::string pending;
+    char buf[4096];
+    DWORD n = 0;
+    int shown = -1;
+    bool cancelled = false;
+    while (ReadFile(rd, buf, sizeof buf, &n, nullptr) && n) {
+        pending.append(buf, n);
+        for (size_t eol; (eol = pending.find('\n')) != std::string::npos; pending.erase(0, eol + 1)) {
+            unsigned done = 0, total = 0;
+            if (sscanf_s(pending.substr(0, eol).c_str(), "[shaders] %u/%u", &done, &total) != 2 || !total) continue;
+            const int pct = from + (int)((uint64_t)done * (to - from) / total);
+            if (pct == shown && done != total) continue;
+            shown = pct;
+            wchar_t s[160];
+            swprintf_s(s, L"Preparing the game's shaders (one time, for smooth play): %u of %u\x2026", done, total);
+            job->Set(pct, s);
+        }
+        if (InterlockedCompareExchange(&job->cancel, 0, 0)) {
+            TerminateProcess(pi.hProcess, 1);
+            cancelled = true;
+            break;
+        }
+    }
+    WaitForSingleObject(pi.hProcess, 10000);
+    CloseHandle(pi.hProcess);
+    CloseHandle(rd);
+    return !cancelled;
+}
+
 static bool RunInstall(InstallJob* job) {
     std::string err;
     std::wstring why;
@@ -427,11 +482,11 @@ static bool RunInstall(InstallJob* job) {
         return Fail(job, L"Could not create the install folder. Try a different location.");
     if (!WritePayload(job->dest.c_str(), err, &job->written)) return Fail(job, Widen(err));
 
-    // The game files: 5..96% of the bar, by bytes written.
+    // The game files: 5..80% of the bar, by bytes written (the shaders take 82..97%).
     uint64_t done = 0;
     auto report = [&](const std::wstring& what, uint64_t extra) {
         if (InterlockedCompareExchange(&job->cancel, 0, 0)) return false;
-        const int pct = 5 + (int)((done + extra) * 91 / (total ? total : 1));
+        const int pct = 5 + (int)((done + extra) * 75 / (total ? total : 1));
         static uint64_t shown = 0;
         if (done + extra - shown > (16u << 20) || extra == 0) {
             shown = done + extra;
@@ -468,7 +523,7 @@ static bool RunInstall(InstallJob* job) {
         done += p.outBytes;
     }
 
-    job->Set(96, L"Installing Title Update 3 data\x2026");
+    job->Set(80, L"Installing Title Update 3 data\x2026");
     for (const wchar_t* f : { L"\\update\\data100.bin", L"\\update\\data100.ofs" }) job->written.push_back(gameDir + f);
     job->written.push_back(job->dest + L"\\" + kImageName);
     if (!ExpandContainer([&](uint64_t off, void* b, uint32_t n) {
@@ -480,6 +535,8 @@ static bool RunInstall(InstallJob* job) {
     if (!WriteBytes(gameDir + L"\\update\\data100.ofs", tuIndex.data(), tuIndex.size()) ||
         !WriteBytes(job->dest + L"\\" + kImageName, image.data(), image.size()))
         return Fail(job, L"Could not write to the install folder (the disk may be full).");
+
+    if (!PrepareShaders(job, 82, 97)) return Fail(job, L"Installation cancelled.");
 
     job->Set(98, L"Creating shortcuts\x2026");
     wchar_t self[MAX_PATH];
@@ -933,8 +990,11 @@ static INT_PTR CALLBACK MainProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
                 L" is installed.\n\nSaved games, profiles and settings are kept in your user profile, so they "
                 L"survive an uninstall.\n\nPlay now?";
             if (MessageBoxW(dlg, msg.c_str(), kAppName, MB_YESNO | MB_ICONINFORMATION) == IDYES) {
-                std::wstring game = g_job.dest + L"\\" + kGameExeName;
-                ShellExecuteW(nullptr, L"open", game.c_str(), nullptr, g_job.dest.c_str(), SW_SHOWNORMAL);
+                // Through Explorer, so the game runs as the user does from its shortcut - started from here
+                // directly it inherited the installer's administrator rights (MEASURED 2026-10-21: an elevated
+                // game whose log and state the unelevated user's tools could not read).
+                std::wstring game = L"\"" + g_job.dest + L"\\" + kGameExeName + L"\"";
+                ShellExecuteW(nullptr, L"open", L"explorer.exe", game.c_str(), g_job.dest.c_str(), SW_SHOWNORMAL);
             }
             EndDialog(dlg, 1);
         } else {

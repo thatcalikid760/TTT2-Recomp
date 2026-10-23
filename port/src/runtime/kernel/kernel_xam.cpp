@@ -88,26 +88,69 @@ PPC_FUNC(__imp__XamGetSystemVersion)
 // the profile monitor sub_82B37080 compares both every poll. ---
 static bool User0SignedIn() { return profiles::SignedIn(); }
 
-// TTT2_XAM_TRACE=1: each new (function, caller, user, result) of the user queries, timestamped.
-static void UserTrace(const char* fn, uint32_t lr, uint32_t user, uint32_t result)
+// --- users 1-3: guests of user 0's profile. On the console a second player signs in (a guest of the
+// first player's profile, or a profile of their own) before playing online, and TTT2's online PAIR PLAY
+// takes only a signed-in controller (MEASURED 2026-10-22: at "Press START button of controller in use."
+// player 2's START did nothing - user report: "the second controller can't join at all"; offline pair
+// play takes any controller). A guest signs in when its controller is first used (PadPollState::guestOf
+// claims it) and stays while user 0 is signed in; it is named after the profile ("NAME(1)"), has XUIDs
+// of its own derived from the profile's, and cannot save (the content calls take user 0 only, as on the
+// console, where guests have no storage).
+std::atomic<uint32_t> g_usedUsers{ 0 };       // bit u: user u's controller has been used
+static bool SignedIn(uint32_t user)
 {
-    static const bool on = std::getenv("TTT2_XAM_TRACE") != nullptr;
-    if (!on) return;
+    if (user == 0) return User0SignedIn();
+    return user < 4 && (g_usedUsers.load() >> user & 1) && User0SignedIn();
+}
+static uint64_t OfflineXuid(uint32_t user)
+{
+    const uint64_t xuid = profiles::ActiveXuid();
+    if (user == 0) return xuid;
+    return 0xE000000000000000ull | ((xuid ^ uint64_t(user) * 0xD6E8FEB86659FD93ull) & 0x0000FFFFFFFFFFFFull);
+}
+// One of this PC's users' XUIDs (offline or online, signed in or not): title storage serves those from here.
+bool XamLocalUserXuid(uint64_t xuid)
+{
+    for (uint32_t user = 0; xuid && user < 4; ++user)
+        if (xuid == OfflineXuid(user) || xuid == xlive::OnlineXuid(user)) return true;
+    return false;
+}
+static std::string UserName(uint32_t user)
+{
+    std::string name = profiles::Active().name;
+    if (user == 0) return name;
+    const std::string tag = "(" + std::to_string(user) + ")";
+    return name.substr(0, 15 - tag.size()) + tag;
+}
+
+// TTT2_XAM_TRACE=1: each new (function, caller, user, result) of the user queries, timestamped;
+// TTT2_XAM_TRACE=2: users 1-3's again every second, with the caller's caller.
+static void UserTrace(const char* fn, uint32_t lr, uint32_t user, uint32_t result, uint32_t lr2 = 0)
+{
+    static const char* env = std::getenv("TTT2_XAM_TRACE");
+    if (!env) return;
     static std::mutex m;
     static std::unordered_map<uint64_t, int> seen;
-    const uint64_t key = (uint64_t(lr) << 32) ^ (uint64_t(user) << 24) ^ result ^ (uint64_t(uintptr_t(fn)) << 8);
+    uint64_t key = (uint64_t(lr) << 32) ^ (uint64_t(user) << 24) ^ result ^ (uint64_t(uintptr_t(fn)) << 8);
+    if (*env == '2' && user) key ^= (GetTickCount64() / 1000) * 0x9E3779B97F4A7C15ull ^ uint64_t(lr2) << 16;
     std::lock_guard l(m);
     if (seen[key]++) return;
-    std::fprintf(stderr, "[xam-user] %llu ms %s user %u lr %08X -> %08X\n",
-                 (unsigned long long)GetTickCount64(), fn, user, lr, result);
+    std::fprintf(stderr, "[xam-user] %llu ms %s user %u lr %08X (%08X) -> %08X\n",
+                 (unsigned long long)GetTickCount64(), fn, user, lr, lr2, result);
+}
+// The caller's caller: the saved LR in the caller's frame (back chain at r1, LR at -8 of the previous frame).
+static uint32_t Caller2(uint8_t* base, const PPCContext& ctx)
+{
+    const uint32_t back = GRead32(base, ctx.r1.u32);
+    return back > 8 ? GRead32(base, back - 8) : 0;
 }
 
 PPC_FUNC(__imp__XamUserGetSigninState)
 {
     KTrace("XamUserGetSigninState");
     const uint32_t user = ctx.r3.u32;
-    ctx.r3.u32 = user == 0 && User0SignedIn() ? (TitleServerEnabled() ? 2 : 1) : 0;
-    UserTrace("GetSigninState", uint32_t(ctx.lr), user, ctx.r3.u32);
+    ctx.r3.u32 = SignedIn(user) ? (TitleServerEnabled() ? 2 : 1) : 0;
+    UserTrace("GetSigninState", uint32_t(ctx.lr), user, ctx.r3.u32, Caller2(base, ctx));
 }
 
 // Xenia Canary's GetXUID uses a profile-type mask (type 1|2), independently
@@ -125,10 +168,11 @@ PPC_FUNC(__imp__XamUserGetXUID)
     GWrite32(base,out,0);GWrite32(base,out+4,0);
     if(user>=4 || (mask!=1&&mask!=2&&mask!=3&&mask!=4&&mask!=7))
     {ctx.r3.u32=0x80070057u;return;}
-    if(user!=0 || !(mask&3) || !User0SignedIn()){ctx.r3.u32=0x80070525u;UserTrace("GetXUID",uint32_t(ctx.lr),user,ctx.r3.u32);return;}
-    const uint64_t xuid=(mask&2) && TitleServerEnabled() ? xlive::OnlineXuid() : profiles::ActiveXuid();
+    if(!(mask&3) || !SignedIn(user)){ctx.r3.u32=0x80070525u;UserTrace("GetXUID",uint32_t(ctx.lr),user,ctx.r3.u32,Caller2(base,ctx));return;}
+    const uint64_t xuid=(mask&2) && TitleServerEnabled() ? xlive::OnlineXuid(user) : OfflineXuid(user);
     GWrite32(base,out,uint32_t(xuid>>32));GWrite32(base,out+4,uint32_t(xuid));
     ctx.r3.u32=0;
+    if(user)UserTrace("GetXUID",uint32_t(ctx.lr),user,mask,Caller2(base,ctx));
 }
 
 PPC_FUNC(__imp__XamUserGetSigninInfo)
@@ -137,10 +181,10 @@ PPC_FUNC(__imp__XamUserGetSigninInfo)
     uint32_t user = ctx.r3.u32, flags = ctx.r4.u32, info = ctx.r5.u32;
     if (!info) { ctx.r3.u32 = 0x80070057u; return; }               // E_INVALIDARG
     std::memset(base + info, 0, 0x28);
-    if (user != 0 || !User0SignedIn())                                 // HRESULT: no such user
+    if (!SignedIn(user))                                               // HRESULT: no such user
     {
         ctx.r3.u32 = 0x80070525u;
-        UserTrace("GetSigninInfo", uint32_t(ctx.lr), user, ctx.r3.u32);
+        UserTrace("GetSigninInfo", uint32_t(ctx.lr), user, ctx.r3.u32, Caller2(base, ctx));
         return;
     }
     // Bit 1 requests the offline identity; bit 0 requests an online identity.
@@ -148,41 +192,118 @@ PPC_FUNC(__imp__XamUserGetSigninInfo)
     // game's profile monitor (82B37080) detect a sign-in transition every frame.
     // Matches Xenia Canary XamUserGetSigninInfo's offline-only behavior.
     const bool live = TitleServerEnabled();
-    const profiles::Profile profile = profiles::Active();
     if (!flags || (flags & 2))
     {
-        GWrite32(base, info + 0, uint32_t(profile.xuid >> 32));    // XUID (hi)
-        GWrite32(base, info + 4, uint32_t(profile.xuid));          // XUID (lo)
+        const uint64_t offline = OfflineXuid(user);
+        GWrite32(base, info + 0, uint32_t(offline >> 32));         // XUID (hi)
+        GWrite32(base, info + 4, uint32_t(offline));               // XUID (lo)
     }
     else if (live)
     {
-        const uint64_t online = xlive::OnlineXuid();               // unique per machine and profile
+        const uint64_t online = xlive::OnlineXuid(user);           // unique per machine, profile and user
         GWrite32(base, info + 0, uint32_t(online >> 32));
         GWrite32(base, info + 4, uint32_t(online));
     }
-    if (live) GWrite32(base, info + 8, 1);                          // XUSER_INFO_FLAG_LIVE_ENABLED
+    // XUSER_INFO_FLAG_LIVE_ENABLED (1) | XUSER_INFO_FLAG_GUEST (2); a guest's number and sponsor (user 0).
+    GWrite32(base, info + 8, (live ? 1u : 0u) | (user ? 2u : 0u));
     GWrite32(base, info + 12, live ? 2 : 1);                         // SigninState: Live / local
-    const size_t n = (std::min)(profile.name.size(), size_t(15));    // gamertag (ASCII, 16 bytes)
-    std::memcpy(base + info + 24, profile.name.data(), n);
+    GWrite32(base, info + 16, user);
+    const std::string name = UserName(user);
+    const size_t n = (std::min)(name.size(), size_t(15));            // gamertag (ASCII, 16 bytes)
+    std::memcpy(base + info + 24, name.data(), n);
     GWrite8(base, info + 24 + uint32_t(n), 0);
     ctx.r3.u32 = 0;
+    if (user) UserTrace("GetSigninInfo", uint32_t(ctx.lr), user, flags, Caller2(base, ctx));
 }
 
 PPC_FUNC(__imp__XamUserGetName)
 {
     KTrace("XamUserGetName");
     uint32_t user = ctx.r3.u32, buf = ctx.r4.u32, size = ctx.r5.u32;
-    if (user != 0 || !buf || !size || !User0SignedIn()) { ctx.r3.u32 = 0x525; return; }
-    const std::string name = profiles::Active().name;
+    if (!buf || !size || !SignedIn(user)) { ctx.r3.u32 = 0x525; return; }
+    const std::string name = UserName(user);
     const uint32_t n = (std::min)(uint32_t(name.size()), size - 1);
     std::memcpy(base + buf, name.data(), n);
     GWrite8(base, buf + n, 0);
     ctx.r3.u32 = 0;
+    if (user) UserTrace("GetName", uint32_t(ctx.lr), user, 0, Caller2(base, ctx));
 }
 
 // (titleId, userIndex, xuidCount, xuids, settingCount, settingIds, bufferSize, buffer, overlapped)
 // Query pass (buffer null): report 4 bytes needed. Read pass: zero the buffer; the game
 // tolerates all-zero profile settings (Unleashed behavior).
+// Profile settings (XUserReadProfileSettings, ...ByXuid with xuids), as XAM answers them: the first call (no buffer,
+// or one too small) gets ERROR_INSUFFICIENT_BUFFER and the size; the second an XUSER_READ_PROFILE_SETTING_RESULT
+// {u32 count, u32 settings} with one XUSER_PROFILE_SETTING (40 bytes: +0 source, +8 user index / xuid, +0x10 setting
+// id, +0x18 XUSER_DATA {u8 type, +8 value / {u32 size, u32 pointer}}) per player and setting, each "no value"
+// (source 0: the game's defaults; no profile settings are kept here), then the strings' and blobs' room.
+// MEASURED 2026-10-23: the license screen (sub_826D5CB0) reads a player's gamer picture key (0x4064000F) and requires
+// 122 from the first call, else "Failed to obtain license."; the second call is overlapped. (The old answer - success,
+// 4 bytes, a zeroed buffer - failed every read: the menus asked again and again, ~1000 times a session.)
+void ReadProfileSettings(PPCContext& ctx, uint8_t* base)
+{
+    const uint32_t xuidCount = ctx.r5.u32, xuids = ctx.r6.u32, settingCount = ctx.r7.u32, ids = ctx.r8.u32;
+    const uint32_t players = (std::max)(xuidCount, 1u);   // none: the requesting user (r4)
+    const uint32_t sizePtr = ctx.r9.u32, buffer = ctx.r10.u32;
+    const uint32_t overlapped = XamGuestRange(ctx.r1.u32 + 0x54, 4) ? GRead32(base, ctx.r1.u32 + 0x54) : 0;
+    if (xuidCount > 16 || settingCount > 64 || (xuidCount && !XamGuestRange(xuids, uint64_t(xuidCount) * 8)) ||
+        !XamGuestRange(ids, uint64_t(settingCount) * 4) || !XamGuestRange(sizePtr, 4))
+    {
+        ctx.r3.u32 = 0x57;                                   // ERROR_INVALID_PARAMETER
+        return;
+    }
+    if (const uint32_t error = XamValidateOverlapped(base, overlapped)) { ctx.r3.u32 = error; return; }
+    // The dashboard's settings (title FFFE07D1): only the voice library (XHV, sub_82C6CE5C) reads them - voice muted,
+    // through speakers, volume (1004000C..E) - and it gets "nothing to read" (success, 4 bytes, the buffer zeroed), as
+    // before 2026-10-23. MEASURED 2026-10-23: given the settings, its worker held its lock 50-130 ms at a time while
+    // the main thread waited for it ([cs] slow acquire at 82C692B4) - 70-105 frames over 50 ms in every online fight
+    // (the user: "the match weren't smooth"); answered this way, 0 frames over 25 ms, the longest 28 ms. No voice here.
+    if (ctx.r3.u32 == 0xFFFE07D1u)
+    {
+        if (buffer) { if (const uint32_t n = GRead32(base, sizePtr); n && XamGuestRange(buffer, n)) std::memset(base + buffer, 0, n); }
+        else GWrite32(base, sizePtr, 4);
+        ctx.r3.u32 = 0;
+        return;
+    }
+    const uint32_t entries = players * settingCount;
+    uint32_t needed = 8 + entries * 40;
+    for (uint32_t i = 0; i < settingCount; ++i)
+    {
+        const uint32_t id = GRead32(base, ids + i * 4), type = id >> 28;
+        if (type == 4 || type == 6) needed += players * ((((id >> 16) & 0xFFF) + 3) & ~3u);   // unicode / binary
+    }
+    if (!buffer || GRead32(base, sizePtr) < needed || !XamGuestRange(buffer, needed))
+    {
+        GWrite32(base, sizePtr, needed);
+        ctx.r3.u32 = 122;                                    // ERROR_INSUFFICIENT_BUFFER
+        return;
+    }
+    std::memset(base + buffer, 0, needed);
+    GWrite32(base, buffer, entries);
+    GWrite32(base, buffer + 4, buffer + 8);
+    uint32_t extra = buffer + 8 + entries * 40;
+    for (uint32_t x = 0; x < players; ++x)
+        for (uint32_t i = 0; i < settingCount; ++i)
+        {
+            const uint32_t e = buffer + 8 + (x * settingCount + i) * 40, id = GRead32(base, ids + i * 4), type = id >> 28;
+            if (xuidCount)
+            {
+                GWrite32(base, e + 0x08, GRead32(base, xuids + x * 8));
+                GWrite32(base, e + 0x0C, GRead32(base, xuids + x * 8 + 4));
+            }
+            else
+                GWrite32(base, e + 0x08, ctx.r4.u32);
+            GWrite32(base, e + 0x10, id);
+            GWrite8(base, e + 0x18, uint8_t(type));
+            if (type == 4 || type == 6)
+            {
+                GWrite32(base, e + 0x24, extra);             // size 0: empty, the room zeroed
+                extra += (((id >> 16) & 0xFFF) + 3) & ~3u;
+            }
+        }
+    ctx.r3.u32 = XamCompleteOverlapped(base, overlapped, 0, 0, 0);
+}
+
 PPC_FUNC(__imp__XamUserReadProfileSettings)
 {
     KTrace("XamUserReadProfileSettings");
@@ -194,16 +315,9 @@ PPC_FUNC(__imp__XamUserReadProfileSettings)
                      ctx.r4.u32, xuidCount, xuids && xuidCount ? GRead32(base, xuids) : 0u, xuids && xuidCount ? GRead32(base, xuids + 4) : 0u,
                      settingCount, ids && settingCount ? GRead32(base, ids) : 0u, buffer, uint32_t(ctx.lr));
     }
-    if (buffer)
-    {
-        uint32_t n = bufferSize ? GRead32(base, bufferSize) : 0;
-        if (n) std::memset(base + buffer, 0, n);
-    }
-    else if (bufferSize)
-    {
-        GWrite32(base, bufferSize, 4);
-    }
-    ctx.r3.u32 = 0;
+    (void)bufferSize;
+    (void)buffer;
+    ReadProfileSettings(ctx, base);
 }
 
 // --- Xam notification listeners. A listener has an area mask and a FIFO of (id, param)
@@ -379,15 +493,21 @@ PPC_FUNC(__imp__XMsgInProcessCall)
     }
     if (app == 0xFC && message == 0x00058035)
     {
-        // XStorageBuildServerPath, marshalled by the XDK library (sub_828546C0): param block
-        // {+0 user, +8 xuid, +0x10 facility, +0x14 save-game ptr, +0x18 size, +0x1C item name
-        // (wide), +0x20 out path (wide), +0x24 out length}. The path only has to round-trip
-        // to XStorageDownloadToMemory, which matches on the item name (title_server.cpp).
+        // XStorageBuildServerPath(ByXuid), marshalled by the XDK library (sub_828546C0): param
+        // block {+0 user, +8 xuid, +0x10 facility, +0x14 save-game ptr, +0x18 size, +0x1C item
+        // name (wide), +0x20 out path (wide), +0x24 out length}. The path only has to round-trip
+        // to the XStorage calls (title_server.cpp), which match on the item name and, for a
+        // per-user item (facility 3: licence.dat), on its owner: the XUID goes in the path, as
+        // the game views other players' licenses by their XUID.
         const uint32_t facility = GRead32(base, param1 + 0x10), item = GRead32(base, param1 + 0x1C);
         const uint32_t out = GRead32(base, param1 + 0x20), outLength = GRead32(base, param1 + 0x24);
         if (!item || !out) { ctx.r3.u32 = 0x80070057u; return; }
-        char prefix[48];
-        std::snprintf(prefix, sizeof(prefix), "/storage/%08X/%u/", 0x4E4D0859u, facility);
+        const uint64_t owner = uint64_t(GRead32(base, param1 + 8)) << 32 | GRead32(base, param1 + 12);
+        char prefix[64];
+        if (facility == 3 && owner)
+            std::snprintf(prefix, sizeof(prefix), "/storage/%08X/%u/%016llX/", 0x4E4D0859u, facility, (unsigned long long)owner);
+        else
+            std::snprintf(prefix, sizeof(prefix), "/storage/%08X/%u/", 0x4E4D0859u, facility);
         std::u16string path;
         for (const char* c = prefix; *c; ++c) path += char16_t(*c);
         for (uint32_t i = 0; i < 96; ++i)
@@ -581,10 +701,11 @@ static XINPUT_CAPABILITIES PlayStationCaps()
 //   TTT2_INPUT_SCRIPT="8000:START:150,12000:A:150,..."  ms since start : buttons : hold ms
 //   C:/ttt2/port/pad_inject.txt  lines "BUTTONS hold_ms [gap_ms]", consumed then deleted
 //                                (pad_inject<tag>.txt with TTT2_INSTANCE=<tag>)
-// BUTTONS is one or more names joined by '+': START BACK UP DOWN LEFT RIGHT A B X Y LB RB.
+// BUTTONS is one or more names joined by '+': START BACK UP DOWN LEFT RIGHT A B X Y LB RB, and LSL LSR LSU LSD
+// (the left stick pushed fully left / right / up / down).
 // Presses go to player 1 (user 0); a P2 name sends them to player 2 (user 1), e.g.
 // "60000:P2+START:150" or "P2+DOWN+A 150" - user 1 then stays connected as a virtual pad.
-struct ScriptedPress { uint64_t at = 0, until = 0; uint16_t buttons = 0; int player = 0; };
+struct ScriptedPress { uint64_t at = 0, until = 0; uint16_t buttons = 0; int player = 0; uint8_t stick = 0; };
 struct PadScript
 {
     std::vector<ScriptedPress> presses;
@@ -592,8 +713,9 @@ struct PadScript
     uint64_t injectBusyUntil = 0, nextInjectPoll = 0;
 };
 
-static uint16_t ParseButtons(const std::string& names, int* player = nullptr)
+static uint16_t ParseButtons(const std::string& names, int* player = nullptr, uint8_t* stick = nullptr)
 {
+    static const std::pair<const char*, uint8_t> sticks[] = { { "LSL", 1 }, { "LSR", 2 }, { "LSU", 4 }, { "LSD", 8 } };
     static const std::pair<const char*, uint16_t> map[] = {
         { "START", 0x0010 }, { "BACK", 0x0020 }, { "UP", 0x0001 }, { "DOWN", 0x0002 },
         { "LEFT", 0x0004 }, { "RIGHT", 0x0008 }, { "A", 0x1000 }, { "B", 0x2000 },
@@ -607,6 +729,8 @@ static uint16_t ParseButtons(const std::string& names, int* player = nullptr)
         for (const auto& [n, v] : map)
             if (name == n) b |= v;
         if (name == "P2" && player) *player = 1;
+        for (const auto& [n, v] : sticks)
+            if (name == n && stick) *stick |= v;
         pos = end + 1;
     }
     return b;
@@ -626,10 +750,10 @@ static void LoadScript(PadScript& s, const char* text)
         {
             ScriptedPress p;
             p.at = std::strtoull(item.c_str(), nullptr, 10);
-            p.buttons = ParseButtons(item.substr(c1 + 1, c2 - c1 - 1), &p.player);
+            p.buttons = ParseButtons(item.substr(c1 + 1, c2 - c1 - 1), &p.player, &p.stick);
             p.until = p.at + std::strtoull(item.c_str() + c2 + 1, nullptr, 10);
-            if (p.buttons) s.presses.push_back(p);
-            s.player2 |= p.buttons && p.player == 1;
+            if (p.buttons || p.stick) s.presses.push_back(p);
+            s.player2 |= (p.buttons || p.stick) && p.player == 1;
         }
         pos = end + 1;
     }
@@ -662,10 +786,11 @@ static void PollInjectFile(PadScript& s, uint64_t now)
         // "&BUTTONS ..." starts together with the line before (both players at once).
         const bool together = names[0] == '&';
         int player = 0;
-        const uint16_t b = ParseButtons(names + together, &player);
-        if (!b) continue;
+        uint8_t stick = 0;
+        const uint16_t b = ParseButtons(names + together, &player, &stick);
+        if (!b && !stick) continue;
         const uint64_t start = together ? previous : at;
-        s.presses.push_back({ start, start + hold, b, player });
+        s.presses.push_back({ start, start + hold, b, player, stick });
         s.player2 |= player == 1;
         if (logged < 2000 && ++logged)
             std::fprintf(stderr, "[input] inject %s at +%llums hold %u\n", names,
@@ -679,13 +804,25 @@ static void PollInjectFile(PadScript& s, uint64_t now)
     s.active = true;
 }
 
-static uint16_t ScriptButtons(PadScript& s, uint64_t now, int player = 0)
+static uint16_t ScriptButtons(PadScript& s, uint64_t now, int player = 0, uint8_t* stick = nullptr)
 {
     if (player == 0) PollInjectFile(s, now);
     uint16_t b = 0;
     for (const ScriptedPress& p : s.presses)
-        if (p.player == player && now >= p.at && now < p.until) b |= p.buttons;
+        if (p.player == player && now >= p.at && now < p.until)
+        {
+            b |= p.buttons;
+            if (stick) *stick |= p.stick;
+        }
     return b;
+}
+// A scripted left stick (LSL / LSR / LSU / LSD bits) on a player's pad state.
+static void ApplyScriptStick(XINPUT_STATE& state, uint8_t stick)
+{
+    if (stick & 1) state.Gamepad.sThumbLX = -32768;
+    if (stick & 2) state.Gamepad.sThumbLX = 32767;
+    if (stick & 4) state.Gamepad.sThumbLY = 32767;
+    if (stick & 8) state.Gamepad.sThumbLY = -32768;
 }
 
 void PublishPad(DWORD index, bool connected, bool physical,
@@ -714,7 +851,8 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
     const bool startPulse = autoStart && elapsedMs > 45000 && (elapsedMs % 9000) < 300;
     // Scripted presses join the keyboard's (controller 0, foreground not required).
     const KeyboardPad keyboard = ReadKeyboardPad();
-    const uint16_t keyboardButtons = keyboard.buttons | (script ? ScriptButtons(*script, elapsedMs) : 0);
+    uint8_t stick1 = 0, stick2 = 0;
+    const uint16_t keyboardButtons = keyboard.buttons | (script ? ScriptButtons(*script, elapsedMs, 0, &stick1) : 0);
     {
         // Input latency tests: when player 1's buttons change, on the [burst] lines' clock.
         static uint16_t shown = 0;
@@ -723,7 +861,7 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count());
         shown = keyboardButtons;
     }
-    const uint16_t player2Buttons = script ? ScriptButtons(*script, elapsedMs, 1) : 0;
+    const uint16_t player2Buttons = script ? ScriptButtons(*script, elapsedMs, 1, &stick2) : 0;
     if (script && script->active) autoStart = true;        // keep pad 0 connected for the script
     polling.keyboardEverPressed |= keyboardButtons != 0 || keyboard.leftTrigger || keyboard.rightTrigger;
     XINPUT_STATE sampled[kHostPads]{};
@@ -776,6 +914,17 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
         for (int user = 0; user < 4; ++user)
             if (!claimed(user)) { polling.guestOf[i] = user; break; }
     }
+    // Users 1-3 sign in as guests on their controller's first use (player 2's scripted presses count).
+    uint32_t used = (script && script->player2 && player2Buttons) ? 2u : 0u;
+    for (DWORD i = 0; i < 4; ++i)
+        if (polling.guestOf[i] > 0) used |= 1u << polling.guestOf[i];
+    if (const uint32_t added = used & ~g_usedUsers.fetch_or(used))
+        for (uint32_t user = 1; user < 4; ++user)
+            if (added >> user & 1 && User0SignedIn())
+            {
+                std::fprintf(stderr, "[xam] user %u signed in: '%s', a guest of the profile\n", user, UserName(user).c_str());
+                XamNotifyEnqueueEvent(0x0000000Au, 1u << user);   // XN_SYS_SIGNINCHANGED
+            }
     int source[4]{ -1, -1, -1, -1 };   // guest user -> host pad
     for (DWORD i = 0; i < kHostPads; ++i)
         if (polling.guestOf[i] >= 0 && polling.physicalConnected[i]) source[polling.guestOf[i]] = int(i);
@@ -817,6 +966,7 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
         if (user == 1 && script && script->player2)
         {
             state.Gamepad.wButtons |= player2Buttons;
+            ApplyScriptStick(state, stick2);
             caps.Gamepad.wButtons |= 0xF33F;
             if (!physical)
             {
@@ -832,6 +982,7 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
             if (startPulse)
                 buttons |= 0x0010;
             state.Gamepad.wButtons |= buttons;
+            ApplyScriptStick(state, stick1);
             if (keyboard.leftTrigger) state.Gamepad.bLeftTrigger = 255;
             if (keyboard.rightTrigger) state.Gamepad.bRightTrigger = 255;
             caps.Gamepad.wButtons |= 0xF3FF; // supported mapped controls, independent of current presses
@@ -879,6 +1030,7 @@ void EnsurePadThread()
 }
 
 std::atomic<int64_t> g_startPulseUntilMs{ 0 };
+std::atomic<int64_t> g_downPulseUntilMs{ 0 };
 int64_t NowMs()
 {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -921,6 +1073,10 @@ bool HostTriggerHeld()
 
 // Player 1 presses START for 150 ms (the title continues after a profile signs in).
 void HostPulseStart() { g_startPulseUntilMs = NowMs() + 150; }
+
+// Player 1 presses DOWN for 80 ms: one step of a menu's cursor, drawn by the menu itself (the server UI moves the
+// ONLINE MODE cursor off a row that needs a server).
+void HostPulseDown() { g_downPulseUntilMs = NowMs() + 80; }
 
 PPC_FUNC(__imp__XamInputGetCapabilities)
 {
@@ -975,15 +1131,22 @@ PPC_FUNC(__imp__XamInputGetState)
         st.Gamepad.wButtons &= ~uint16_t(0x0010 | 0x1000);   // START / A open Select Profile instead
     else if (const uint16_t mask = SysUiGameButtonMask(); user == 0 && mask != 0xFFFF)
     {
-        // Controller Setup's KEYBOARD mode takes the other buttons (and the stick's LEFT / RIGHT).
+        // Controller Setup's KEYBOARD mode takes the other buttons (and the stick's LEFT / RIGHT); the server list
+        // takes UP / DOWN at its ends (and the stick's UP / DOWN with them).
         st.Gamepad.wButtons &= mask;
         st.Gamepad.bLeftTrigger = st.Gamepad.bRightTrigger = 0;
         st.Gamepad.sThumbLX = 0;
+        if ((mask & 0x0003) != 0x0003) st.Gamepad.sThumbLY = 0;
     }
     else if (user == 0 && NowMs() < g_startPulseUntilMs.load())
     {
         st.Gamepad.wButtons |= 0x0010;
         st.dwPacketNumber += 0x10000;           // a new packet while the pulse lasts
+    }
+    else if (user == 0 && NowMs() < g_downPulseUntilMs.load())
+    {
+        st.Gamepad.wButtons |= 0x0002;          // DPAD_DOWN
+        st.dwPacketNumber += 0x20000;
     }
     if (user == 0)
     {

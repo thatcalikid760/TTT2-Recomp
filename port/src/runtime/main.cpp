@@ -22,6 +22,7 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <filesystem>
 
 // 4 GiB reserved so (base + any 32-bit guest address) is always valid.
 // 4 GiB of guest space plus a 16 MiB zero tail: a garbage guest pointer near the top of the
@@ -85,11 +86,10 @@ static LONG CALLBACK NullPageVeh(EXCEPTION_POINTERS* ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-// TTT2_STACKDUMP=<seconds>: after that delay, suspend every other thread and print each
-// one's RIP plus in-module stack return addresses (resolve offline via the linker map).
-static void StackDumpAfter(int seconds)
+// Suspend every other thread and print each one's RIP plus in-module stack return addresses
+// (resolve offline via the linker map: tools/stackdump.ps1). `why` heads the dump.
+void DumpAllStacks(const char* why)
 {
-    std::this_thread::sleep_for(std::chrono::seconds(seconds));
     uint64_t modBase = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
     DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -97,7 +97,7 @@ static void StackDumpAfter(int seconds)
     THREADENTRY32 te{ sizeof(te) };
     // Capture with threads suspended, but PRINT only after resuming them: a suspended
     // thread may hold the CRT stderr lock and printing would deadlock the dump.
-    struct Cap { DWORD tid; uint64_t rip; uint64_t rets[12]; int nret; };
+    struct Cap { DWORD tid; uint64_t rip; uint64_t rets[24]; int nret; };
     Cap caps[64]; int ncap = 0;
     for (BOOL ok = Thread32First(snap, &te); ok && ncap < 64; ok = Thread32Next(snap, &te))
     {
@@ -113,7 +113,7 @@ static void StackDumpAfter(int seconds)
                 cap.tid = te.th32ThreadID;
                 cap.rip = c.Rip - modBase;
                 cap.nret = 0;
-                for (int i = 0; i < 2048 && cap.nret < 12; ++i)
+                for (int i = 0; i < 2048 && cap.nret < 24; ++i)
                 {
                     uint64_t v = 0;
                     if (!ReadProcessMemory(GetCurrentProcess(),
@@ -129,7 +129,7 @@ static void StackDumpAfter(int seconds)
     CloseHandle(snap);
     extern void KernelDumpGuestThreads();
     KernelDumpGuestThreads();
-    std::fprintf(stderr, "[stacks] ==== thread dump ====\n");
+    std::fprintf(stderr, "[stacks] ==== thread dump (%s) ====\n", why);
     for (int i = 0; i < ncap; ++i)
     {
         std::fprintf(stderr, "[stacks] tid=%lu rip=0x%llX", caps[i].tid,
@@ -139,6 +139,13 @@ static void StackDumpAfter(int seconds)
         std::fprintf(stderr, "\n");
     }
     std::fprintf(stderr, "[stacks] ==== end dump ====\n");
+}
+
+// TTT2_STACKDUMP=<seconds>: after that delay, the dump above, then the process ends.
+static void StackDumpAfter(int seconds)
+{
+    std::this_thread::sleep_for(std::chrono::seconds(seconds));
+    DumpAllStacks("timer");
     LogDrain(); TerminateProcess(GetCurrentProcess(), 3);
 }
 
@@ -151,8 +158,22 @@ static void UnmappedCallReporter(PPCContext& ctx, uint8_t* base)
     static std::atomic<unsigned> logged{0};
     if (strict || logged.fetch_add(1, std::memory_order_relaxed) < 100)
     {
-        std::fprintf(stderr, "[runtime] UNMAPPED indirect call: ctr=0x%08X lr=0x%08X r3=0x%08X r1=0x%08X\n",
-            static_cast<uint32_t>(ctx.ctr.u32), static_cast<uint32_t>(ctx.lr), ctx.r3.u32, ctx.r1.u32);
+        // The guest's call chain (back chain at r1, saved lr at frame - 8), for the first reports.
+        char chain[160] = "";
+        if (logged.load(std::memory_order_relaxed) <= 20)
+        {
+            int k = 0;
+            uint32_t sp = ctx.r1.u32;
+            for (int i = 0; i < 10 && sp && sp < 0xFFFFFFF0u && k < int(sizeof(chain)) - 10; ++i)
+            {
+                const uint32_t prev = __builtin_bswap32(*reinterpret_cast<uint32_t*>(base + sp));
+                if (!prev || prev <= sp || prev - sp > 0x10000) break;
+                k += std::snprintf(chain + k, sizeof(chain) - k, " %08X", __builtin_bswap32(*reinterpret_cast<uint32_t*>(base + prev - 8)));
+                sp = prev;
+            }
+        }
+        std::fprintf(stderr, "[runtime] UNMAPPED indirect call: ctr=0x%08X lr=0x%08X r3=0x%08X r1=0x%08X%s%s\n",
+            static_cast<uint32_t>(ctx.ctr.u32), static_cast<uint32_t>(ctx.lr), ctx.r3.u32, ctx.r1.u32, *chain ? ", guest callers" : "", chain);
     }
     if (strict)
     {
@@ -365,18 +386,41 @@ static std::string InstalledLayout(int argc)
     setDefault("TTT2_VFS_ROOT", narrow(dir + L"game"));
     setDefault("TTT2_GPU_HW", "1");
     setDefault("TTT2_FBDUMP", "0");
+    // The log stays where it goes only for a writable file (a launcher's redirect, as "Start TTT2 with
+    // test logging.bat" does); anything else - nothing, a console, a pipe, a handle value that is not
+    // this process's file - gets log.txt. MEASURED 2026-10-20: a copy started from its shortcut on one
+    // PC wrote no log at all since 2026-10-12 (the same build started from a script did).
+    // MEASURED 2026-10-21: a game started elevated by the installer held log.txt open for writing yet never
+    // truncated or wrote it - its standard error was already a handle to that file. A redirect to our own
+    // log.txt is not one to keep, and log_start.txt (next to it) says what each start found.
     const HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
-    if (!err || err == INVALID_HANDLE_VALUE || GetFileType(err) == FILE_TYPE_UNKNOWN)
+    const DWORD type = err && err != INVALID_HANDLE_VALUE ? GetFileType(err) : FILE_TYPE_UNKNOWN;
+    wchar_t errPath[MAX_PATH] = L"";
+    if (type == FILE_TYPE_DISK && !GetFinalPathNameByHandleW(err, errPath, MAX_PATH, 0)) errPath[0] = 0;
+    const std::wstring errName(errPath);
+    static const wchar_t kOwnLog[] = L"\\TTT2Recomp\\log.txt";
+    const size_t ownLen = std::wcslen(kOwnLog);
+    const bool ownLog = errName.size() >= ownLen && _wcsicmp(errName.c_str() + errName.size() - ownLen, kOwnLog) == 0;
+    DWORD none = 0;
+    const bool redirected = type == FILE_TYPE_DISK && !ownLog && WriteFile(err, "", 0, &none, nullptr);
+    wchar_t local[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH))
     {
-        wchar_t local[MAX_PATH] = {};
-        if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH))
+        const std::wstring folder = std::wstring(local) + L"\\TTT2Recomp";
+        CreateDirectoryW(folder.c_str(), nullptr);
+        bool reopened = false;
+        // _wfreopen, not _wfreopen_s: the _s variant opens without sharing, so the log could
+        // not be opened (or sent) while the game runs.
+        if (!redirected) reopened = _wfreopen((folder + L"\\log.txt").c_str(), L"w", stderr) != nullptr;
+        if (FILE* f = _wfopen((folder + L"\\log_start.txt").c_str(), L"w"))
         {
-            const std::wstring folder = std::wstring(local) + L"\\TTT2Recomp";
-            CreateDirectoryW(folder.c_str(), nullptr);
-            // _wfreopen, not _wfreopen_s: the _s variant opens without sharing, so the log could
-            // not be opened (or sent) while the game runs.
-            _wfreopen((folder + L"\\log.txt").c_str(), L"w", stderr);
+            std::fprintf(f, "standard error %p, type %lu, file \"%ls\"; %s\n", static_cast<void*>(err), type, errPath,
+                         redirected ? "kept (a launcher's redirect)" : reopened ? "log.txt opened" : "log.txt could not be opened");
+            std::fclose(f);
         }
+        if (reopened)
+            std::fprintf(stderr, "[runtime] log: %%LOCALAPPDATA%%\\TTT2Recomp\\log.txt (standard error was %s, type %lu)\n",
+                         !err ? "none" : err == INVALID_HANDLE_VALUE ? "invalid" : ownLog ? "log.txt itself" : "another handle", type);
     }
     return narrow(image);
 }
@@ -444,16 +488,74 @@ static void RunGuest(PPCContext& ctx, uint8_t* base)
     __except (FaultFilter(GetExceptionInformation())) { std::fprintf(stderr, "[runtime] guest faulted\n"); }
 }
 
+// The game's main thread (the guest's _xstart), for per-frame CPU cost reports (gpu_hw_d3d11.h).
+HANDLE g_mainThreadHandle = nullptr;
+
+// Switchable-graphics laptops: the NVIDIA / AMD drivers run an exe that exports these on the dedicated
+// GPU (MEASURED: a friend's PC ran the port on its integrated Intel UHD Graphics). gpu_adapter.h also
+// picks the high-performance adapter itself.
+extern "C" {
+__declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+
 int main(int argc, char** argv)
 {
     // The Steam helper process (kernel/steam_bridge.cpp): Steam lives there so Steam Input does
     // not hide the controllers from the game. Nothing of the game starts in it.
-    if (argc >= 2 && std::strcmp(argv[1], "--steam-bridge") == 0) return steamnet::RunBridge();
+    if (argc >= 2 && std::strcmp(argv[1], "--steam-bridge") == 0) return steamnet::RunBridge(argc, argv);
+    // --build-shaders [game folder] [game image] [threads]: the game's pixel shaders into the disk cache
+    // ahead of time (the installer runs it; gpu_hw_d3d11.h PrebuildShaders). Default: the installed
+    // layout next to the exe (game\data002.bin, data003.bin, tekken.img), else the development tree.
+    if (argc >= 4 && std::strcmp(argv[1], "--translate") == 0)
+    {
+        extern int GpuTranslateFile(const char* kind, const char* path);
+        return GpuTranslateFile(argv[2], argv[3]);
+    }
+    if (argc >= 2 && std::strcmp(argv[1], "--build-shaders") == 0)
+    {
+        wchar_t self[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, self, MAX_PATH);
+        std::filesystem::path exeDir = std::filesystem::path(self).parent_path();
+        std::filesystem::path game = argc > 2 && *argv[2] ? std::filesystem::path(argv[2]) : exeDir / "game";
+        std::filesystem::path image = argc > 3 && *argv[3] ? std::filesystem::path(argv[3]) : game / "tekken.img";
+        std::error_code ec;
+        if ((argc <= 2 || !*argv[2]) && !std::filesystem::exists(game / "data002.bin", ec))
+        {
+            game = "C:/ttt2/re/game_files_x";
+            image = "C:/ttt2/re/decrypted/Default_patched_tu3.bin";
+        }
+        const unsigned threads = argc > 4 ? unsigned(std::atoi(argv[4])) : 0u;
+        extern int GpuPrebuildShaders(const std::vector<std::filesystem::path>& files, unsigned threads);
+        return GpuPrebuildShaders({ game / "data002.bin", game / "data003.bin", image }, threads);
+    }
     const std::string installedImage = InstalledLayout(argc);
     std::setvbuf(stderr, nullptr, _IONBF, 0);   // unbuffered: trace survives a hard crash
     StartLogWriter();
     // Early, so a Discord Join that started the game reaches it (Discord holds it ~3 minutes).
     discord_presence::Start();
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_mainThreadHandle,
+                    THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0);
+    // An installed game whose shader prebuild is missing or from another build (the installer ran it
+    // under another account, the cache was deleted, the port was updated): it runs again now, as a
+    // separate low-priority process on half the cores, while the game plays as before (shaders it
+    // meets first are built in game until then). Work already in the cache is skipped.
+    extern bool GpuShaderPrebuildCurrent();
+    if (!installedImage.empty() && !GpuShaderPrebuildCurrent())
+    {
+        wchar_t self[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, self, MAX_PATH);
+        const unsigned cores = std::thread::hardware_concurrency();
+        std::wstring line = L"\"" + std::wstring(self) + L"\" --build-shaders \"\" \"\" " + std::to_wstring(cores > 3 ? cores / 2 : 1);
+        STARTUPINFOW si = { sizeof si };
+        PROCESS_INFORMATION pi = {};
+        if (CreateProcessW(self, line.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, nullptr, nullptr, &si, &pi))
+        {
+            std::fprintf(stderr, "[shaders] the shader prebuild is not current - building in the background (process %lu)\n", pi.dwProcessId);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+    }
 
     // Timer resolution. Since Windows 10 2004 a process that never calls timeBeginPeriod
     // gets the default ~15.6 ms timer even if other processes asked for more, so every
@@ -492,6 +594,15 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "[fatal] module base %p, RVA %llX\n", GetModuleHandleW(nullptr),
                      (unsigned long long)(reinterpret_cast<uint64_t>(r->ExceptionAddress) -
                                           reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr))));
+        HMODULE mod = nullptr;
+        wchar_t modName[MAX_PATH] = L"?";
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               static_cast<LPCWSTR>(r->ExceptionAddress), &mod) && mod)
+            GetModuleFileNameW(mod, modName, MAX_PATH);
+        std::fprintf(stderr, "[fatal] in %ls +%llX; access %s %p\n", modName,
+                     (unsigned long long)(reinterpret_cast<uint64_t>(r->ExceptionAddress) - reinterpret_cast<uint64_t>(mod)),
+                     r->NumberParameters >= 2 ? (r->ExceptionInformation[0] == 1 ? "write" : r->ExceptionInformation[0] == 8 ? "execute" : "read") : "?",
+                     r->NumberParameters >= 2 ? reinterpret_cast<void*>(r->ExceptionInformation[1]) : nullptr);
         std::fflush(stderr);
         LogDrain();
         return EXCEPTION_EXECUTE_HANDLER;
@@ -575,6 +686,13 @@ int main(int argc, char** argv)
     ctx.r13.u64 = threadGuest;                  // thread pointer -> PCR
     ctx.r3.u64  = 0;                            // entry argument (params.value)
     ctx.fpscr.loadFromHost();
+
+    // The packet transport starts in the background now (Steam: a helper process, seconds to start):
+    // a profile's sign-in asks for this PC's peer id (xlive.cpp LocalPeerId), which starts it if it
+    // has not started yet, on the game's main thread. MEASURED: picking a profile froze the menus for
+    // ~5 s (one 7.8 s stats window at 20 fps, no shader builds) while the helper started Steam.
+    extern bool XSocketStartTransport();
+    std::thread([] { XSocketStartTransport(); }).detach();
 
     std::fprintf(stderr, "[runtime] entering _xstart (base=%p, r13=0x%X, r1=0x%X)\n",
                  static_cast<void*>(base), (unsigned)ctx.r13.u32, (unsigned)ctx.r1.u32);

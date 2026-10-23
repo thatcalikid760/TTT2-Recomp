@@ -104,6 +104,9 @@ std::atomic<uint32_t> g_threadIdCounter{2};   // main thread is 1
 
 void put32be(uint8_t* p, uint32_t v) { *reinterpret_cast<uint32_t*>(p) = __builtin_bswap32(v); }
 
+std::mutex g_blocksMutex;
+std::vector<std::pair<uint32_t, uint32_t>> g_blocks;   // guest base, size of every thread block
+
 // Set up a fresh guest thread block, returning its guest base and stack-top.
 uint32_t SetupThreadBlock(uint32_t threadId, uint32_t& stackTopOut)
 {
@@ -111,6 +114,10 @@ uint32_t SetupThreadBlock(uint32_t threadId, uint32_t& stackTopOut)
     uint8_t* thr = static_cast<uint8_t*>(host);
     std::memset(thr, 0, TOTAL);
     uint32_t g = GuestAddr(g_base, host);
+    {
+        std::lock_guard l(g_blocksMutex);
+        g_blocks.push_back({ g, TOTAL });
+    }
     put32be(thr + 0x00,  g + PCR_SIZE);
     put32be(thr + 0x100, g + PCR_SIZE + TLS_SIZE);
     put32be(thr + PCR_SIZE + 0x10, 0xFFFFFFFF);
@@ -119,6 +126,14 @@ uint32_t SetupThreadBlock(uint32_t threadId, uint32_t& stackTopOut)
     return g;
 }
 } // namespace
+
+// The guest thread blocks (PCR / TLS / TEB / stack) of every host thread that ran guest code; the
+// main thread's block at 0x40000000 is not in the list. rollback.cpp keeps them out of its state.
+void GuestThreadBlocks(std::vector<std::pair<uint32_t, uint32_t>>& out)
+{
+    std::lock_guard l(g_blocksMutex);
+    out = g_blocks;
+}
 
 // Launch a guest routine on the current host thread. The guest thread block (PCR/TLS/stack)
 // is created once per host thread and reused, so periodic callbacks (vblank) don't leak.
@@ -144,8 +159,10 @@ void GuestSetCurrentCpu(uint8_t cpu)
 }
 
 static void GuestInvoke(PPCFunc* fn, PPCContext& ctx);
+void RollbackNoteForeignThread();   // rollback.cpp: callbacks run on their own timeline
 
-void GuestCall2(uint32_t guestAddr, uint32_t arg0, uint32_t arg1)
+// Run a guest routine on the current host thread (a guest thread's start routine, or a callback).
+static void GuestRun2(uint32_t guestAddr, uint32_t arg0, uint32_t arg1)
 {
     EnsureThreadBlock();
     PPCContext ctx{};
@@ -158,6 +175,13 @@ void GuestCall2(uint32_t guestAddr, uint32_t arg0, uint32_t arg1)
     PPCFunc* fn = PPC_LOOKUP_FUNC(g_base, guestAddr);
     ScopedGuestContext published(&ctx, guestAddr);
     if (fn) GuestInvoke(fn, ctx);
+}
+
+// A callback from one of the runtime's own threads (DPC, interrupt, audio): not the frame's timeline.
+void GuestCall2(uint32_t guestAddr, uint32_t arg0, uint32_t arg1)
+{
+    RollbackNoteForeignThread();
+    GuestRun2(guestAddr, arg0, arg1);
 }
 
 // SEH-guarded invoke: a fault in a guest callback must be REPORTED, not silently kill
@@ -173,6 +197,7 @@ static void GuestInvoke(PPCFunc* fn, PPCContext& ctx)
 
 void GuestCall4(uint32_t guestAddr, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3)
 {
+    RollbackNoteForeignThread();
     EnsureThreadBlock();
     PPCContext ctx{};
     ctx.r1.u64 = t_stackTop;
@@ -293,7 +318,7 @@ PPC_FUNC(__imp__ExCreateThread)
     bool suspended = (creationFlags & 1) != 0;
     KernelStartHostThread(obj, [startAddress, startContext]() {
         KernelRegisterGuestThread(startAddress, startContext);
-        GuestCall(startAddress, startContext);
+        GuestRun2(startAddress, startContext, 0);
     }, suspended);
 
     GWrite32(base, handlePtr, KernelObjectHandle(obj));

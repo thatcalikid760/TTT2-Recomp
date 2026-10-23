@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
 #include <unordered_map>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -32,9 +33,55 @@ struct CsEntry
     std::recursive_mutex m;
     std::atomic<uint32_t> ownerLr{ 0 };          // last acquirer, for the slow-acquire log
     std::atomic<unsigned long> ownerTid{ 0 };
+    uint32_t ga = 0;                             // the guest section
+    std::atomic<unsigned long> holder{ 0 };      // the thread holding it now (0: free)
+    int depth = 0;                               // the holder's recursion (the holder's own)
 };
 static std::shared_mutex g_csMapLock;
 static std::unordered_map<uint32_t, std::unique_ptr<CsEntry>> g_csMap;
+// Threads blocked in RtlEnterCriticalSection right now (host thread id -> the section), written on the
+// slow path only: rollback's job wait (CsThreadBlockedBy) must not wait for a thread it blocks itself.
+static std::mutex g_csWaitLock;
+struct CsWait { CsEntry* e; std::chrono::steady_clock::time_point since; bool dumped; };
+static std::unordered_map<unsigned long, CsWait> g_csWaiting;
+
+// TTT2_CS_STACKS=1 (diagnostics): a thread that waits over 2 s for a guest critical section gets every thread's
+// stack dumped (main.cpp DumpAllStacks; resolve with the linker map), with who waits and who holds it - what the
+// holder does then is why the game stalls (GitHub #42: character select frozen 17-72 s on a loader section).
+void DumpAllStacks(const char* why);
+static void CsWatchdog()
+{
+    // TTT2_CS_STACKS=1: after 2 s; =<ms>: after that long
+    static const long long threshold = [] { const long long v = std::atoll(std::getenv("TTT2_CS_STACKS")); return v > 1 ? v : 2000; }();
+    int dumps = 0;
+    for (;;)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        unsigned long waiter = 0, holder = 0;
+        uint32_t section = 0, holderLr = 0;
+        long long ms = 0;
+        {
+            std::lock_guard l(g_csWaitLock);
+            const auto now = std::chrono::steady_clock::now();
+            for (auto& [tid, w] : g_csWaiting)
+            {
+                ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - w.since).count();
+                if (w.dumped || ms < threshold) continue;
+                w.dumped = true;
+                waiter = tid;
+                holder = w.e->holder.load(std::memory_order_relaxed);
+                section = w.e->ga;
+                holderLr = w.e->ownerLr.load(std::memory_order_relaxed);
+                break;
+            }
+        }
+        if (!waiter || dumps >= 4) continue;
+        ++dumps;
+        std::fprintf(stderr, "[cs] thread %lu has waited %lld ms for section %08X, held by thread %lu (entered at %08X) - stacks:\n",
+                     waiter, ms, section, holder, holderLr);
+        DumpAllStacks("a long section wait");
+    }
+}
 
 static CsEntry& CsFor(uint32_t ga)
 {
@@ -52,7 +99,7 @@ static CsEntry& CsFor(uint32_t ga)
     {
         std::unique_lock wl(g_csMapLock);
         auto& slot = g_csMap[ga];
-        if (!slot) slot = std::make_unique<CsEntry>();
+        if (!slot) { slot = std::make_unique<CsEntry>(); slot->ga = ga; }
         e = slot.get();
     }
     c = { ga, e };
@@ -79,7 +126,22 @@ PPC_FUNC(__imp__RtlEnterCriticalSection)
     if (!cs.m.try_lock())
     {
         auto t0 = std::chrono::steady_clock::now();
+        const unsigned long self = GetCurrentThreadId();
+        {
+            std::lock_guard l(g_csWaitLock);
+            g_csWaiting[self] = CsWait{ &cs, t0, false };
+        }
+        static const bool watch = [] {
+            const char* e = std::getenv("TTT2_CS_STACKS");
+            if (e && *e && *e != '0') std::thread(CsWatchdog).detach();
+            return true;
+        }();
+        (void)watch;
         cs.m.lock();
+        {
+            std::lock_guard l(g_csWaitLock);
+            g_csWaiting.erase(self);
+        }
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::steady_clock::now() - t0).count();
         if (ms > 50)
@@ -94,11 +156,66 @@ PPC_FUNC(__imp__RtlEnterCriticalSection)
     }
     cs.ownerLr.store((uint32_t)ctx.lr, std::memory_order_relaxed);
     cs.ownerTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    cs.holder.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    ++cs.depth;
+}
+// Is host thread `tid` blocked on a critical section that host thread `owner` holds?
+bool CsThreadBlockedBy(unsigned long tid, unsigned long owner, uint32_t* section, uint32_t* ownerLr)
+{
+    std::lock_guard l(g_csWaitLock);
+    const auto it = g_csWaiting.find(tid);
+    if (it == g_csWaiting.end() || it->second.e->holder.load(std::memory_order_relaxed) != owner) return false;
+    if (section) *section = it->second.e->ga;
+    if (ownerLr) *ownerLr = it->second.e->ownerLr.load(std::memory_order_relaxed);
+    return true;
+}
+// Rollback's job wait (rollback.cpp QuiesceJobs) lends a section the calling thread holds to a job
+// thread blocked on it - the game's own job wait (sub_824F6C28) does the same: the main thread holds
+// the job group's section [job+148]+8 all frame and leaves it only while it waits for a job. CsLend
+// leaves it as often as the caller entered it (returns that count, 0: not the caller's); CsReclaim
+// enters it again that often.
+int CsLend(uint32_t ga, uint32_t& lr)
+{
+    CsEntry& cs = CsFor(ga);
+    if (cs.holder.load(std::memory_order_relaxed) != GetCurrentThreadId()) return 0;
+    const int depth = cs.depth;
+    lr = cs.ownerLr.load(std::memory_order_relaxed);
+    cs.depth = 0;
+    cs.holder.store(0, std::memory_order_relaxed);
+    for (int i = 0; i < depth; ++i) cs.m.unlock();
+    return depth;
+}
+void CsReclaim(uint32_t ga, int depth, uint32_t lr)
+{
+    CsEntry& cs = CsFor(ga);
+    const auto t0 = std::chrono::steady_clock::now();
+    bool slow = false;
+    while (!cs.m.try_lock())
+    {
+        if (!slow && std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(100))
+        {
+            slow = true;
+            std::fprintf(stderr, "[cs] section %08X lent by rollback's job wait: still held by thread %lu after 100 ms\n", ga,
+                         cs.holder.load(std::memory_order_relaxed));
+        }
+        SwitchToThread();
+    }
+    for (int i = 1; i < depth; ++i) cs.m.lock();
+    cs.depth = depth;
+    cs.holder.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    cs.ownerTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    cs.ownerLr.store(lr, std::memory_order_relaxed);
 }
 PPC_FUNC(__imp__RtlLeaveCriticalSection)
 {
     KTrace("RtlLeaveCriticalSection");
-    CsFor(ctx.r3.u32).m.unlock();
+    CsEntry& cs = CsFor(ctx.r3.u32);
+    if (--cs.depth <= 0)
+    {
+        cs.depth = 0;
+        cs.holder.store(0, std::memory_order_relaxed);
+    }
+    cs.m.unlock();
 }
 PPC_FUNC(__imp__RtlTryEnterCriticalSection)
 {
@@ -109,6 +226,8 @@ PPC_FUNC(__imp__RtlTryEnterCriticalSection)
     {
         cs.ownerLr.store((uint32_t)ctx.lr, std::memory_order_relaxed);
         cs.ownerTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        cs.holder.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        ++cs.depth;
     }
     ctx.r3.u32 = got ? 1 : 0;
 }

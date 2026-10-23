@@ -1,0 +1,16 @@
+#!/bin/sh
+# ttt2admin <command...>: an admin command in the running ttt2-server service (server/README.md "Admin commands"),
+# run as the server's user ttt2 with its configuration - from any account that may sudo, from ttt2 itself, or root.
+# Install: sudo install -m 755 ttt2admin /usr/local/bin/ttt2admin
+# e.g. ttt2admin players / ttt2admin players all jin / ttt2admin ban <steam id> 7 cheating / ttt2admin panel-setup
+# (ttt2admin alone: help). A server in another folder: change DIR below.
+DIR=/opt/ttt2-server
+SERVER="$DIR/ttt2-server"
+CONFIG="$DIR/server.toml"
+if [ "$(id -un)" = ttt2 ]; then
+  exec "$SERVER" -config "$CONFIG" admin "$@"
+fi
+if [ "$(id -u)" = 0 ] && ! command -v sudo >/dev/null 2>&1; then
+  exec runuser -u ttt2 -- "$SERVER" -config "$CONFIG" admin "$@"
+fi
+exec sudo -u ttt2 "$SERVER" -config "$CONFIG" admin "$@"

@@ -174,6 +174,20 @@ endif()
 option(TTT2_BUNDLE_DISCORD "Bundle discord_partner_sdk.dll in the installer" ON)
 # Emit a linker map so faulting PC RVAs can be resolved to guest functions during bring-up.
 target_link_options(tekken_recomp PRIVATE "/MAP:tekken_recomp.map")
+# Community servers (kernel/community_*.cpp): TLS through SChannel, the server key's hash through CNG.
+target_link_libraries(tekken_recomp PRIVATE secur32 crypt32)
+
+# community_net_test: the community-server client (TLS + pinning, sessions, invites, GIN, the server list) against a
+# running ttt2-server - port/tools/community_net_test.cpp. Built with warnings on; no game code.
+add_executable(community_net_test
+    "${CMAKE_SOURCE_DIR}/tools/community_net_test.cpp"
+    "${CMAKE_SOURCE_DIR}/src/runtime/kernel/community_net.cpp"
+    "${CMAKE_SOURCE_DIR}/src/runtime/kernel/server_list.cpp"
+    "${CMAKE_SOURCE_DIR}/src/runtime/kernel/community_tls.cpp")
+target_include_directories(community_net_test PRIVATE "${CMAKE_SOURCE_DIR}/src/runtime/kernel")
+target_compile_options(community_net_test PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-O2;-W4>")
+target_link_libraries(community_net_test PRIVATE ws2_32 secur32 crypt32 bcrypt)
+target_compile_definitions(community_net_test PRIVATE _CRT_SECURE_NO_WARNINGS)
 
 # --- Version, icon -------------------------------------------------------------------------
 # One version for the game executable's VERSIONINFO, the installer and Add or remove programs.

@@ -6,7 +6,8 @@
 //  - streams (TCP): SYN / SYN-ACK / DATA / FIN / RST on the reliable channel, a connection is
 //    (peer, connection id, direction);
 //  - select / FIONBIO / FIONREAD / options as the game's code uses them (NACE: TCP 21000,
-//    VDP 20000+n, UDP 10000 / 1000; scratch ttt2_online_recon.md section 2).
+//    VDP 20000+n, UDP 10000 / 1000; scratch ttt2_online_recon.md section 2);
+//  - service peers (xsocket_service.h): streams to an in-process handler instead of the transport.
 // Guest structs are big-endian: XSOCKADDR_IN {u16 family, u16 port, u32 addr, 8 zero},
 // fd_set {u32 count, u32 handles[64]}, timeval {s32 sec, s32 usec}.
 // TTT2_NET_TRACE=1 logs every socket call and packet.
@@ -16,7 +17,10 @@
 #include "kernel_trace.h"
 #include "net_transport.h"
 #include "xlive.h"
+#include "xsocket_service.h"
+#include "title_server.h"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -25,9 +29,14 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <string>
+#include <thread>
 #include <vector>
 
+void RollbackTimeSyncReceive(const uint8_t* data, size_t size);   // rollback_session.cpp
+
 namespace {
+std::atomic<uint64_t> g_timeSyncPeer{ 0 };
 
 constexpr uint32_t WSAEWOULDBLOCK_ = 10035, WSAENOTSOCK_ = 10038, WSAEINVAL_ = 10022, WSAEFAULT_ = 10014;
 constexpr uint32_t WSAEADDRINUSE_ = 10048, WSAEISCONN_ = 10056, WSAENOTCONN_ = 10057, WSAECONNREFUSED_ = 10061;
@@ -65,7 +74,9 @@ thread_local uint32_t t_error = 0;
 bool Trace() { static const bool on = std::getenv("TTT2_NET_TRACE") != nullptr; return on; }
 
 // ---- wire format ----
-enum class Op : uint8_t { Datagram = 1, Syn = 2, SynAck = 3, Reset = 4, Data = 5, Fin = 6 };
+// TimeSync: rollback sessions' frame-advantage reports (rollback_session.cpp), never a socket's.
+// FileAsk / FileData: a player's license asked of the games connected to this one (title_server.cpp), never a socket's.
+enum class Op : uint8_t { Datagram = 1, Syn = 2, SynAck = 3, Reset = 4, Data = 5, Fin = 6, TimeSync = 7, FileAsk = 8, FileData = 9 };
 #pragma pack(push, 1)
 struct Header { Op op; uint8_t proto; uint8_t toConnector; uint8_t pad; uint16_t srcPort, dstPort; uint32_t connId; };
 #pragma pack(pop)
@@ -137,21 +148,95 @@ bool Readable(const Socket& s)
     if (s.state == TcpState::Listening) return !s.accepted.empty();
     return !s.stream.empty() || s.state == TcpState::PeerClosed || s.state == TcpState::Refused;
 }
+bool IsServicePeer(uint64_t peer);
 bool Writable(const Socket& s)
 {
     if (s.kind == Kind::Datagram) return true;
-    return s.state == TcpState::Connected;
+    // A service's stream it closed stays writable, as TCP after the peer's FIN (a send then fails): the GIN
+    // client polls for writable before reading a response that ends with the server's close.
+    return s.state == TcpState::Connected || (s.state == TcpState::PeerClosed && IsServicePeer(s.peer));
 }
 bool Excepted(const Socket& s) { return s.kind == Kind::Stream && s.state == TcpState::Refused; }
+
+// ---- players' files from their games (title_server.cpp: another player's license when no server keeps it) ----
+// FileAsk {u64 owner XUID, u8 length, item}; FileData {u64 owner, u8 length, item, u8 found, the file}. Every game
+// heard from in the last 5 minutes (a ranked match's opponent, still on the results screen) is asked; each answers (found or not), so the asker stops at the first copy or when
+// all said no.
+struct FileWait { uint64_t owner; std::string item; int unanswered; bool found = false; std::vector<uint8_t> data; };
+std::mutex g_fileMutex;
+std::condition_variable g_fileCv;
+std::vector<FileWait*> g_fileWaits;                         // under g_fileMutex
+std::map<uint64_t, std::chrono::steady_clock::time_point> g_heardFrom;   // peers by their last packet, under g_fileMutex
+
+std::vector<uint8_t> FilePayload(uint64_t owner, const std::string& item)
+{
+    std::vector<uint8_t> p(8);
+    std::memcpy(p.data(), &owner, 8);
+    p.push_back(uint8_t(item.size()));
+    p.insert(p.end(), item.begin(), item.end());
+    return p;
+}
+
+void FileReceive(uint64_t from, Op op, const uint8_t* p, size_t n)
+{
+    if (n < 9 || n < 9 + size_t(p[8])) return;
+    uint64_t owner;
+    std::memcpy(&owner, p, 8);
+    const std::string item(reinterpret_cast<const char*>(p + 9), p[8]);
+    p += 9 + item.size();
+    n -= 9 + item.size();
+    if (op == Op::FileAsk)
+    {
+        std::thread([from, owner, item] {
+            std::vector<uint8_t> data;
+            const bool found = TitleServerOwnItem(owner, item, data);
+            std::vector<uint8_t> reply = FilePayload(owner, item);
+            reply.push_back(found ? 1 : 0);
+            if (found) reply.insert(reply.end(), data.begin(), data.end());
+            SendPacket(from, net::Channel::Reliable, Op::FileData, 0, false, 0, 0, 0, reply.data(), reply.size());
+            if (found)
+                std::fprintf(stderr, "[xsocket] %016llX asked for %s: given (%zu bytes)\n", (unsigned long long)from, item.c_str(),
+                             data.size());
+        }).detach();
+        return;
+    }
+    if (n < 1) return;
+    const bool found = p[0] == 1 && n > 1 && n - 1 <= (16u << 10);
+    std::lock_guard l(g_fileMutex);
+    for (FileWait* w : g_fileWaits)
+        if (w->owner == owner && w->item == item && !w->found)
+        {
+            if (found) { w->found = true; w->data.assign(p + 1, p + n); }
+            --w->unanswered;
+        }
+    g_fileCv.notify_all();
+}
 
 // ---- incoming packets (transport thread) ----
 void Receive(uint64_t from, net::Channel, const uint8_t* data, size_t size)
 {
     if (size < sizeof(Header)) return;
+    {
+        std::lock_guard l(g_fileMutex);
+        if (g_heardFrom.size() > 64) g_heardFrom.clear();
+        g_heardFrom[from] = std::chrono::steady_clock::now();
+    }
     Header h;
     std::memcpy(&h, data, sizeof(h));
     const uint8_t* payload = data + sizeof(h);
     const size_t payloadSize = size - sizeof(h);
+    if (h.op == Op::TimeSync)
+    {
+        g_timeSyncPeer.store(from);
+        RollbackTimeSyncReceive(payload, payloadSize);
+        return;
+    }
+    if (h.op == Op::FileAsk || h.op == Op::FileData)
+    {
+        FileReceive(from, h.op, payload, payloadSize);
+        return;
+    }
+    if (h.op == Op::Datagram) g_timeSyncPeer.store(from);   // the match's peer (NACE's datagrams)
     std::lock_guard l(g_m);
     const uint32_t fromAddr = xlive::AddrOfPeer(from);
     if (Trace())
@@ -220,6 +305,92 @@ void Receive(uint64_t from, net::Channel, const uint8_t* data, size_t size)
 
 bool EnsureTransport() { return net::Start(Receive); }
 
+std::mutex g_serviceMutex;
+std::map<uint64_t, xsvc::Handler*> g_services;
+bool IsServicePeer(uint64_t peer) { return xsvc::Find(peer) != nullptr; }
+} // namespace
+
+namespace xsvc {
+void Register(uint64_t peer, Handler* handler)
+{
+    std::lock_guard l(g_serviceMutex);
+    g_services[peer] = handler;
+}
+Handler* Find(uint64_t peer)
+{
+    if ((peer & 0xFFFFFF0000000000ull) != kServicePeer) return nullptr;
+    std::lock_guard l(g_serviceMutex);
+    const auto it = g_services.find(peer);
+    return it == g_services.end() ? nullptr : it->second;
+}
+void Reply(uint64_t peer, uint32_t conn, const uint8_t* data, size_t size)
+{
+    std::lock_guard l(g_m);
+    for (auto& [handle, s] : g_sockets)
+        if (s.kind == Kind::Stream && s.peer == peer && s.connId == conn && s.connector && s.state == TcpState::Connected)
+        {
+            s.stream.insert(s.stream.end(), data, data + size);
+            break;
+        }
+    g_cv.notify_all();
+}
+void Finish(uint64_t peer, uint32_t conn)
+{
+    std::lock_guard l(g_m);
+    for (auto& [handle, s] : g_sockets)
+        if (s.kind == Kind::Stream && s.peer == peer && s.connId == conn && s.connector && s.state == TcpState::Connected)
+        {
+            s.state = TcpState::PeerClosed;
+            break;
+        }
+    g_cv.notify_all();
+}
+} // namespace xsvc
+
+uint64_t XSocketMatchPeer() { return g_timeSyncPeer.load(); }
+void XSocketForgetMatchPeer() { g_timeSyncPeer.store(0); }
+
+// rollback_session.cpp: a frame-advantage report to the match's peer (the last one whose datagrams
+// arrived - a 1v1 match has one).
+int XSocketAskPeersForFile(uint64_t owner, const std::string& item, std::vector<uint8_t>& data, int timeoutMs)
+{
+    if (!owner || item.empty() || item.size() > 32) return 0;
+    std::vector<uint64_t> peers;
+    {
+        std::lock_guard l(g_fileMutex);
+        const auto now = std::chrono::steady_clock::now();
+        for (const auto& [peer, at] : g_heardFrom)
+            if (now - at < std::chrono::minutes(5) && peer != net::LocalPeer() && !IsServicePeer(peer)) peers.push_back(peer);
+    }
+    if (peers.empty()) return 0;
+    FileWait wait{ owner, item, int(peers.size()) };
+    {
+        std::lock_guard l(g_fileMutex);
+        g_fileWaits.push_back(&wait);
+    }
+    const std::vector<uint8_t> ask = FilePayload(owner, item);
+    for (const uint64_t peer : peers)
+        if (!SendPacket(peer, net::Channel::Reliable, Op::FileAsk, 0, false, 0, 0, 0, ask.data(), ask.size()))
+        {
+            std::lock_guard l(g_fileMutex);
+            --wait.unanswered;
+        }
+    std::unique_lock l(g_fileMutex);
+    g_fileCv.wait_for(l, std::chrono::milliseconds(timeoutMs), [&] { return wait.found || wait.unanswered <= 0; });
+    g_fileWaits.erase(std::find(g_fileWaits.begin(), g_fileWaits.end(), &wait));
+    if (!wait.found) return 0;
+    data = std::move(wait.data);
+    return 1;
+}
+
+bool RollbackTimeSyncSend(const void* data, size_t size)
+{
+    const uint64_t peer = g_timeSyncPeer.load();
+    return peer && SendPacket(peer, net::Channel::Unreliable, Op::TimeSync, 0, false, 0, 0, 0, static_cast<const uint8_t*>(data), size);
+}
+
+namespace {
+
 // Wait (blocking sockets) until `ready` or the timeout; g_m held through `lock`.
 template <typename F> bool WaitFor(std::unique_lock<std::mutex>& lock, F ready, int timeoutMs = 30000)
 {
@@ -259,7 +430,9 @@ PPC_FUNC(__imp__NetDll_closesocket)
     std::lock_guard l(g_m);
     Socket* s = Find(ctx.r4.u32);
     if (!s) { ctx.r3.u64 = uint32_t(Fail(WSAENOTSOCK_)); return; }
-    if (s->kind == Kind::Stream && s->state == TcpState::Connected && !s->sendShut)
+    if (s->kind == Kind::Stream && (s->state == TcpState::Connected || s->state == TcpState::PeerClosed) && !s->sendShut)
+        if (xsvc::Handler* service = xsvc::Find(s->peer)) service->Close(s->connId);
+    if (s->kind == Kind::Stream && s->state == TcpState::Connected && !s->sendShut && !xsvc::Find(s->peer))
         SendPacket(s->peer, net::Channel::Reliable, Op::Fin, 6, !s->connector, s->port, s->peerPort, s->connId, nullptr, 0);
     for (const uint32_t pending : s->accepted) g_sockets.erase(pending);
     g_sockets.erase(ctx.r4.u32);
@@ -276,7 +449,8 @@ PPC_FUNC(__imp__NetDll_shutdown)
     const uint32_t how = ctx.r5.u32;
     if (s->kind == Kind::Stream && s->state == TcpState::Connected && how >= 1 && !s->sendShut)
     {
-        SendPacket(s->peer, net::Channel::Reliable, Op::Fin, 6, !s->connector, s->port, s->peerPort, s->connId, nullptr, 0);
+        if (xsvc::Handler* service = xsvc::Find(s->peer)) service->Close(s->connId);
+        else SendPacket(s->peer, net::Channel::Reliable, Op::Fin, 6, !s->connector, s->port, s->peerPort, s->connId, nullptr, 0);
         s->sendShut = true;
     }
     ctx.r3.u64 = 0;
@@ -363,6 +537,14 @@ PPC_FUNC(__imp__NetDll_connect)
     s->peerPort = port;
     xlive::Random(&s->connId, sizeof(s->connId));
     s->connector = true;
+    if (xsvc::Handler* service = xsvc::Find(peer))
+    {
+        s->state = TcpState::Connected;
+        service->Open(s->connId, port);
+        if (Trace()) std::fprintf(stderr, "[xsocket] connect %08X -> service %016llX:%u\n", handle, (unsigned long long)peer, port);
+        ctx.r3.u64 = 0;
+        return;
+    }
     s->state = TcpState::Connecting;
     SendPacket(peer, net::Channel::Reliable, Op::Syn, 6, false, s->port, port, s->connId, nullptr, 0);
     if (Trace()) std::fprintf(stderr, "[xsocket] connect %08X -> peer %016llX:%u\n", handle, (unsigned long long)peer, port);
@@ -386,6 +568,11 @@ static int SendCommon(uint8_t* base, uint32_t handle, uint32_t buffer, uint32_t 
     {
         if (s->state != TcpState::Connected || s->sendShut) return Fail(WSAENOTCONN_);
         TraceBytes("send", handle, xlive::AddrOfPeer(s->peer), s->peerPort, base + buffer, int(length));
+        if (xsvc::Handler* service = xsvc::Find(s->peer))
+        {
+            service->Data(s->connId, base + buffer, length);
+            return int(length);
+        }
         for (uint32_t done = 0; done < length;)
         {
             const uint32_t chunk = (std::min)(length - done, 16384u);
@@ -404,7 +591,7 @@ static int SendCommon(uint8_t* base, uint32_t handle, uint32_t buffer, uint32_t 
         if (addr == 0xFFFFFFFFu) return int(length);       // LAN broadcast: no LAN here
         peer = xlive::PeerOfAddr(addr);
     }
-    if (!peer)
+    if (!peer || xsvc::Find(peer))
     {
         TraceBytes("sendto(unknown address, dropped)", handle, 0, port, base + buffer, int(length));
         return int(length);                                 // unknown address: lost, as with UDP
@@ -420,10 +607,14 @@ PPC_FUNC(__imp__NetDll_send)
     KTrace("NetDll_send");
     ctx.r3.u64 = uint32_t(SendCommon(base, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, 0));
 }
+bool RollbackSuppressSend();   // rollback.cpp: an online task's send in a re-simulated frame
 PPC_FUNC(__imp__NetDll_sendto)
 {
     KTrace("NetDll_sendto");
     // r4 socket, r5 buffer, r6 length, r7 flags, r8 to, r9 tolen
+    // A rollback re-simulation runs the game's online tasks again: what they send went out when the
+    // frame first ran - reported as sent, not sent twice.
+    if (RollbackSuppressSend()) { ctx.r3.u64 = ctx.r6.u32; return; }
     ctx.r3.u64 = uint32_t(SendCommon(base, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r8.u32));
 }
 

@@ -9,6 +9,14 @@
 #include "profiles.h"
 #include "xlive.h"
 #include "matchmaking.h"
+#include "display_settings.h"
+#include "live_stats.h"
+#include "community_net.h"
+#include "net_transport.h"
+#include <chrono>
+#include <memory>
+#include <random>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +26,8 @@
 #include <set>
 #include <string>
 #include <vector>
+
+bool SessionEnabled();   // rollback_session.cpp: rollback sessions (TTT2_ROLLBACK)
 
 namespace {
 
@@ -96,6 +106,9 @@ void Publish(const Session& s)
     std::memcpy(r.info, s.info.data(), sizeof(r.info));
     for (const auto& [id, value] : g_contexts) r.contexts.push_back({ id, value });
     for (const auto& [id, value] : g_properties) r.properties.push_back({ id, value });
+    if (SessionEnabled())
+        r.netcode = mm::kNetcodeKnown | uint32_t(display_settings::GetNetcode()) | uint32_t(display_settings::GetCustomDelay()) << 8 |
+                    uint32_t(display_settings::GetCustomRollback()) << 16;
     mm::Publish(r);
 }
 
@@ -149,16 +162,18 @@ uint32_t JoinLeave(uint8_t* base, uint32_t b, bool join)
         else
         {
             m.userIndex = users ? GRead32(base, users + i * 4) : 0;
-            m.xuid = xlive::OnlineXuid();
+            m.xuid = xlive::OnlineXuid(m.userIndex < 4 ? m.userIndex : 0);   // a pair's second player: a guest
         }
         m.isPrivate = privates && GRead32(base, privates + i * 4);
         auto it = std::find_if(s->members.begin(), s->members.end(), [&](const Member& x) { return x.xuid == m.xuid; });
         if (join && it == s->members.end()) s->members.push_back(m);
         if (!join && it != s->members.end()) s->members.erase(it);
     }
-    Log(join ? (xuids ? "joinremote" : "joinlocal") : (xuids ? "leaveremote" : "leavelocal"), "XSession%s%s(%u, first %016llX)",
-        join ? "Join" : "Leave", xuids ? "Remote" : "Local", count,
-        (unsigned long long)(xuids && count ? Read64(base, xuids) : xlive::OnlineXuid()));
+    const uint32_t firstUser = !xuids && users && count ? GRead32(base, users) : 0;
+    Log(std::string(join ? (xuids ? "joinremote" : "joinlocal") : (xuids ? "leaveremote" : "leavelocal")) + std::to_string(firstUser),
+        "XSession%s%s(%u, first %016llX%s)", join ? "Join" : "Leave", xuids ? "Remote" : "Local", count,
+        (unsigned long long)(xuids && count ? Read64(base, xuids) : xlive::OnlineXuid(firstUser < 4 ? firstUser : 0)),
+        xuids ? "" : firstUser ? ", a guest" : "");
     Publish(*s);
     return S_OK_;
 }
@@ -242,10 +257,20 @@ uint32_t WriteResults(uint8_t* base, const std::vector<mm::SessionRecord>& found
     return S_OK_;
 }
 
+// A search running on xlive.cpp's worker thread (the game asked asynchronously): it may wait.
+thread_local bool t_asyncSearch = false;
+} // namespace
+void XSessionSearchIsAsync(bool on) { t_asyncSearch = on; }
+namespace {
+
 // 0xB0016 / 0xB001C XSessionSearch(Ex) {proc, user, numResults, u16 numProps, u16 numContexts,
 // props, contexts, cbResults, pResults[, numUsers]}: published sessions of other
 // hosts with open public slots whose GAME_TYPE / GAME_MODE match the searcher's contexts (the
 // title's XLAST rules are not evaluated). Buffer sizing as the game computes it: 8 + 1326 each.
+// A ranked search that finds nothing asks once more after a random 1.5-4.5 s (MEASURED 2026-10-23, the user and a
+// friend: after a match both games searched in the same second, found nothing - each one's room was not up yet, or
+// was being removed - and hosted; their rooms then timed out in the same second, and so on, minute after minute).
+// The two searches now return at different moments: the first hosts, the second finds its room.
 uint32_t Search(uint8_t* base, uint32_t b)
 {
     const uint32_t proc = GRead32(base, b), numResults = GRead32(base, b + 8);
@@ -253,6 +278,19 @@ uint32_t Search(uint8_t* base, uint32_t b)
     const uint32_t size = GRead32(base, b + 0x18), results = GRead32(base, b + 0x1C);
     if (!results) return E_INVALIDARG_;
     if (size < 8 + 0x5C * numResults) return X_ONLINE_E_SESSION_INSUFFICIENT_BUFFER;
+    // the query's parameters (XUSER_PROPERTY: id, XUSER_DATA type at +8, a 4-byte value at +0x10), in the log once per
+    // different set: the ranked search's rank range is among them (VS_MATCHING, MATCHING_THIS_RANK min / max)
+    {
+        const uint32_t numProps = GRead16(base, b + 0xC), props = GRead32(base, b + 0x10);
+        std::string text;
+        for (uint32_t i = 0; props && i < numProps && i < 32; ++i)
+        {
+            char one[32];
+            std::snprintf(one, sizeof(one), "%s%08X=%d", i ? " " : "", GRead32(base, props + i * 0x18), int32_t(GRead32(base, props + i * 0x18 + 0x10)));
+            text += one;
+        }
+        Log("searchprops" + text, "XSessionSearch(proc %u) parameters: %s", proc, text.c_str());
+    }
     std::map<uint32_t, uint32_t> wanted;
     for (uint32_t i = 0; contexts && i < numContexts && i < 32; ++i)
     {
@@ -260,18 +298,49 @@ uint32_t Search(uint8_t* base, uint32_t b)
         if (id == 0x800A || id == 0x800B) wanted[id] = value;
     }
     std::vector<mm::SessionRecord> found;
-    for (mm::SessionRecord& r : mm::List(64))
+    const std::vector<std::pair<uint32_t, uint32_t>> filters(wanted.begin(), wanted.end());
+    auto list = [&] {
+        found.clear();
+        for (mm::SessionRecord& r : mm::List(64, filters, true))
+        {
+            if (found.size() >= numResults) break;
+            if (r.maxPublic <= r.filledPublic) continue;
+            bool match = true;
+            for (const auto& [id, value] : wanted)
+                for (const mm::Context& c : r.contexts)
+                    if (c.id == id && c.value != value) match = false;
+            if (match) found.push_back(std::move(r));
+        }
+    };
+    list();
+    const auto gameType = wanted.find(0x800A);              // X_CONTEXT_GAME_TYPE: 0 ranked
+    if (found.empty() && t_asyncSearch && gameType != wanted.end() && gameType->second == 0)
     {
-        if (found.size() >= numResults) break;
-        if (r.maxPublic <= r.filledPublic) continue;
-        bool match = true;
-        for (const auto& [id, value] : wanted)
-            for (const mm::Context& c : r.contexts)
-                if (c.id == id && c.value != value) match = false;
-        if (match) found.push_back(std::move(r));
+        thread_local std::mt19937 rng{ std::random_device{}() };
+        const int waitMs = std::uniform_int_distribution<int>(1500, 4500)(rng);
+        std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
+        list();
+        Log("searchagain", "XSessionSearch: a ranked search that found nothing asked again after %d ms -> %zu sessions", waitMs,
+            found.size());
     }
     Log("search" + std::to_string(proc) + "_" + std::to_string(found.size()), "XSessionSearch(proc %u, %u results, %u contexts) -> %zu sessions",
         proc, numResults, numContexts, found.size());
+    // the hosts found, with the attributes the title's query compares (once per host and attribute set)
+    for (const mm::SessionRecord& r : found)
+    {
+        std::string text;
+        for (const mm::Property& p : r.properties)
+            if (p.value.size() == 4)
+            {
+                char one[32];
+                std::snprintf(one, sizeof(one), " %08X=%d", p.id,
+                              int32_t(uint32_t(p.value[0]) << 24 | uint32_t(p.value[1]) << 16 | uint32_t(p.value[2]) << 8 | p.value[3]));
+                text += one;
+            }
+        char head[64];
+        std::snprintf(head, sizeof(head), "found %016llX of %016llX:", (unsigned long long)r.id, (unsigned long long)r.hostPeer);
+        Log(std::string("searchhost") + head + text, "XSessionSearch %s%s", head, text.c_str());
+    }
     return WriteResults(base, found, results, size);
 }
 
@@ -290,28 +359,6 @@ uint32_t SearchById(uint8_t* base, uint32_t b)
     }
     Log("searchbyid", "XSessionSearchByID(%016llX) -> found", (unsigned long long)id);
     return WriteResults(base, { r }, results, size);
-}
-
-// 0xB0021 XUserReadStats {titleId, nXuids, pXuids, nSpecs, pSpecs, cbResults, pResults}:
-// every view empty. XUSER_STATS_READ_RESULTS {numViews, pViews}, views (0x10) {id, total, rows, pRows}.
-uint32_t ReadStats(uint8_t* base, uint32_t b)
-{
-    const uint32_t nSpecs = GRead32(base, b + 0x0C), specs = GRead32(base, b + 0x10);
-    const uint32_t size = GRead32(base, b + 0x14), results = GRead32(base, b + 0x18);
-    if (!nSpecs || nSpecs > 64 || !specs || !results) return E_INVALIDARG_;
-    if (size < 8 + nSpecs * 0x10) return X_ONLINE_E_SESSION_INSUFFICIENT_BUFFER;
-    GWrite32(base, results, nSpecs);
-    GWrite32(base, results + 4, results + 8);
-    for (uint32_t i = 0; i < nSpecs; ++i)
-    {
-        const uint32_t v = results + 8 + i * 0x10;
-        GWrite32(base, v, GRead32(base, specs + i * 0x88));        // view id from the spec
-        GWrite32(base, v + 4, 0);
-        GWrite32(base, v + 8, 0);
-        GWrite32(base, v + 0xC, 0);
-    }
-    Log("readstats", "XUserReadStats(%u views) -> empty", nSpecs);
-    return S_OK_;
 }
 
 // 0xB001A XSessionArbitrationRegister {obj, flags, nonce, duration, cbResults, pResults}: the
@@ -334,7 +381,12 @@ uint32_t ArbitrationRegister(uint8_t* base, uint32_t b)
     GWrite32(base, reg + 0x10, users);
     Write64(base, users, xlive::OnlineXuid());
     s->state = State::Registration;
-    Log("arbitration", "XSessionArbitrationRegister -> 1 registrant");
+    // On a community server: register for the ranked match (its results count only for registered players).
+    const std::shared_ptr<community::Client> server = net::Community();
+    const uint64_t opponent = XSocketMatchPeer();
+    if (server && server->Connected()) server->RegisterRanked(s->id, xlive::OnlineXuid(), opponent);
+    Log("arbitration", "XSessionArbitrationRegister -> 1 registrant%s (opponent %016llX)", server ? " (registered with the server)" : "",
+        (unsigned long long)opponent);
     return S_OK_;
 }
 
@@ -349,6 +401,66 @@ bool XSessionAnyActive()
     for (const auto& [handle, s] : g_sessions)
         if (s.created && s.state != State::Deleted) return true;
     return false;
+}
+
+// The room session this game is in (hosted or joined), 0 when none: the Friend Invite's lobby (server_ui.cpp).
+uint64_t XSessionCurrentId()
+{
+    std::lock_guard l(g_mutex);
+    uint64_t id = 0;
+    for (const auto& [handle, s] : g_sessions)
+        if (s.created && s.state != State::Deleted && (s.flags & (kMatchmaking | kPeerNetwork)) && s.id) id = s.id;
+    return id;
+}
+
+// A match of the room session starts / ends (rollback.cpp: an online fight's rollback session): the community server
+// keeps the matches played on it (its match history; only a server that asks for them, community_net.h).
+void XSessionReportMatch(bool started)
+{
+    const std::shared_ptr<community::Client> server = net::Community();
+    if (!server || !server->Connected()) return;
+    uint64_t id = 0;
+    uint8_t local = 0;
+    {
+        std::lock_guard l(g_mutex);
+        for (const auto& [handle, s] : g_sessions)
+            if (s.created && s.state != State::Deleted && (s.flags & (kMatchmaking | kPeerNetwork)) && s.id)
+            {
+                id = s.id;
+                local = 0;
+                for (const Member& m : s.members) local += m.userIndex < 4 ? 1 : 0;
+            }
+    }
+    const uint64_t opponent = XSocketMatchPeer();
+    std::vector<uint64_t> peers;
+    if (opponent) peers.push_back(opponent);
+    server->ReportMatch(id, started, (std::max)(local, uint8_t(1)), peers);
+    Log(started ? "matchstart" : "matchend", "match %s in session %016llX (opponent %016llX) reported to the server",
+        started ? "start" : "end", (unsigned long long)id, (unsigned long long)opponent);
+}
+
+// This instance hosts an active session (created with XSESSION_CREATE_HOST) - rollback_session.cpp:
+// the host's ONLINE NETCODE setting decides the shared input delay.
+bool XSessionLocalHosts()
+{
+    std::lock_guard l(g_mutex);
+    for (const auto& [handle, s] : g_sessions)
+        if (s.created && s.state != State::Deleted && (s.flags & kHost)) return true;
+    return false;
+}
+
+// The host's ONLINE NETCODE as its session record carries it (mm::SessionRecord::netcode), for a
+// session this instance joined; 0 when unknown.
+uint32_t XSessionHostNetcode()
+{
+    uint64_t joined = 0;
+    {
+        std::lock_guard l(g_mutex);
+        for (const auto& [handle, s] : g_sessions)
+            if (s.created && s.state != State::Deleted && !(s.flags & kHost) && s.id) joined = s.id;
+    }
+    mm::SessionRecord r;
+    return joined && mm::Find(joined, r) ? r.netcode : 0;
 }
 
 // ---- session handles ------------------------------------------------------------------------------
@@ -410,6 +522,7 @@ uint32_t XgiDispatch(uint8_t* base, uint32_t msg, uint32_t b, uint32_t length, b
         if (!s) return STATUS_INVALID_HANDLE_;
         s->state = State::Deleted;
         mm::Remove(s->id);
+        XSocketForgetMatchPeer();                            // the next match names its own opponent
         Log("delete", "XSessionDelete(%016llX)", (unsigned long long)s->id);
         return S_OK_;
     }
@@ -433,9 +546,19 @@ uint32_t XgiDispatch(uint8_t* base, uint32_t msg, uint32_t b, uint32_t length, b
     case 0x000B001A: return ArbitrationRegister(base, b);
     case 0x000B001B: return SearchById(base, b);
     case 0x000B0020: return S_OK_;                           // XUserResetStatsView
-    case 0x000B0021: return ReadStats(base, b);
-    case 0x000B0025: case 0x000B0026:                        // XSessionWriteStats / FlushStats: kept local
-        Log("writestats", "XSessionWriteStats / Flush (kept local)");
+    case 0x000B0021: return live_stats::ReadPlayers(base, b);  // XUserReadStats (the leaderboards, live_stats.h)
+    case 0x000B0025:                                         // XSessionWriteStats: to the server (live_stats.h)
+    {
+        uint64_t id = 0;
+        {
+            std::lock_guard l(g_mutex);
+            if (const Session* s = Lookup(base, GRead32(base, b))) id = s->id;
+        }
+        live_stats::Write(base, b, length, id);
+        return S_OK_;
+    }
+    case 0x000B0026:                                         // XSessionFlushStats
+        Log("flushstats", "XSessionFlushStats");
         return S_OK_;
     default:
         handled = false;

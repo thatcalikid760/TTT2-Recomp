@@ -2,6 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "matchmaking.h"
+#include "community_net.h"
 #include "net_transport.h"
 #include "steam_net.h"
 #include "discord_presence.h"
@@ -30,6 +31,7 @@ std::deque<SessionRecord> g_queuedInvites;      // QueueInvite (Discord Join)
 bool g_heartbeat = false;
 
 bool Steam() { return std::strcmp(net::BackendName(), "steam") == 0; }
+std::shared_ptr<community::Client> Server() { return net::Community(); }
 
 std::filesystem::path Folder()
 {
@@ -66,6 +68,7 @@ std::vector<uint8_t> Serialize(const SessionRecord& r)
         Put32(v, uint32_t(p.value.size()));
         v.insert(v.end(), p.value.begin(), p.value.end());
     }
+    Put32(v, r.netcode);                       // last: records without it read as 0
     return v;
 }
 
@@ -98,6 +101,8 @@ bool Deserialize(const std::vector<uint8_t>& v, SessionRecord& r)
         p.value.assign(v.begin() + at, v.begin() + at + size);
         at += size;
     }
+    r.netcode = 0;
+    if (at + 4 <= v.size()) get32(r.netcode);
     return true;
 }
 
@@ -146,7 +151,8 @@ void Publish(const SessionRecord& record)
 {
     std::lock_guard l(g_mutex);
     g_owned[record.id] = record;
-    if (Steam()) steamnet::PublishLobby(record.id, Serialize(record));
+    if (const std::shared_ptr<community::Client> server = Server()) server->PublishSession(Serialize(record));
+    else if (Steam()) steamnet::PublishLobby(record.id, Serialize(record));
     else
     {
         Write(record);
@@ -162,14 +168,30 @@ void Remove(uint64_t id)
     discord_presence::EndSession(id);
     std::lock_guard l(g_mutex);
     if (!g_owned.erase(id)) return;
+    if (const std::shared_ptr<community::Client> server = Server()) { server->RemoveSession(id); std::fprintf(stderr, "[mm] removed %016llX\n", (unsigned long long)id); return; }
     if (Steam()) steamnet::RemoveLobby(id);
     std::error_code ec;
     std::filesystem::remove(FileOf(id), ec);
     std::fprintf(stderr, "[mm] removed %016llX\n", (unsigned long long)id);
 }
 
-std::vector<SessionRecord> List(uint32_t max)
+std::vector<SessionRecord> List(uint32_t max, const std::vector<std::pair<uint32_t, uint32_t>>& contexts, bool openOnly)
 {
+    if (const std::shared_ptr<community::Client> server = Server())
+    {
+        std::vector<SessionRecord> out;
+        for (const std::vector<uint8_t>& bytes : server->ListSessions((std::max)(max, 1u), 5000, contexts, openOnly))
+        {
+            SessionRecord r;
+            if (out.size() >= max || !Deserialize(bytes, r) || r.hostPeer == net::LocalPeer()) continue;
+            {
+                std::lock_guard l(g_mutex);
+                g_seen[r.id] = r;
+            }
+            out.push_back(std::move(r));
+        }
+        return out;
+    }
     if (Steam())
     {
         std::vector<SessionRecord> out;
@@ -210,6 +232,14 @@ bool Find(uint64_t id, SessionRecord& out)
         const auto it = g_seen.find(id);
         if (it != g_seen.end()) { out = it->second; return true; }
     }
+    if (const std::shared_ptr<community::Client> server = Server())
+    {
+        std::vector<uint8_t> bytes;
+        if (!server->GetSession(id, bytes, 2000) || !Deserialize(bytes, out) || out.id != id) return false;
+        std::lock_guard l(g_mutex);
+        g_seen[id] = out;
+        return true;
+    }
     if (Steam()) return false;
     const std::filesystem::path file = FileOf(id);
     return Fresh(file) && Load(file, out);
@@ -234,7 +264,12 @@ bool TakeInvite(SessionRecord& out)
         }
     }
     std::vector<uint8_t> bytes;
-    if (!steamnet::TakeJoinRequest(bytes) || !Deserialize(bytes, out)) return false;
+    if (const std::shared_ptr<community::Client> server = Server())
+    {
+        uint64_t from = 0;
+        if (!server->TakeInvite(bytes, from) || !Deserialize(bytes, out)) return false;
+    }
+    else if (!steamnet::TakeJoinRequest(bytes) || !Deserialize(bytes, out)) return false;
     std::lock_guard l(g_mutex);
     g_seen[out.id] = out;
     return true;

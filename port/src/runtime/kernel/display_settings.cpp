@@ -2,12 +2,21 @@
 //   [Display]
 //   Mode=0|1|2            (windowed, borderless, fullscreen)
 //   Resolution=1920x1080
+//   Sharpness=0..10       (0 = off)
+//   AntiAliasing=0|1      (off, FXAA)
+//   TextureFilter=0..4    (the game's own, anisotropic 2x / 4x / 8x / 16x)
+//   VSync=1|0             (frames at the display's refresh / at once)
+//   Shadows=1|0           (cast shadows drawn / not)
 //   [Game]
 //   InputDelay=0|1        (the game's 2-frame offline input delay: removed / original)
 //   [Graphics]
 //   VSync=0|1  RenderScale=100|125|150|200  Upscaler=0|1  FsrMode=100|77|67|59|50
 //   AntiAliasing=0|1|2 (FXAA=0|1 before it)  Anisotropy=1|2|4|8|16  Sharpen=0..3  MotionBlur=0|1
-//   Brightness=0..10  FpsCounter=0|1
+//   Shadows=0|1  Brightness=0..10  FpsCounter=0|1
+//   [Online]
+//   Netcode=0..3          (STANDARD, PRIORITIZE RESPONSE, PRIORITIZE GRAPHICS, CUSTOM)
+//   CustomDelay=1..6      (CUSTOM's input delay, frames)
+//   CustomRollback=1..8   (CUSTOM's prediction limit, frames)
 // in %LOCALAPPDATA%\TTT2Recomp\settings.ini, read once at first use.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -30,6 +39,24 @@ bool g_inputDelay = false;
 Graphics g_graphics;
 Voice g_voice;
 std::vector<uint64_t> g_muted;
+int g_netcode = NetStandard;
+int g_customDelay = 1;
+int g_customRollback = kMaxRollback;
+// The image options as the renderer asks for them every frame and every draw (GetSharpness ..
+// GetShadows): lock-free copies of g_graphics, refreshed by MirrorLocked.
+std::atomic<int> g_sharpness{ 0 }, g_antiAliasing{ 0 }, g_textureFilter{ 0 }, g_vsync{ 1 }, g_shadows{ 1 };
+std::atomic<bool> g_loadedFlag{ false };
+
+void MirrorLocked()
+{
+    static const int kSharpness[4] = { 0, 3, 6, 10 };   // SHARPENING OFF / LOW / MEDIUM / HIGH on the 0..10 scale
+    const Graphics& g = g_graphics;
+    g_sharpness = kSharpness[g.sharpen];
+    g_antiAliasing = g.antiAliasing == 1 ? 1 : 0;       // FXAA; SMAA is the presenter's own
+    g_textureFilter = g.anisotropy;                     // the same steps: off, 2x .. 16x
+    g_vsync = g.vsync ? 1 : 0;
+    g_shadows = g.shadows ? 1 : 0;
+}
 std::atomic<uint32_t> g_generation{ 0 };
 
 std::string IniPath()
@@ -72,7 +99,7 @@ void LoadLocked()
     char res[32] = {};
     GetPrivateProfileStringA("Display", "Resolution", "1280x720", res, sizeof(res), ini.c_str());
     unsigned w = 0, h = 0;
-    g_resolution = 0;
+    g_resolution = 2;                                   // 1280x720 unless the file names another
     if (std::sscanf(res, "%ux%u", &w, &h) == 2)
     {
         const auto& list = Resolutions();
@@ -91,6 +118,7 @@ void LoadLocked()
     g.anisotropy = IndexOf(Anisotropies(), GetPrivateProfileIntA("Graphics", "Anisotropy", 1, ini.c_str()));
     g.sharpen = GetPrivateProfileIntA("Graphics", "Sharpen", d.sharpen, ini.c_str());
     g.motionBlur = GetPrivateProfileIntA("Graphics", "MotionBlur", d.motionBlur, ini.c_str()) != 0;
+    g.shadows = GetPrivateProfileIntA("Graphics", "Shadows", d.shadows, ini.c_str()) != 0;
     g.brightness = GetPrivateProfileIntA("Graphics", "Brightness", d.brightness, ini.c_str());
     g.fpsCounter = GetPrivateProfileIntA("Graphics", "FpsCounter", d.fpsCounter, ini.c_str()) != 0;
     g = Clamped(g);
@@ -109,8 +137,14 @@ void LoadLocked()
             p = *end ? end + 1 : end;
         }
     }
-    std::fprintf(stderr, "[display] settings: mode=%d resolution=%ux%u input delay %s (%s)\n", g_mode,
-                 Resolutions()[g_resolution].width, Resolutions()[g_resolution].height, g_inputDelay ? "on" : "off", ini.c_str());
+    g_netcode = std::clamp<int>(GetPrivateProfileIntA("Online", "Netcode", NetStandard, ini.c_str()), NetStandard, NetCustom);
+    g_customDelay = std::clamp<int>(GetPrivateProfileIntA("Online", "CustomDelay", 1, ini.c_str()), kMinDelay, kMaxCustomDelay);
+    g_customRollback = std::clamp<int>(GetPrivateProfileIntA("Online", "CustomRollback", kMaxRollback, ini.c_str()), 1, kMaxRollback);
+    MirrorLocked();
+    g_loadedFlag.store(true, std::memory_order_release);
+    std::fprintf(stderr, "[display] settings: mode=%d resolution=%ux%u input delay %s, online netcode %d (custom: delay %d, rollback %d) (%s)\n",
+                 g_mode, Resolutions()[g_resolution].width, Resolutions()[g_resolution].height, g_inputDelay ? "on" : "off",
+                 g_netcode, g_customDelay, g_customRollback, ini.c_str());
 }
 
 void SaveLocked()
@@ -122,6 +156,14 @@ void SaveLocked()
     const Resolution r = Resolutions()[g_resolution];
     std::snprintf(value, sizeof(value), "%ux%u", r.width, r.height);
     WritePrivateProfileStringA("Display", "Resolution", value, ini.c_str());
+    std::snprintf(value, sizeof(value), "%d", g_sharpness.load());
+    WritePrivateProfileStringA("Display", "Sharpness", value, ini.c_str());
+    std::snprintf(value, sizeof(value), "%d", g_antiAliasing.load());
+    WritePrivateProfileStringA("Display", "AntiAliasing", value, ini.c_str());
+    std::snprintf(value, sizeof(value), "%d", g_textureFilter.load());
+    WritePrivateProfileStringA("Display", "TextureFilter", value, ini.c_str());
+    WritePrivateProfileStringA("Display", "VSync", g_vsync.load() ? "1" : "0", ini.c_str());
+    WritePrivateProfileStringA("Display", "Shadows", g_shadows.load() ? "1" : "0", ini.c_str());
     WritePrivateProfileStringA("Game", "InputDelay", g_inputDelay ? "1" : "0", ini.c_str());
     const Graphics& g = g_graphics;
     auto put = [&](const char* key, int v) {
@@ -137,6 +179,7 @@ void SaveLocked()
     put("Anisotropy", Anisotropies()[size_t(g.anisotropy)]);
     put("Sharpen", g.sharpen);
     put("MotionBlur", g.motionBlur);
+    put("Shadows", g.shadows);
     put("Brightness", g.brightness);
     put("FpsCounter", g.fpsCounter);
     auto putVoice = [&](const char* key, int v) {
@@ -154,14 +197,52 @@ void SaveLocked()
         muted += hex;
     }
     WritePrivateProfileStringA("Voice", "Muted", muted.c_str(), ini.c_str());
+    std::snprintf(value, sizeof(value), "%d", g_netcode);
+    WritePrivateProfileStringA("Online", "Netcode", value, ini.c_str());
+    std::snprintf(value, sizeof(value), "%d", g_customDelay);
+    WritePrivateProfileStringA("Online", "CustomDelay", value, ini.c_str());
+    std::snprintf(value, sizeof(value), "%d", g_customRollback);
+    WritePrivateProfileStringA("Online", "CustomRollback", value, ini.c_str());
+}
+
+// One clamped int setting: stored and logged when it changes.
+void SetInt(int& slot, int v, int lo, int hi, const char* what)
+{
+    std::lock_guard<std::mutex> l(g_mutex);
+    LoadLocked();
+    v = std::clamp(v, lo, hi);
+    if (v == slot) return;
+    slot = v;
+    SaveLocked();
+    std::fprintf(stderr, "[display] %s -> %d\n", what, v);
+}
+
+// The same for the image options (atomics: the renderer reads them without the lock).
+void SetAtomic(std::atomic<int>& slot, int v, int lo, int hi, const char* what)
+{
+    std::lock_guard<std::mutex> l(g_mutex);
+    LoadLocked();
+    v = std::clamp(v, lo, hi);
+    if (v == slot.load()) return;
+    slot.store(v);
+    SaveLocked();
+    std::fprintf(stderr, "[display] %s -> %d\n", what, v);
+}
+int GetAtomic(const std::atomic<int>& slot)
+{
+    if (!g_loadedFlag.load(std::memory_order_acquire)) { std::lock_guard<std::mutex> l(g_mutex); LoadLocked(); }
+    return slot.load(std::memory_order_relaxed);
 }
 
 } // namespace
 
 const std::vector<Resolution>& Resolutions()
 {
+    // 640x360 and 960x540 render below the console's 720p (half / three quarters of it): for weak
+    // GPUs (integrated graphics, GTX 1050 class at high window sizes). The setting is stored as WxH,
+    // so adding entries keeps everyone's choice.
     static const std::vector<Resolution> list = {
-        { 1280, 720 }, { 1600, 900 }, { 1920, 1080 }, { 2560, 1440 }, { 3840, 2160 } };
+        { 640, 360 }, { 960, 540 }, { 1280, 720 }, { 1600, 900 }, { 1920, 1080 }, { 2560, 1440 }, { 3840, 2160 } };
     return list;
 }
 
@@ -262,14 +343,15 @@ void SetGraphics(const Graphics& wanted)
     const Graphics& o = g_graphics;
     if (g.vsync == o.vsync && g.renderScale == o.renderScale && g.upscaler == o.upscaler && g.fsrMode == o.fsrMode &&
         g.antiAliasing == o.antiAliasing && g.anisotropy == o.anisotropy && g.sharpen == o.sharpen &&
-        g.motionBlur == o.motionBlur && g.brightness == o.brightness && g.fpsCounter == o.fpsCounter)
+        g.motionBlur == o.motionBlur && g.shadows == o.shadows && g.brightness == o.brightness && g.fpsCounter == o.fpsCounter)
         return;
     g_graphics = g;
+    MirrorLocked();
     SaveLocked();
     g_generation.fetch_add(1);
-    std::fprintf(stderr, "[display] graphics: vsync %d, render scale %d%%, upscaler %d (fsr %d%%), aa %d, anisotropy %dx, sharpen %d, motion blur %d, brightness %d, fps %d\n",
+    std::fprintf(stderr, "[display] graphics: vsync %d, render scale %d%%, upscaler %d (fsr %d%%), aa %d, anisotropy %dx, sharpen %d, motion blur %d, shadows %d, brightness %d, fps %d\n",
                  g.vsync, RenderScales()[size_t(g.renderScale)], g.upscaler, FsrModes()[size_t(g.fsrMode)], g.antiAliasing,
-                 Anisotropies()[size_t(g.anisotropy)], g.sharpen, g.motionBlur,
+                 Anisotropies()[size_t(g.anisotropy)], g.sharpen, g.motionBlur, g.shadows,
                  g.brightness, g.fpsCounter);
 }
 
@@ -307,5 +389,24 @@ void SetVoiceMuted(uint64_t peer, bool muted)
     SaveLocked();
     std::fprintf(stderr, "[display] voice: %016llX %s\n", (unsigned long long)peer, muted ? "muted" : "unmuted");
 }
+
+int GetNetcode() { std::lock_guard<std::mutex> l(g_mutex); LoadLocked(); return g_netcode; }
+int GetCustomDelay() { std::lock_guard<std::mutex> l(g_mutex); LoadLocked(); return g_customDelay; }
+int GetCustomRollback() { std::lock_guard<std::mutex> l(g_mutex); LoadLocked(); return g_customRollback; }
+void SetNetcode(int netcode) { SetInt(g_netcode, netcode, NetStandard, NetCustom, "online netcode"); }
+void SetCustomDelay(int frames) { SetInt(g_customDelay, frames, kMinDelay, kMaxCustomDelay, "custom input delay"); }
+void SetCustomRollback(int frames) { SetInt(g_customRollback, frames, 1, kMaxRollback, "custom rollback"); }
+
+// Upstream's Display Settings setters, onto GRAPHICS SETTINGS (its rows are not added; kept for the natives).
+int GetSharpness() { return GetAtomic(g_sharpness); }
+int GetAntiAliasing() { return GetAtomic(g_antiAliasing); }
+int GetTextureFilter() { return GetAtomic(g_textureFilter); }
+bool GetVSync() { return GetAtomic(g_vsync) != 0; }
+bool GetShadows() { return GetAtomic(g_shadows) != 0; }
+void SetSharpness(int level) { Graphics g = GetGraphics(); g.sharpen = std::clamp(level, 0, kMaxSharpness) * 3 / kMaxSharpness; SetGraphics(g); }
+void SetAntiAliasing(int mode) { Graphics g = GetGraphics(); g.antiAliasing = mode ? 1 : 0; SetGraphics(g); }
+void SetTextureFilter(int mode) { Graphics g = GetGraphics(); g.anisotropy = std::clamp(mode, 0, kMaxTextureFilter); SetGraphics(g); }
+void SetVSync(bool on) { Graphics g = GetGraphics(); g.vsync = on; SetGraphics(g); }
+void SetShadows(bool on) { Graphics g = GetGraphics(); g.shadows = on; SetGraphics(g); }
 
 } // namespace display_settings

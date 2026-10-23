@@ -1,0 +1,26 @@
+{{define "audit"}}{{template "top" .}}
+{{- with .Data}}
+<form class="toolbar" method="get" action="/audit" role="search">
+<label class="search-box">{{template "icon" "search"}}<span class="sr-only">Search the audit log</span>
+<input type="search" name="q" value="{{.Query}}" maxlength="64" placeholder="An address, a Steam ID, banned, failed login...">
+</label>
+<button type="submit" class="btn primary">Search</button>
+{{- if .Query}} <a class="btn ghost" href="/audit">Clear</a>{{end}}
+</form>
+<section class="panel">
+<div class="panel-head">
+<h2>{{if .Query}}Lines found{{else}}Newest lines{{end}}</h2>
+<span class="muted small">data/admin_audit.log{{if .Cut}}, its last 256 KB{{end}}; at most 500 lines</span>
+</div>
+{{- if .Lines}}{{template "auditlist" (auditList $ .Lines)}}{{else}}<p class="empty">{{if .Query}}No line matches.{{else}}The audit log is empty.{{end}}</p>{{end}}
+</section>
+{{- end}}
+{{template "bottom" .}}{{end}}
+
+{{define "auditlist"}}
+<ol class="audit">
+{{- range .Lines}}
+<li class="al al-{{.Kind}}"><span class="al-when">{{if .At.IsZero}}-{{else}}{{template "local" .At}}{{end}}</span><span class="tag al-tag">{{.Kind}}</span><span class="al-text">{{.Text}}</span></li>
+{{- end}}
+</ol>
+{{end}}

@@ -25,6 +25,9 @@ void SignOut();
 // A new profile (not signed in); returns its index, or -1 when the list is full or the name
 // is not valid (1-15 characters: letters, digits, spaces; not all spaces; unique).
 int Create(const std::string& name);
+// A new name for a profile that is not signed in (the game keeps a signed-in profile's gamertag; the
+// save folder goes by the XUID, which stays): 0 done, 1 not valid / signed in, 2 another profile's name.
+int Rename(int index, const std::string& name);
 bool ValidName(const std::string& name);
 std::string Normalize(const std::string& name);   // trims, collapses spaces
 

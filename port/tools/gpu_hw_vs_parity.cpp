@@ -97,6 +97,7 @@ int main(int argc, char** argv)
         state.xs = 320.0f + any(rng); state.xo = 320.0f + any(rng); state.ys = -360.0f + any(rng);
         state.yo = 360.0f + any(rng); state.zs = 0.5f + 0.1f * any(rng); state.zo = 0.5f + 0.1f * any(rng);
         state.pitch = 640.0f; state.rows = 2048.0f; state.noClip = 0;
+        ttt2_hw::VsFetchDescriptors(t, state.vfDesc);   // the fetches' parameters, as the backend's draw passes them
 
         // Vertex data: every slot the shader fetches gets its own base; dwords are a mix of
         // small floats, raw random bits and byte-sized integers (colours, indices, weights).

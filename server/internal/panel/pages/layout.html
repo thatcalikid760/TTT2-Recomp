@@ -1,0 +1,185 @@
+{{define "top"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="color-scheme" content="light dark">
+<title>{{.Title}}{{with .Server}} · {{.}}{{end}}</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/panel.css">
+{{- if .CSRF}}
+<meta name="csrf" content="{{.CSRF}}">
+<script src="/panel.js" defer></script>
+{{- end}}
+</head>
+{{- if .CSRF}}
+<body class="app" data-live-since="{{.LiveSince}}" data-back="{{.Back}}">
+<a class="skip" href="#main">Skip to the content</a>
+<div class="shell">
+<aside class="side">
+<div class="side-top">
+<a class="brand" href="/">
+<span class="mark" aria-hidden="true">T2</span>
+<span class="brand-text"><span class="brand-name">{{if .Server}}{{.Server}}{{else}}TTT2 Server{{end}}</span><span class="brand-sub">Admin panel</span></span>
+</a>
+<span class="pill" id="live-pill" data-state="static" role="status" title="Shown as it was when the page loaded"><span class="dot" aria-hidden="true"></span><span class="pill-text">As of {{.Now.Format "15:04"}}</span></span>
+</div>
+<nav class="nav" aria-label="Main">
+<a href="/"{{if eq .Nav "dashboard"}} aria-current="page"{{end}}>{{template "icon" "dashboard"}}<span>Dashboard</span><span class="count" data-stat="online" title="Online now">{{.Online}}</span></a>
+<a href="/players"{{if eq .Nav "players"}} aria-current="page"{{end}}>{{template "icon" "players"}}<span>Players</span></a>
+<a href="/matches"{{if eq .Nav "matches"}} aria-current="page"{{end}}>{{template "icon" "matches"}}<span>Matches</span><span class="count" data-stat="playing" title="Playing now">{{.Playing}}</span></a>
+<a href="/bans"{{if eq .Nav "bans"}} aria-current="page"{{end}}>{{template "icon" "bans"}}<span>Bans</span><span class="count" data-stat="bans" title="Bans in force">{{.Bans}}</span></a>
+<a href="/audit"{{if eq .Nav "audit"}} aria-current="page"{{end}}>{{template "icon" "audit"}}<span>Audit log</span></a>
+</nav>
+<div class="side-foot">
+<p class="uptime">Up <time datetime="{{iso .Started}}" data-ts="{{unix .Started}}" data-fmt="since">{{between .Started .Now}}</time></p>
+<form method="post" action="/logout">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<button type="submit" class="btn ghost sm">{{template "icon" "logout"}}<span>Log out</span></button>
+</form>
+</div>
+</aside>
+<main id="main" class="main">
+<header class="page-head">
+<h1>{{.Title}}</h1>
+</header>
+{{- with .Flash}}
+<div class="flash {{if $.FlashErr}}err{{else}}ok{{end}}" role="status"><span class="flash-text">{{.}}</span></div>
+{{- end}}
+{{- else}}
+<body class="bare">
+<main id="main" class="login-main">
+{{- end}}
+{{end}}
+
+{{define "bottom"}}
+{{- if .CSRF}}
+<footer class="foot">Times are the server's ({{.Zone}}) where the page is not live. Panel of <span class="mono">ttt2-server</span>.</footer>
+</main>
+</div>
+{{template "dialogs" .}}
+{{- else}}
+</main>
+{{- end}}
+</body>
+</html>
+{{end}}
+
+{{/* The kick / ban dialog (panel.js opens it from the [data-act] links; without JavaScript they lead to the
+player's page and its forms), and the confirmation dialog of forms with data-confirm. */}}
+{{define "dialogs"}}
+<dialog class="modal" id="act-dialog" aria-labelledby="act-title">
+<form method="post" action="/kick" class="modal-form">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<input type="hidden" name="steam_id" value="">
+<input type="hidden" name="back" value="{{.Back}}">
+<div class="modal-head">
+<h2 id="act-title"><span data-verb>Kick</span> <span data-name class="modal-name"></span></h2>
+<p class="mono muted" data-idtext></p>
+</div>
+<fieldset class="presets" data-mode="kick">
+<legend>Keep them out for</legend>
+{{template "kickchoices" .KickMinutes}}
+</fieldset>
+<fieldset class="presets" data-mode="ban" hidden disabled>
+<legend>Ban for</legend>
+{{template "banchoices"}}
+</fieldset>
+<label class="field"><span>Reason <span class="muted">(optional; the player sees it)</span></span>
+<input type="text" name="reason" maxlength="200" autocomplete="off">
+</label>
+<div class="modal-actions">
+<button type="button" class="btn ghost" data-close>Cancel</button>
+<button type="submit" class="btn danger" data-submit>Kick</button>
+</div>
+</form>
+</dialog>
+<dialog class="modal" id="confirm-dialog" aria-labelledby="confirm-text">
+<div class="modal-form">
+<p id="confirm-text" class="confirm-text"></p>
+<div class="modal-actions">
+<button type="button" class="btn ghost" data-close>Cancel</button>
+<button type="button" class="btn danger" data-ok>Confirm</button>
+</div>
+</div>
+</dialog>
+{{end}}
+
+{{define "kickchoices"}}
+{{- range kickPresets .}}
+<label class="chip"><input type="radio" name="minutes" value="{{.Value}}"{{if .Checked}} checked{{end}}> {{.Label}}</label>
+{{- end}}
+<label class="chip custom"><input type="radio" name="minutes" value="custom"> Minutes:
+<input type="number" name="minutes_custom" min="0" max="1440" inputmode="numeric" aria-label="Minutes (0 to 1440)"></label>
+{{end}}
+
+{{define "banchoices"}}
+{{- range banPresets}}
+<label class="chip{{if eq .Value "0"}} chip-danger{{end}}"><input type="radio" name="days" value="{{.Value}}"{{if .Checked}} checked{{end}}> {{.Label}}</label>
+{{- end}}
+<label class="chip custom"><input type="radio" name="days" value="custom"> Days:
+<input type="number" name="days_custom" min="0" max="36500" inputmode="numeric" aria-label="Days (0 = for good)"></label>
+{{end}}
+
+{{/* A kick form and a ban form for one player (the player's page; the Bans page's "ban a Steam ID" without .ID). */}}
+{{define "kickform"}}
+<form class="act-form" method="post" action="/kick" id="kick">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<input type="hidden" name="steam_id" value="{{.ID}}">
+<input type="hidden" name="back" value="{{.Back}}">
+<fieldset class="presets">
+<legend>Kick: keep them out for</legend>
+{{template "kickchoices" .KickMinutes}}
+</fieldset>
+<label class="field"><span>Reason <span class="muted">(optional; the player sees it)</span></span>
+<input type="text" name="reason" maxlength="200" autocomplete="off">
+</label>
+<button type="submit" class="btn warn">Kick {{.Name}}</button>
+</form>
+{{end}}
+
+{{define "banform"}}
+<form class="act-form" method="post" action="/ban" id="ban">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<input type="hidden" name="back" value="{{.Back}}">
+{{- if .ID}}
+<input type="hidden" name="steam_id" value="{{.ID}}">
+{{- else}}
+<label class="field"><span>Steam ID</span> <input type="text" name="steam_id" inputmode="numeric" pattern="[0-9 ]{1,24}" maxlength="24" required autocomplete="off" placeholder="7656119..."></label>
+{{- end}}
+<fieldset class="presets">
+<legend>Ban for</legend>
+{{template "banchoices"}}
+</fieldset>
+<label class="field"><span>Reason <span class="muted">(optional; the player sees it)</span></span>
+<input type="text" name="reason" maxlength="200" autocomplete="off">
+</label>
+<button type="submit" class="btn danger">Ban{{with .Name}} {{.}}{{end}}</button>
+</form>
+{{end}}
+
+{{define "unbanform"}}
+<form class="inline" method="post" action="/unban" data-confirm="{{if .Kick}}Let {{or .Name .ID}} back in now?{{else}}Unban {{or .Name .ID}}?{{end}}">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<input type="hidden" name="steam_id" value="{{.ID}}">
+<input type="hidden" name="back" value="{{.Back}}">
+<button type="submit" class="btn sm">{{if .Kick}}Lift kick{{else}}Unban{{end}}</button>
+</form>
+{{end}}
+
+{{/* Icons: simple line drawings, the text's colour. */}}
+{{define "icon"}}<svg class="icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+{{- if eq . "dashboard"}}<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>
+{{- else if eq . "players"}}<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.8-3.6 3.4-5.5 6.5-5.5s5.7 1.9 6.5 5.5"/><path d="M16 4.6a3.5 3.5 0 0 1 0 6.8"/><path d="M18.5 14.8c1.6.8 2.6 2.5 3 5.2"/>
+{{- else if eq . "matches"}}<path d="M4 4l9.5 9.5"/><path d="M20 4l-9.5 9.5"/><path d="M6.5 15.5l2 2-3 3-2-2z"/><path d="M17.5 15.5l-2 2 3 3 2-2z"/>
+{{- else if eq . "bans"}}<circle cx="12" cy="12" r="8.5"/><path d="M6 6l12 12"/>
+{{- else if eq . "audit"}}<path d="M7 3h7l5 5v13H7z"/><path d="M14 3v5h5"/><path d="M10 12h6M10 16h6"/>
+{{- else if eq . "logout"}}<path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/><path d="M10 16l-4-4 4-4"/><path d="M6 12h10"/>
+{{- else if eq . "external"}}<path d="M14 4h6v6"/><path d="M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>
+{{- else if eq . "search"}}<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/>
+{{- end}}</svg>{{end}}
+
+{{/* The time an event happened: "5m ago" (panel.js keeps it right), the full time on hover. */}}
+{{define "ago"}}<time datetime="{{iso .T}}" data-ts="{{unix .T}}" data-fmt="ago" title="{{datetime .T}}">{{ago .Now .T}}</time>{{end}}
+{{define "local"}}<time datetime="{{iso .}}" data-ts="{{unix .}}" data-fmt="local">{{datetime .}}</time>{{end}}

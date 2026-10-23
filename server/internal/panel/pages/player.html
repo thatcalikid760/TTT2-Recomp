@@ -1,0 +1,77 @@
+{{define "player"}}{{template "top" .}}
+{{- with .Data}}{{if .ID}}
+<section class="profile">
+<div class="profile-tags">
+{{- with .Live}}{{template "state" .}}{{else}}<span class="tag">offline</span>{{end}}
+{{- with .Ban}} <span class="tag danger">{{if .Kick}}kicked{{else}}banned{{end}}</span> <span class="muted small">{{$.Data.BanText}}</span>{{end}}
+{{- if and .Known (not .Player.Verified)}} <span class="tag warn" title="Steam did not check their last login">unverified</span>{{end}}
+</div>
+<p class="profile-id"><span class="muted">Steam ID</span> <span class="mono">{{.ID}}</span>
+<a class="ext" href="{{steamURL .ID}}" target="_blank" rel="noopener noreferrer">Steam profile{{template "icon" "external"}}<span class="sr-only"> (opens steamcommunity.com in a new tab)</span></a>
+<a class="ext" href="/matches?q={{.ID}}">All their matches</a></p>
+</section>
+
+{{- if not .Known}}
+<p class="flash ok"><span class="flash-text">The server has not seen this Steam ID log in{{if .Ban}}; it is on the ban list{{end}}.</span></p>
+{{- end}}
+
+<dl class="facts">
+{{- if .Known}}
+<div><dt>Last seen</dt><dd>{{if .Live}}now{{else}}{{template "ago" (at $.Now .Player.LastSeen)}}{{end}}</dd></div>
+<div><dt>First seen</dt><dd>{{template "local" .Player.FirstSeen}}</dd></div>
+<div><dt>Logins</dt><dd>{{.Player.Logins}}</dd></div>
+{{- end}}
+{{- with .Live}}
+<div><dt>Online for</dt><dd><time datetime="{{iso (fromUnix .Since)}}" data-ts="{{.Since}}" data-fmt="since">{{between (fromUnix .Since) $.Now}}</time></dd></div>
+<div><dt>IP address</dt><dd class="mono">{{.IP}}</dd></div>
+{{- end}}
+{{- with .Ban}}
+<div><dt>{{if .Kick}}Kept out{{else}}Banned{{end}}</dt><dd>{{if .Until.IsZero}}for good{{else}}<span data-until="{{unix .Until}}">until {{datetime .Until}}</span>{{end}}</dd></div>
+{{- end}}
+</dl>
+
+<div class="dash">
+<section class="panel" aria-labelledby="act-title-page">
+<div class="panel-head"><h2 id="act-title-page">Actions</h2></div>
+<div class="panel-body stack">
+{{- if .Live}}{{template "kickform" (target $ .ID .Live.Name false)}}{{end}}
+{{- if .Ban}}
+<div class="ban-now">
+<p>{{if .Ban.Kick}}Kept out by a kick{{else}}Banned{{end}} {{.BanText}}{{with .Ban}}{{if .Kick}}{{with .KickReason}}. Reason: {{.}}{{end}}{{else}}{{with .Reason}}. Reason: {{.}}{{end}}{{end}}{{end}}</p>
+{{template "unbanform" (target $ .ID (or .Player.Name "") .Ban.Kick)}}
+</div>
+{{- end}}
+{{- if or (not .Ban) .Ban.Kick}}{{template "banform" (target $ .ID (or .Player.Name "") false)}}{{end}}
+</div>
+</section>
+
+<section class="panel" aria-labelledby="names-title">
+<div class="panel-head"><h2 id="names-title">Names used</h2><span class="muted small">in their recorded matches</span></div>
+{{- if .Names}}
+<table class="list compact">
+<thead><tr><th scope="col">Name</th><th scope="col">Last used</th><th scope="col" class="num">Matches</th></tr></thead>
+<tbody>
+{{- range .Names}}
+<tr><td data-label="Name">{{.Name}}</td><td data-label="Last used">{{template "ago" (at $.Now .Last)}}</td><td data-label="Matches" class="num">{{.Matches}}</td></tr>
+{{- end}}
+</tbody>
+</table>
+{{- else}}
+<p class="empty">{{if .Known}}No recorded match yet; their name now: <b>{{.Player.Name}}</b>.{{else}}None recorded.{{end}}</p>
+{{- end}}
+</section>
+</div>
+
+<section class="panel" aria-labelledby="pm-title">
+<div class="panel-head"><h2 id="pm-title">Recent matches</h2>{{if .More}}<a class="small" href="/matches?q={{.ID}}">All of them</a>{{end}}</div>
+{{- if .Matches}}{{template "matchtable" (matchTable $ .Matches .ID)}}{{else}}<p class="empty">No recorded match.</p>{{end}}
+</section>
+
+<section class="panel" aria-labelledby="pa-title">
+<div class="panel-head"><h2 id="pa-title">Kicks and bans from this panel</h2><span class="muted small">from the audit log</span></div>
+{{- if .Audit}}{{template "auditlist" (auditList $ .Audit)}}{{else}}<p class="empty">None in the audit log. (Kicks and bans from the server's console are in its log only.)</p>{{end}}
+</section>
+{{- else}}
+<p class="empty">Open a player from the <a href="/players">players list</a>.</p>
+{{- end}}{{end}}
+{{template "bottom" .}}{{end}}

@@ -5,6 +5,7 @@
 //    rewritten every 2 s while the host lives (older than 10 s = gone).
 #pragma once
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace mm {
@@ -22,12 +23,18 @@ struct SessionRecord
     uint8_t info[0x3C] = {};            // XSESSION_INFO as the host wrote it
     std::vector<Context> contexts;
     std::vector<Property> properties;
+    // Rollback builds: the host's ONLINE NETCODE (display_settings.h) - kNetcodeKnown | mode |
+    // custom delay << 8 | custom rollback << 16; 0 = none. The guest picks the battle's input delay
+    // with it (NACE lets only the guest request one), so the host's setting decides.
+    uint32_t netcode = 0;
 };
+constexpr uint32_t kNetcodeKnown = 0x80000000u;
 
 void Publish(const SessionRecord& record);     // add or update (host)
 void Remove(uint64_t id);
 // Sessions of other hosts, newest first, at most `max`.
-std::vector<SessionRecord> List(uint32_t max);
+// `contexts` / `openOnly`: what a search wants (a community server filters by them; elsewhere the caller does).
+std::vector<SessionRecord> List(uint32_t max, const std::vector<std::pair<uint32_t, uint32_t>>& contexts = {}, bool openOnly = false);
 bool Find(uint64_t id, SessionRecord& out);       // also sessions seen in a list or an invite
 // A friend's "Join Game" through Steam, or a Join queued by QueueInvite, once: the session to
 // join (then findable by id).

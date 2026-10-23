@@ -324,6 +324,8 @@ uint8_t AddHostPage(Doc& d, uint8_t lastSmall, int row, const char* label, const
                     const char* frameName);
 void AddKeyboardMode(Doc& d);
 void AddInputDelay(Doc& d);
+void AddOnlineNetcode(Doc& d);
+void AddDisplayImage(Doc& d);
 
 void Edit(Doc& d, const PcLists& lists, std::string* note)
 {
@@ -434,6 +436,8 @@ void Edit(Doc& d, const PcLists& lists, std::string* note)
         top.insert(top.begin() + std::ptrdiff_t(at) + 1, std::move(dialog));
     }
 
+    // (Upstream's VSYNC / SHARPNESS / ANTI-ALIASING / TEXTURE FILTERING / SHADOWS rows in Display
+    // Settings, AddDisplayImage, are not added: GRAPHICS SETTINGS holds all of them.)
     const uint8_t switchIcon = AddSwitchProfile(d);
     // GRAPHICS SETTINGS edits a copy: if the Options page is not as measured, only it is left out.
     Doc graphics = d;
@@ -472,6 +476,10 @@ void Edit(Doc& d, const PcLists& lists, std::string* note)
     Doc inputDelay = d;
     try { AddInputDelay(inputDelay); d = std::move(inputDelay); }
     catch (const Fail& e) { if (note) *note += std::string(note->empty() ? "" : "; ") + "Game Options INPUT DELAY left out: " + e.what(); }
+    // And ONLINE NETCODE (after INPUT DELAY: only with it).
+    Doc netcode = d;
+    try { AddOnlineNetcode(netcode); d = std::move(netcode); }
+    catch (const Fail& e) { if (note) *note += std::string(note->empty() ? "" : "; ") + "Game Options ONLINE NETCODE left out: " + e.what(); }
 }
 
 // ---- Options -> Game Options: INPUT DELAY (OFF / ON) before DEFAULT - the game's 2-frame offline
@@ -509,6 +517,174 @@ void AddInputDelay(Doc& d)
     d.Set(help, "textid360", nullptr);
     d.Set(list[at], "name", "StaticMode007-01-07");
     list.insert(list.begin() + std::ptrdiff_t(at), std::move(help));
+}
+
+// ---- Options -> Game Options: ONLINE NETCODE, CUSTOM INPUT DELAY, CUSTOM ROLLBACK after INPUT DELAY
+// (display_settings.h; rollback_session.cpp applies them). Copies of GUARD DAMAGE with value lists of
+// their own, read and stored like INPUT DELAY (menu_ext.cpp). The page's icon arrays grow to the 10
+// rows; help texts go by position ("StaticMode007-01-0" + row: DEFAULT's becomes "...-010").
+void AddOnlineNetcode(Doc& d)
+{
+    const struct { int n; const char* label; const char* help; std::vector<std::string> values; int def; } rows[] = {
+        // Help texts stay short: the focused row shows its help under the label, and the long
+        // values (PRIORITIZE ...) start at about 60 characters (MEASURED 2026-10-19).
+        { 8, "ONLINE NETCODE", "Input delay versus rollback in online matches.",
+          { "STANDARD", "PRIORITIZE RESPONSE", "PRIORITIZE GRAPHICS", "CUSTOM" }, 0 },
+        { 9, "CUSTOM INPUT DELAY", "Online input delay when ONLINE NETCODE is CUSTOM.",
+          { "1 FRAME", "2 FRAMES", "3 FRAMES", "4 FRAMES", "5 FRAMES", "6 FRAMES" }, 0 },
+        { 10, "CUSTOM ROLLBACK", "Frames the game may predict online when ONLINE NETCODE is CUSTOM.",
+          { "1 FRAME", "2 FRAMES", "3 FRAMES", "4 FRAMES", "5 FRAMES", "6 FRAMES", "7 FRAMES", "8 FRAMES" }, 7 },
+    };
+    const Node rowTemplate = d.Find("MenuItemMode007-01-04");
+    const Node svTemplate = d.Find("SelectValueMenuItemMode007-01-04");
+    const uint32_t itemIndex = d.E("selectvalueitem");
+    std::vector<Node> items, lists;
+    for (const auto& r : rows)
+    {
+        const std::string n = (r.n < 10 ? "0" : "") + std::to_string(r.n);
+        Node row = rowTemplate;
+        d.Set(row, "name", ("MenuItemMode007-01-" + n).c_str());
+        d.Set(row, "text", r.label);
+        d.Set(row, "textid", nullptr);
+        d.Set(row, "textid360", nullptr);
+        d.Set(row, "value", ("SelectValueMenuItemMode007-01-" + n).c_str());
+        items.push_back(std::move(row));
+        Node sv = svTemplate;
+        d.Set(sv, "name", ("SelectValueMenuItemMode007-01-" + n).c_str());
+        sv.children.clear();
+        for (size_t k = 0; k < r.values.size(); ++k)
+        {
+            Node item;
+            item.index = itemIndex;
+            item.text = r.values[k] + '\0';
+            if (int(k) == r.def) d.Set(item, "default", "true");
+            sv.children.push_back(std::move(item));
+        }
+        lists.push_back(std::move(sv));
+    }
+    // Rows before DEFAULT, value lists after INPUT DELAY's (value columns follow document order).
+    {
+        size_t at = 0;
+        std::vector<Node>& list = d.ListOf("MenuItemMode007-01-06", at);
+        list.insert(list.begin() + std::ptrdiff_t(at), items.begin(), items.end());
+    }
+    {
+        size_t at = 0;
+        std::vector<Node>& list = d.ListOf("SelectValueMenuItemMode007-01-07", at);
+        list.insert(list.begin() + std::ptrdiff_t(at) + 1, lists.begin(), lists.end());
+    }
+    XtalExtendArrays(d.Event(d.Find("MenuMode007-01-01"), "OnLoad").text, { 1, 2 }, 10);
+    // Help texts: rows 7..9, DEFAULT's moves to 10.
+    size_t at = 0;
+    std::vector<Node>& list = d.ListOf("StaticMode007-01-07", at);
+    std::vector<Node> helps;
+    for (size_t i = 0; i < 3; ++i)
+    {
+        Node help = list[at];
+        d.Set(help, "name", ("StaticMode007-01-0" + std::to_string(7 + i)).c_str());
+        d.Set(help, "text", rows[i].help);
+        d.Set(help, "textid", nullptr);
+        d.Set(help, "textid360", nullptr);
+        helps.push_back(std::move(help));
+    }
+    d.Set(list[at], "name", "StaticMode007-01-010");
+    list.insert(list.begin() + std::ptrdiff_t(at), helps.begin(), helps.end());
+}
+
+// ---- Options -> Display Settings: VSYNC, SHARPNESS, ANTI-ALIASING, TEXTURE FILTERING, SHADOWS after RESOLUTION
+// (display_settings.h; the presenter, the texture samplers and the renderer apply them as the cursor moves).
+// Clones of 3D DEPTH like DISPLAY MODE / RESOLUTION, natives renamed to PC ones of the same lengths
+// (menu_ext.cpp registers them); the page's icon arrays grow to 12 rows; help texts go by position
+// (rows 7..11, DEFAULT's becomes "StaticMode007-04-012").
+void AddDisplayImage(Doc& d)
+{
+    const struct { const char* n; const char* label; const char* preview; const char* store; const char* help;
+                   std::vector<std::string> values; } rows[] = {
+        { "11", "VSYNC", "MenuOptionDisplayVSyncOnOff", "DisplaySettingSetVSyncOn",
+          "OFF: less input lag, the picture may tear. Still 60 fps.",
+          { "ON", "OFF" } },
+        { "08", "SHARPNESS", "MenuOptionDisplaySharpening", "DisplaySettingSetSharpen",
+          "Sharpen the picture (contrast adaptive sharpening).",
+          { "OFF", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10" } },
+        { "09", "ANTI-ALIASING", "MenuOptionDisplayEdgeSmooth", "DisplaySettingSetEdgesAA",
+          "Smooth jagged edges (FXAA).",
+          { "OFF", "FXAA" } },
+        { "10", "TEXTURE FILTERING", "MenuOptionDisplayTexFilters", "DisplaySettingSetTexFilt",
+          "Anisotropic filtering keeps textures sharp at an angle.",
+          { "STANDARD", "ANISOTROPIC 2X", "ANISOTROPIC 4X", "ANISOTROPIC 8X", "ANISOTROPIC 16X" } },
+        { "12", "SHADOWS", "MenuOptionDisplayShadowsOff", "DisplaySettingSetShadows",
+          "OFF: fighters and stage objects cast no shadows. Lighter on the GPU.",
+          { "ON", "OFF" } },
+    };
+    const Node depth = d.Find("MenuItemMode007-04-04");
+    const Node svTemplate = d.Find("SelectValueMenuItemMode007-04-02");
+    const uint32_t itemIndex = d.E("selectvalueitem");
+    std::vector<Node> items, lists;
+    for (const auto& r : rows)
+    {
+        const std::string sv = std::string("SelectValueMenuItemMode007-04-") + r.n;
+        Node row = depth;
+        d.Set(row, "name", (std::string("MenuItemMode007-04-") + r.n).c_str());
+        d.Set(row, "text", r.label);
+        d.Set(row, "textid", nullptr);
+        d.Set(row, "value", sv.c_str());
+        std::string& trig = d.Event(row, "OnTrigger").text;
+        XtalRename(trig, "DisplaySettingIsMonitor3DCapable", "DisplaySettingIsPCDisplayCapable");
+        XtalRename(trig, "MenuOptionDisplay3DPallarax", r.preview);
+        XtalRename(trig, "DisplaySettingSet3DDepth", r.store);
+        XtalRename(trig, "SelectValueMenuItemMode007-04-04", sv);
+        items.push_back(std::move(row));
+        Node list = svTemplate;
+        d.Set(list, "name", sv.c_str());
+        list.children.clear();
+        for (size_t k = 0; k < r.values.size(); ++k)
+        {
+            Node item;
+            item.index = itemIndex;
+            item.text = r.values[k] + '\0';
+            if (k == 0) d.Set(item, "default", "true");
+            list.children.push_back(std::move(item));
+        }
+        lists.push_back(std::move(list));
+    }
+    // Rows before DEFAULT (after RESOLUTION), value lists after RESOLUTION's (document order).
+    {
+        size_t at = 0;
+        std::vector<Node>& list = d.ListOf("MenuItemMode007-04-05", at);
+        list.insert(list.begin() + std::ptrdiff_t(at), items.begin(), items.end());
+    }
+    {
+        size_t at = 0;
+        std::vector<Node>& list = d.ListOf("SelectValueMenuItemMode007-04-07", at);
+        list.insert(list.begin() + std::ptrdiff_t(at) + 1, lists.begin(), lists.end());
+    }
+    XtalExtendArrays(d.Event(d.Find("MenuMode007-04-01"), "OnLoad").text, { 1, 2 }, 12);
+    // 3D MODE / 3D DEPTH (stereoscopic 3D: never on a PC, the rows stayed greyed out) leave the page so 10 rows fit
+    // above the info bar (12 overlapped it). The page's scripts look them up by name, so they stay in the document,
+    // out of the automatic layout and hidden (row, value, help text); the cursor already skipped them. MEASURED: only
+    // hiding them left their help texts and frames in place.
+    for (const char* name : { "MenuItemMode007-04-03", "MenuItemMode007-04-04", "SelectValueMenuItemMode007-04-03",
+                              "SelectValueMenuItemMode007-04-04", "StaticMode007-04-03", "StaticMode007-04-04" })
+    {
+        Node& n = d.Find(name);
+        d.Set(n, "postype", "abs");
+        d.Set(n, "posx", "-4000");
+        d.Set(n, "posy", "-4000");
+        d.Set(n, "visible", "false");
+    }
+    size_t at = 0;
+    std::vector<Node>& list = d.ListOf("StaticMode007-04-07", at);
+    std::vector<Node> helps;
+    for (size_t i = 0; i < std::size(rows); ++i)
+    {
+        Node help = list[at];
+        d.Set(help, "name", ("StaticMode007-04-0" + std::to_string(7 + i)).c_str());
+        d.Set(help, "text", rows[i].help);
+        d.Set(help, "textid", nullptr);
+        helps.push_back(std::move(help));
+    }
+    d.Set(list[at], "name", "StaticMode007-04-012");
+    list.insert(list.begin() + std::ptrdiff_t(at), helps.begin(), helps.end());
 }
 
 // ---- Options -> Controller Setup: KEYBOARD mode (KEYBOARD_PLAN.md). The screen's artwork has room
@@ -727,6 +903,173 @@ void AddSystemFrames(Doc& d)
     top.insert(top.begin() + std::ptrdiff_t(at) + 1, frames.begin(), frames.end());
 }
 
+// ---- ONLINE MODE menu (document 001): SERVER, a 7th row after LEADERBOARDS - the network the online
+// modes use (STEAM or a community server, port/COMMUNITY_SERVER_PLAN.md; server_ui.cpp writes its name
+// in the value column). A copy of LEADERBOARDS whose OnEnter (play the bars out, switch frame) opens the
+// server list; help and value texts go by position ("StaticOnlineMode00" / "StaticOnlineModeValue00" +
+// row).
+// ---- the Player Match room's Friend Invite (same document): its OnEnter's native, the room's operation for the
+// console's friends list, becomes a PC native of the same length (menu_ext.cpp: a Steam friend picker, server_ui.cpp).
+// MEASURED 2026-10-23: the original does nothing on PC (XamShowFriendsUI is never reached).
+void AddFriendInvite(Doc& d)
+{
+    XtalRename(d.Event(d.Find("MenuItemPlayerMatch04-Friend"), "OnEnter").text, "OnlinePlayerMatchOperationMenuSetValue",
+               "OnlinePlayerMatchSteamFriendInviteOpen");
+}
+
+void AddServerRow(Doc& d)
+{
+    Node row = d.Find("MenuItemOnline07-leaderboard");
+    d.Set(row, "name", "MenuItemOnline08-server");
+    d.Set(row, "text", "SERVER");
+    d.Set(row, "textid", nullptr);
+    d.Set(row, "textid360", nullptr);
+    XtalRename(d.Event(row, "OnEnter").text, "FrameOnline07", "FrameOnlineServerList");
+    {
+        size_t at = 0;
+        std::vector<Node>& items = d.ListOf("MenuItemOnline07-leaderboard", at);
+        items.insert(items.begin() + std::ptrdiff_t(at) + 1, std::move(row));
+    }
+    const struct { const char* from; const char* to; const char* text; } statics[] = {
+        { "StaticOnlineMode006", "StaticOnlineMode007", "Play on Steam or a community server." },
+        { "StaticOnlineModeValue006", "StaticOnlineModeValue007", "STEAM" },
+    };
+    for (const auto& s : statics)
+    {
+        size_t at = 0;
+        std::vector<Node>& list = d.ListOf(s.from, at);
+        Node copy = list[at];
+        d.Set(copy, "name", s.to);
+        d.Set(copy, "text", s.text);
+        d.Set(copy, "textid", nullptr);
+        d.Set(copy, "textid360", nullptr);
+        list.insert(list.begin() + std::ptrdiff_t(at) + 1, std::move(copy));
+    }
+    // The value (a server's name, longer than the menu's own values) right-aligned in the plain font, as the
+    // online pages' value columns: it ends where the column starts, short of the focused row's help text
+    // (the menu font's wider letters reached it - MEASURED 2026-10-21).
+    d.Set(d.Find("StaticOnlineModeValue007"), "fontalign", "right");
+}
+
+// ---- The server list in the online menus' own style (the user's pick, phase 0 mock-up B): a copy of
+// Search Session's criteria page (IFOnlineMenuM: label + value column, the focused row's help under its
+// label, scroll arrows) with kServerRows rows whose texts server_ui.cpp sets (and scrolls); B returns to
+// the ONLINE MODE menu. Every name the copied scripts use is renamed to the copy's; the page hides its
+// VOICE CHAT row in its OnLoad, which here hides a spare row.
+constexpr int kServerRows = 8;                                   // server_ui.cpp kRows
+void AddServerListFrame(Doc& d)
+{
+    size_t at = 0;
+    std::vector<Node>& top = d.ListOf("FrameOnline020201-start_search", at);
+    const Node& source = top[at];
+    const std::pair<std::string, std::string> renames[] = {
+        { "MenuOnline020201-start_search", "MenuOnlineServerList" },
+        { "StaticTelopOnline0202", "StaticTelopOnlineSrv" },
+        { "StaticIconOnline0202", "StaticIconOnlineSrv" },
+        { "StaticOnline020200", "StaticOnlineSrv00" },
+        { "MenuOnline0202_icon_L_array", "MenuOnlineSrv_icon_L_array" },
+        { "MenuOnline020201_VoiceChat", "MenuOnlineSrv_VoiceChat" },
+        { "MenuItemOnline020206-voice_chat", "MenuItemOnlineSrvSpare" },
+        { "SelectValueMenuItemOnline020206-voice_chat", "SelectValueOnlineSrvSpare" },
+        { "StaticOnline0202005", "StaticOnlineSrvSpare" },
+        { "MenuItemOnline020201-start_search", "MenuItemOnlineSrv01" },
+        { "MenuItemOnline0202-custom_match", "MenuItemOnline08-server" },
+        { "FrameOnline0201-quick_match", "FrameOnlineMenu" },
+        // the OnTick's key help: the host native adds SERVER INFO / REMOVE in front (menu_ext.cpp)
+        { "WindowPrintKeyInfo", "ServerListKeyInfo" } };
+    auto has = [](const std::string& blob, const std::string& name) {     // an identifier / string entry
+        for (const char tag : { '\x0e', '\x0b' })
+        {
+            std::string pat(1, tag);
+            PutBe32(pat, uint32_t(name.size()));
+            if (blob.find(pat + name) != std::string::npos) return true;
+        }
+        return false;
+    };
+    auto renameAll = [&](std::string& blob) {
+        for (const auto& [from, to] : renames)
+            if (has(blob, from)) XtalRename(blob, from, to);
+    };
+    auto two = [](int i) { return std::string(i < 10 ? "0" : "") + std::to_string(i); };
+    auto child = [&](const char* name) -> const Node& {
+        for (const Node& c : source.children)
+            if (d.Get(c, "name") == name) return c;
+        throw Fail(std::string("no ") + name + " in Search Session");
+    };
+
+    Node frame;
+    frame.index = source.index;
+    frame.text = source.text;
+    frame.attrs = source.attrs;
+    d.Set(frame, "name", "FrameOnlineServerList");
+    for (const Node& c : source.children)
+        if (d.Get(c, "name").empty())                            // the frame's own events
+        {
+            Node e = c;
+            renameAll(e.text);
+            frame.children.push_back(std::move(e));
+        }
+    const Node& menuSource = child("MenuOnline020201-start_search");
+    Node menu;
+    menu.index = menuSource.index;
+    menu.text = menuSource.text;
+    menu.attrs = menuSource.attrs;
+    d.Set(menu, "name", "MenuOnlineServerList");
+    const Node* rowTemplate = nullptr;
+    for (const Node& c : menuSource.children)
+        if (d.Get(c, "name") == "MenuItemOnline020201-start_search") rowTemplate = &c;
+    if (!rowTemplate) throw Fail("no SEARCH row");
+    for (int i = 1; i <= kServerRows + 1; ++i)
+    {
+        Node row;
+        row.index = rowTemplate->index;
+        row.text = rowTemplate->text;
+        row.attrs = rowTemplate->attrs;
+        d.Set(row, "name", i <= kServerRows ? ("MenuItemOnlineSrv" + two(i)).c_str() : "MenuItemOnlineSrvSpare");
+        d.Set(row, "text", "-");
+        d.Set(row, "textid", nullptr);
+        menu.children.push_back(std::move(row));
+    }
+    for (const Node& c : menuSource.children)
+        if (d.Get(c, "name").empty())                            // the menu's events
+        {
+            Node e = c;
+            renameAll(e.text);
+            // OnLoad's icon array (constant 1, "icon_L_01"): one entry per row, as the cursor script
+            // hides the help texts of the rows it holds
+            if (c.index == d.E("OnLoad")) XtalResizeArrays(e.text, { 1 }, kServerRows + 1);
+            menu.children.push_back(std::move(e));
+        }
+    frame.children.push_back(std::move(menu));
+    const Node& valueTemplate = child("SelectValueMenuItemOnline020201");
+    for (int i = 1; i <= kServerRows; ++i)
+    {
+        Node v = valueTemplate;
+        d.Set(v, "name", ("SelectValueOnlineSrv" + two(i)).c_str());
+        frame.children.push_back(std::move(v));
+    }
+    Node spare = child("SelectValueMenuItemOnline020206-voice_chat");
+    d.Set(spare, "name", "SelectValueOnlineSrvSpare");
+    frame.children.push_back(std::move(spare));
+    const Node& descTemplate = child("StaticOnline0202002");
+    for (int i = 1; i <= kServerRows + 1; ++i)
+    {
+        Node h = descTemplate;
+        d.Set(h, "name", i <= kServerRows ? ("StaticOnlineSrv00" + std::to_string(i)).c_str() : "StaticOnlineSrvSpare");
+        d.Set(h, "text", "-");
+        frame.children.push_back(std::move(h));
+    }
+    for (const char* name : { "StaticIconOnline0202", "StaticTelopOnline0202" })
+    {
+        Node s = child(name);
+        std::string n = name;
+        n.replace(n.find("0202"), 4, "Srv");
+        d.Set(s, "name", n.c_str());
+        frame.children.push_back(std::move(s));
+    }
+    top.insert(top.begin() + std::ptrdiff_t(at) + 1, std::move(frame));
+}
+
 } // namespace
 
 std::string ApplyPcEdits(const uint8_t* b, size_t size, const PcLists& lists, std::string* why, std::string* note)
@@ -735,7 +1078,10 @@ std::string ApplyPcEdits(const uint8_t* b, size_t size, const PcLists& lists, st
     {
         if (size < 16 || std::string(reinterpret_cast<const char*>(b), 4) != "BX01") return {};
         const std::string text(reinterpret_cast<const char*>(b), size);
-        if (text.find("FrameMode007-04-01") == std::string::npos || text.find("FrameMainMenu") == std::string::npos) return {};
+        const bool online = lists.serverRow && text.find("FrameOnlineMenu") != std::string::npos &&
+                            text.find("MenuItemOnline07-leaderboard") != std::string::npos;
+        if (!online && (text.find("FrameMode007-04-01") == std::string::npos || text.find("FrameMainMenu") == std::string::npos))
+            return {};
         const uint32_t elemOff = Be32(b, size, 8), attrOff = Be32(b, size, 12);
         if (elemOff > size || attrOff > size || attrOff < elemOff) throw Fail("bad table offsets");
         Doc d;
@@ -744,7 +1090,8 @@ std::string ApplyPcEdits(const uint8_t* b, size_t size, const PcLists& lists, st
         size_t p = 16;
         d.roots = ReadList(b, size, p, 0);
         if (p != elemOff) throw Fail("body does not end at the name tables");
-        Edit(d, lists, note);
+        if (online) { AddServerRow(d); AddServerListFrame(d); AddFriendInvite(d); }
+        else Edit(d, lists, note);
         std::string body;
         WriteList(d.roots, body);
         std::string out(reinterpret_cast<const char*>(b), 8);

@@ -81,6 +81,10 @@ bool TryCloseContentEnumerator(uint32_t handle, uint32_t& status)
 }
 
 // r3=user, r4=device, r5=type, r6=flags, r7=count, r8=&bytes, r9=&handle.
+void RollbackNoteIo(bool frameOnly, const char* op = "", const PPCContext* ctx = nullptr);   // rollback.cpp: no rewind across a save's I/O
+void RollbackSaveOpen(bool open);   // rollback.cpp: a save container opened / closed (rewinds wait for the save)
+int32_t RollbackSaveJournalFrame(); // rollback.cpp: the frame of a save a rewind may still re-simulate, else -1
+
 PPC_FUNC(__imp__XamContentCreateEnumerator)
 {
     KTrace("XamContentCreateEnumerator");
@@ -148,7 +152,7 @@ PPC_FUNC(__imp__XamEnumerate)
 
 // The ninth argument (overlapped) follows the qword in r10 at caller SP+0x54.
 PPC_FUNC(__imp__XamContentCreateEx)
-{
+{ RollbackSaveOpen(true); RollbackNoteIo(false, "XamContentCreateEx");
     KTrace("XamContentCreateEx");
     if (!XamGuestRange(ctx.r1.u32, 0x58) || !OptionalWord(ctx.r7.u32) ||
         !OptionalWord(ctx.r8.u32) || !XamGuestRange(ctx.r4.u32, 1, 1) ||
@@ -163,7 +167,11 @@ PPC_FUNC(__imp__XamContentCreateEx)
     std::memcpy(record.data(),base+ctx.r5.u32,record.size());
     if(ctx.r3.u32!=0)result=XAM_NO_SUCH_USER;
     else if(!ContentRoot(base,ctx.r4.u32,root))result=XAM_INVALID_PARAMETER;
-    else result=SaveCreateContent(root,record,ctx.r6.u32&15,disposition);
+    else {
+        // Online: a save in a frame a rewind may still re-simulate is copied first (save_store.cpp).
+        if(const int32_t frame=RollbackSaveJournalFrame(); frame>=0) SaveJournalCapture(record,frame);
+        result=SaveCreateContent(root,record,ctx.r6.u32&15,disposition);
+    }
     {
         // Record: device id @4, content type @8, display name (UTF-16BE) @12, file name @264.
         char file[43]={};std::memcpy(file,record.data()+264,42);
@@ -171,6 +179,7 @@ PPC_FUNC(__imp__XamContentCreateEx)
                      root.c_str(),file,ctx.r6.u32&15,ctx.r6.u32,result,disposition);
     }
     GWrite32(base,ctx.r7.u32,disposition);
+    if (result != 0) RollbackSaveOpen(false);                  // nothing opened
     ctx.r3.u32 = XamCompleteOverlapped(base, overlapped, result, disposition, HResult(result));
 }
 
@@ -182,10 +191,10 @@ static void ContentCloseOrFlush(PPCContext& ctx,uint8_t* base,bool close)
     std::fprintf(stderr,"[content] %s root=%s -> %u\n",close?"close":"flush",root.c_str(),result);
     ctx.r3.u32=XamCompleteOverlapped(base,ov,result,0,HResult(result));
 }
-PPC_FUNC(__imp__XamContentClose) { KTrace("XamContentClose");ContentCloseOrFlush(ctx,base,true); }
-PPC_FUNC(__imp__XamContentFlush) { KTrace("XamContentFlush");ContentCloseOrFlush(ctx,base,false); }
+PPC_FUNC(__imp__XamContentClose) { KTrace("XamContentClose");RollbackNoteIo(false, "XamContentClose");ContentCloseOrFlush(ctx,base,true);RollbackSaveOpen(false); }
+PPC_FUNC(__imp__XamContentFlush) { KTrace("XamContentFlush");RollbackNoteIo(false, "XamContentFlush");ContentCloseOrFlush(ctx,base,false); }
 PPC_FUNC(__imp__XamContentDelete)
-{
+{ RollbackNoteIo(false, "XamContentDelete");
     KTrace("XamContentDelete");const auto ov=ctx.r5.u32;
     if(uint32_t e=XamValidateOverlapped(base,ov)){ctx.r3.u32=e;return;}
     uint32_t result=XAM_INVALID_PARAMETER;

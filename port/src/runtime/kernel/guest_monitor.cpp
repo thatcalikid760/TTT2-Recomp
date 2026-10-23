@@ -22,6 +22,9 @@
 #include <intrin.h>
 
 bool KernelEventHasWaiters(uint32_t handle);   // kernel_objects.cpp
+void RollbackNoteJobObject(uint32_t addr, uint32_t size);   // rollback.cpp: never rewound
+bool RollbackInResimDraw();                                  // rollback.cpp
+void RollbackResimSkip();
 
 extern "C" PPC_FUNC(__imp__sub_82AE4438);
 PPC_EXTERN_FUNC(sub_82BEE890);   // WaitForSingleObject(handle, ms)
@@ -32,6 +35,11 @@ PPC_EXTERN_FUNC(sub_82BEEF30);   // ReleaseMutex(handle)
 PPC_FUNC(sub_82AE4438)
 {
     const timeline::Scope mark{ timeline::WorkerCounterWait, ctx.r4.u32 };   // TTT2_TIMELINE=1
+    RollbackNoteJobObject(ctx.r3.u32, 0x20);
+    // A rollback's re-simulated frames: the frame kick (sub_82AD1DE8) waits on this monitor, which
+    // moves with the vblank (sub_82AD17A8 ticks it) - MEASURED 15 ms per re-simulated frame. The
+    // command processor discards those frames; nothing to pace.
+    if (ctx.r3.u32 == 0x82F72178u && RollbackInResimDraw()) { RollbackResimSkip(); return; }
     static const bool on = [] { const char* e = std::getenv("TTT2_MONITOR_WAIT"); return !(e && *e == '0'); }();
     if (!on) { __imp__sub_82AE4438(ctx, base); return; }
     const uint32_t monitor = ctx.r3.u32;

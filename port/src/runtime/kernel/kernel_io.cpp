@@ -18,6 +18,9 @@
 #include <vector>
 #include <algorithm>
 
+void RollbackBeforeHostWrite(uint32_t addr, uint32_t size);   // rollback.cpp
+void RollbackNoteIo(bool frameOnly, const char* op = "", const PPCContext* ctx = nullptr);   // rollback.cpp: no rewind across I/O
+
 // Where the extracted disc lives. TTT2_VFS_ROOT overrides it, which is how a tree of
 // EXPANDED archives is selected (26 of the 42 dataNNN.bin are LZX containers on the disc and
 // have to be expanded before the game can read them - see PROJECT_STATUS session 8).
@@ -359,12 +362,13 @@ static void LogSlowIo(const char* what, std::chrono::steady_clock::time_point st
     static std::atomic<int> logged{ 0 };
     if (ms > 5.0 && logged++ < 300) std::fprintf(stderr, "[frame] slow %s %.1f ms (%u bytes) thread %lu\n", what, ms, length, GetCurrentThreadId());
 }
-PPC_FUNC(__imp__NtCreateFile) { KTrace("NtCreateFile"); const auto t = std::chrono::steady_clock::now(); DoOpen(ctx, base,true); LogSlowIo("open", t, 0); }
-PPC_FUNC(__imp__NtOpenFile)   { KTrace("NtOpenFile");   const auto t = std::chrono::steady_clock::now(); DoOpen(ctx, base,false); LogSlowIo("open", t, 0); }
+PPC_FUNC(__imp__NtCreateFile) { KTrace("NtCreateFile"); RollbackNoteIo(true, "NtCreateFile", &ctx); const auto t = std::chrono::steady_clock::now(); DoOpen(ctx, base,true); LogSlowIo("open", t, 0); }
+PPC_FUNC(__imp__NtOpenFile)   { KTrace("NtOpenFile");   RollbackNoteIo(true, "NtOpenFile", &ctx); const auto t = std::chrono::steady_clock::now(); DoOpen(ctx, base,false); LogSlowIo("open", t, 0); }
 
 PPC_FUNC(__imp__NtReadFile)
 {
     KTrace("NtReadFile");
+    RollbackNoteIo(true, "NtReadFile", &ctx);
     // r3=FileHandle, r4=Event, r5=ApcRoutine, r6=ApcContext,
     // r7=IoStatusBlock, r8=Buffer, r9=Length, r10=ByteOffset* (LARGE_INTEGER, optional)
     auto file = GetFile(ctx.r3.u32);
@@ -405,6 +409,7 @@ PPC_FUNC(__imp__NtReadFile)
                 if (status == STATUS_SUCCESS)
                 {
                     PhysPrepareHostAccess(buffer, length);   // ReadFile fails on a guard page
+                    RollbackBeforeHostWrite(buffer, length);   // rollback.cpp: write-protected pages
                     if (!ReadFile(file->handle, base + buffer, length, &read, nullptr))
                         status = FileErrorStatus(GetLastError());
                     else if (read == 0)
@@ -466,6 +471,7 @@ PPC_FUNC(__imp__NtReadFile)
 PPC_FUNC(__imp__NtSetInformationFile)
 {
     KTrace("NtSetInformationFile");
+    RollbackNoteIo(true, "NtSetInformationFile", &ctx);     // seeks by streaming threads are theirs; deletes come from the frame
     // r3=handle, r4=IoStatusBlock, r5=FileInformation, r6=Length, r7=FileInformationClass
     auto file = GetFile(ctx.r3.u32);
     if (!file) { ctx.r3.u32 = IO_STATUS_INVALID_HANDLE; return; }
@@ -634,7 +640,7 @@ PPC_FUNC(__imp__NtQueryFullAttributesFile)
 
 PPC_FUNC(__imp__NtWriteFile)
 {
-    KTrace("NtWriteFile");auto file=GetFile(ctx.r3.u32);
+    KTrace("NtWriteFile");RollbackNoteIo(false, "NtWriteFile", &ctx);auto file=GetFile(ctx.r3.u32);
     if(!file){ctx.r3.u32=IO_STATUS_INVALID_HANDLE;return;}
     if(ctx.r5.u32){ctx.r3.u32=0xC0000002u;return;} // initiating-thread APC delivery unavailable
     const uint32_t ios=ctx.r7.u32,buffer=ctx.r8.u32,length=ctx.r9.u32,offsetPtr=ctx.r10.u32;

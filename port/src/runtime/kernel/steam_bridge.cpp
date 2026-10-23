@@ -2,25 +2,38 @@
 // every controller from the process that initialises SteamAPI as app 480 (Spacewar's controller
 // config then gives the game nothing), while processes Steam has not hooked keep seeing the pads.
 //
-// Start() runs this exe again as `<exe> --steam-bridge` with two anonymous pipes as its stdin and
-// stdout, and its stderr = our log. The helper (RunBridge) runs steam_net.cpp's in-process code
-// and relays. It dies with the game: EOF on its stdin, and a kill-on-close job as a backstop.
+// Start() runs this exe again as `<exe> --steam-bridge <in> <out>` with two anonymous pipes of its
+// own for the frames (their handle values on the command line) and stdout = stderr = our log. The
+// helper (RunBridge) runs steam_net.cpp's in-process code and relays. It dies with the game: EOF on
+// its frame pipe, and a kill-on-close job as a backstop.
+//
+// The frames are not on the helper's stdout (MEASURED 2026-10-23, GitHub #30 / #35, a user's two
+// sessions): right after SteamNetworkingSockets assertions ("..._p2p_ice.cpp (628) : false") the game
+// stopped understanding the helper while it still ran (exit code STILL_ACTIVE) - Steam's libraries
+// print to stdout, which was the frame pipe. And if the helper is lost anyway, a new one is started
+// (Restart below): before, online was gone until the game was restarted ("after a couple matches ...
+// not able to find each other's lobbies anymore").
 //
 // Frames on both pipes: u32 size (type + payload), u8 type, payload; integers little-endian.
 //   game -> helper: SEND u64 peer, u8 reliable, data | PUBLISH u64 session, record |
 //                   REMOVE u64 session | LIST u32 request, i32 max, i32 timeoutMs |
+//                   TICKET u32 request, identity | CANCEL_TICKET u32 handle |
 //                   VOICE_RECORD u8 on | VOICE_PEERS n x u64
 //   helper -> game: READY u8 ok, u64 steamId | RECV u64 peer, u8 reliable, data |
 //                   LIST_RESULT u32 request, u32 n, n x (u32 size, record) | JOIN record |
+//                   TICKET_RESULT u32 request, u32 handle (0 = none), ticket hex |
 //                   VOICE_PCM u64 peer, u32 rate, i16 samples | VOICE_TALK u8 on | VOICE_NAME u64 peer, chars
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <io.h>
 #include "steam_net.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdio>
+#include <exception>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -31,8 +44,10 @@
 namespace steamnet {
 namespace {
 
-enum : uint8_t { kSend = 1, kPublish = 2, kRemove = 3, kList = 4, kVoiceRecord = 5, kVoicePeers = 6,
-                 kReady = 101, kRecv = 102, kListResult = 103, kJoin = 104, kVoicePcm = 105, kVoiceTalk = 106, kVoiceName = 107 };
+enum : uint8_t { kSend = 1, kPublish = 2, kRemove = 3, kList = 4, kTicket = 5, kCancelTicket = 6, kFriends = 7, kInvite = 8,
+                 kVoiceRecord = 9, kVoicePeers = 10,
+                 kReady = 101, kRecv = 102, kListResult = 103, kJoin = 104, kTicketResult = 105, kFriendsResult = 106,
+                 kInviteResult = 107, kVoicePcm = 108, kVoiceTalk = 109, kVoiceName = 110 };
 constexpr uint32_t kMaxFrame = 16u << 20;
 
 void Put32(uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); }
@@ -107,22 +122,75 @@ bool g_voiceRecord = false;
 std::vector<uint64_t> g_voicePeers;
 HANDLE g_in = INVALID_HANDLE_VALUE;             // from the helper
 HANDLE g_helper = nullptr;
+std::atomic<uint32_t> g_generation{ 0 };        // the helper started last; an older one's reader leaves no trace
+std::atomic<bool> g_restarting{ false };        // Restart runs
+std::mutex g_launchMutex;                       // one launch at a time
+std::mutex g_hostedMutex;
+std::map<uint64_t, std::vector<uint8_t>> g_hostedRecords;   // what this game hosts: published again to a new helper
 std::mutex g_mutex;
 std::condition_variable g_cv;
 int g_ready = 0;                                // 0 waiting, 1 Steam up, -1 failed
+bool g_readyFrame = false;                      // the helper reported (READY) - it did not just end
 uint32_t g_nextRequest = 1;
 std::map<uint32_t, std::vector<std::vector<uint8_t>>> g_lists;
+std::map<uint32_t, std::pair<uint32_t, std::string>> g_tickets;   // request -> handle, ticket hex
 std::deque<std::vector<uint8_t>> g_joins;
-// Desired lobby state survives the helper process, whose Steam lobby IDs do not.
-std::mutex g_hostedMutex;
-std::map<uint64_t, std::vector<uint8_t>> g_hostedRecords;
+std::map<uint32_t, std::vector<FriendInfo>> g_friendLists;       // request -> friends
+std::map<uint32_t, bool> g_invites;                              // request -> sent
+std::chrono::steady_clock::time_point g_launched;
 
-void Reader()
+// Why the helper ended (GitHub issue #30: it ended during a match and every later lobby call did nothing).
+const char* ExitMeaning(DWORD code)
+{
+    switch (code)
+    {
+    case 0: return "it exited normally";
+    case 1: return "Steam did not start in it";
+    case 2: return "it had no pipes";
+    case 3: return "abort() in it";
+    case STILL_ACTIVE: return "it is still running but closed its pipe";
+    case 0xC0000005: return "a crash: access violation";
+    case 0xC0000409: return "a crash: fail-fast / stack buffer overrun";
+    case 0x80000003: return "a crash: breakpoint (an assertion)";
+    case 0xC00000FD: return "a crash: stack overflow";
+    case 0xC000001D: return "a crash: illegal instruction";
+    case 0xE06D7363: return "a crash: unhandled C++ exception";
+    case 0xC0000374: return "a crash: heap corruption";
+    case 1067: return "it was ended by another process";
+    default: return "unknown";
+    }
+}
+
+void Restart();
+
+// A frame header that cannot be one: what came instead, in the log (text the helper's libraries printed would
+// show here - the frames have pipes of their own now).
+void ReportBadHeader(HANDLE h, const uint8_t head[5])
+{
+    uint8_t more[64] = {};
+    DWORD got = 0, left = 0;
+    if (PeekNamedPipe(h, nullptr, 0, nullptr, &left, nullptr) && left)
+        ReadFile(h, more, (std::min)(DWORD(sizeof more), left), &got, nullptr);
+    char text[80] = {};
+    size_t n = 0;
+    for (int i = 0; i < 5; ++i) text[n++] = head[i] >= 32 && head[i] < 127 ? char(head[i]) : '.';
+    for (DWORD i = 0; i < got; ++i) text[n++] = more[i] >= 32 && more[i] < 127 ? char(more[i]) : '.';
+    std::fprintf(stderr, "[steam] the helper sent something that is not a frame: \"%s\"\n", text);
+}
+
+void Reader(HANDLE in, uint32_t generation)
 {
     uint8_t type = 0;
     std::vector<uint8_t> p;
-    while (ReadFrame(g_in, type, p))
+    for (;;)
     {
+        uint8_t head[5];
+        if (!ReadAll(in, head, 5)) break;
+        const uint32_t size = Get32(head);
+        if (size == 0 || size > kMaxFrame) { ReportBadHeader(in, head); break; }
+        type = head[4];
+        p.resize(size - 1);
+        if (size > 1 && !ReadAll(in, p.data(), p.size())) break;
         if (type == kRecv && p.size() >= 9)
         {
             if (g_receiver) g_receiver(Get64(p.data()), p[8] != 0, p.data() + 9, p.size() - 9);
@@ -131,6 +199,7 @@ void Reader()
         {
             std::lock_guard l(g_mutex);
             g_ready = p[0] ? 1 : -1;
+            g_readyFrame = true;
             g_local = Get64(p.data() + 1);
             g_cv.notify_all();
         }
@@ -169,26 +238,60 @@ void Reader()
         {
             if (g_voice.name) g_voice.name(Get64(p.data()), std::string(p.begin() + 8, p.end()));
         }
+        else if (type == kFriendsResult && p.size() >= 8)
+        {
+            // u32 request, u32 count, count x (u64 id, u8 in this game, u16 name size, name)
+            std::vector<FriendInfo> list;
+            const uint32_t n = Get32(p.data() + 4);
+            size_t at = 8;
+            for (uint32_t i = 0; i < n && i < 200 && at + 11 <= p.size(); ++i)
+            {
+                FriendInfo f;
+                f.id = Get64(p.data() + at);
+                f.inGame = p[at + 8] != 0;
+                const size_t len = size_t(p[at + 9]) | size_t(p[at + 10]) << 8;
+                at += 11;
+                if (len > 128 || at + len > p.size()) break;
+                f.name.assign(reinterpret_cast<const char*>(p.data() + at), len);
+                at += len;
+                list.push_back(std::move(f));
+            }
+            std::lock_guard l(g_mutex);
+            g_friendLists[Get32(p.data())] = std::move(list);
+            g_cv.notify_all();
+        }
+        else if (type == kInviteResult && p.size() >= 5)
+        {
+            std::lock_guard l(g_mutex);
+            g_invites[Get32(p.data())] = p[4] != 0;
+            g_cv.notify_all();
+        }
+        else if (type == kTicketResult && p.size() >= 8 && p.size() <= 8 + 2 * 2560)
+        {
+            std::lock_guard l(g_mutex);
+            g_tickets[Get32(p.data())] = { Get32(p.data() + 4), std::string(p.begin() + 8, p.end()) };
+            g_cv.notify_all();
+        }
     }
-    const bool wasUp = g_running.load();
-    std::fprintf(stderr, "[steam] helper process ended - Steam online stopped\n");
-    g_running = false;
+    CloseHandle(in);
+    if (generation != g_generation.load()) return;      // a helper replaced meanwhile
+    const bool wasUp = g_running.exchange(false);
     {
         std::lock_guard l(g_mutex);
         if (!g_ready) g_ready = -1;
         g_cv.notify_all();
     }
-    // A helper that was up died mid-session: bring Steam back now (Start() republishes hosted
-    // lobbies), not only on the game's next search or publish - a host just waits and would
-    // otherwise stay invisible. A few tries, backing off; Start() serialises with other callers.
-    if (wasUp)
-        std::thread([] {
-            for (int attempt = 0; attempt < 5 && !g_running; ++attempt)
-            {
-                Sleep(DWORD(2000u << attempt));
-                if (g_running || Start(g_receiver)) break;
-            }
-        }).detach();
+    DWORD code = STILL_ACTIVE;
+    if (g_helper)
+    {
+        WaitForSingleObject(g_helper, 2000);
+        GetExitCodeProcess(g_helper, &code);
+    }
+    if (!wasUp) return;                                 // it never came up: its launch reports that
+    std::fprintf(stderr, "[steam] helper process ended after %.0f s (exit code 0x%08lX: %s) - Steam online stops until a new "
+                 "helper is up\n",
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - g_launched).count(), code, ExitMeaning(code));
+    if (!g_restarting.exchange(true)) std::thread(Restart).detach();
 }
 
 bool Launch()
@@ -201,7 +304,8 @@ bool Launch()
     if (!CreatePipe(&fromChild, &childOut, &sa, 1u << 20)) { CloseHandle(childIn); CloseHandle(toChild); return false; }
     SetHandleInformation(toChild, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(fromChild, HANDLE_FLAG_INHERIT, 0);
-    // The helper logs into our log (file or redirected stderr).
+    // The helper logs into our log (file or redirected stderr) - its stdout too: whatever Steam prints lands there,
+    // never in the frames.
     const HANDLE err = HANDLE(_get_osfhandle(_fileno(stderr)));
     if (err && err != INVALID_HANDLE_VALUE)
         DuplicateHandle(GetCurrentProcess(), err, GetCurrentProcess(), &childErr, 0, TRUE, DUPLICATE_SAME_ACCESS);
@@ -219,11 +323,14 @@ bool Launch()
     STARTUPINFOEXW si = {};
     si.StartupInfo.cb = sizeof si;
     si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    si.StartupInfo.hStdInput = childIn;
-    si.StartupInfo.hStdOutput = childOut;
+    si.StartupInfo.hStdInput = nullptr;
+    si.StartupInfo.hStdOutput = childErr;
     si.StartupInfo.hStdError = childErr;
     if (attrsOk) si.lpAttributeList = attrs;
-    std::wstring line = L"\"" + std::wstring(self) + L"\" --steam-bridge";
+    // The frame pipes' handle values (inherited, the same in the helper).
+    wchar_t pipes[64];
+    std::swprintf(pipes, 64, L" %llX %llX", (unsigned long long)uintptr_t(childIn), (unsigned long long)uintptr_t(childOut));
+    std::wstring line = L"\"" + std::wstring(self) + L"\" --steam-bridge" + pipes;
     PROCESS_INFORMATION pi = {};
     const BOOL created = CreateProcessW(self, line.data(), nullptr, nullptr, TRUE,
                                         CREATE_SUSPENDED | CREATE_NO_WINDOW | (attrsOk ? EXTENDED_STARTUPINFO_PRESENT : 0),
@@ -250,10 +357,103 @@ bool Launch()
     }
     ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
+    g_launched = std::chrono::steady_clock::now();
     g_helper = pi.hProcess;
-    g_out.h = toChild;
+    {
+        std::lock_guard l(g_out.m);
+        g_out.h = toChild;
+    }
     g_in = fromChild;
     return true;
+}
+
+// The last helper's process and pipes go (it is ended if it still runs: two helpers would share the Steam id).
+void DropHelper()
+{
+    {
+        std::lock_guard l(g_out.m);
+        if (g_out.h != INVALID_HANDLE_VALUE) CloseHandle(g_out.h);
+        g_out.h = INVALID_HANDLE_VALUE;
+    }
+    if (g_helper)
+    {
+        if (WaitForSingleObject(g_helper, 0) == WAIT_TIMEOUT)
+        {
+            TerminateProcess(g_helper, 1);
+            WaitForSingleObject(g_helper, 5000);
+        }
+        CloseHandle(g_helper);
+        g_helper = nullptr;
+    }
+    // g_in belongs to the old reader: it ends on its own (EOF) and closes it
+}
+
+// Starts a helper and waits for Steam in it (20 s at most). `why` for the log; false: no Steam now.
+bool LaunchHelper(const char* why)
+{
+    std::lock_guard launch(g_launchMutex);
+    const uint32_t generation = ++g_generation;         // first: the old helper's reader is stale from here on
+    DropHelper();
+    {
+        std::lock_guard l(g_mutex);
+        g_ready = 0;
+        g_readyFrame = false;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint64_t before = g_local.load();
+    if (!Launch()) return false;
+    std::thread(Reader, g_in, generation).detach();
+    {
+        std::unique_lock w(g_mutex);
+        if (!g_cv.wait_for(w, std::chrono::seconds(20), [] { return g_ready != 0; }) || g_ready != 1)
+        {
+            std::fprintf(stderr, "[steam] Steam not available (helper %s)\n",
+                         !g_ready ? "timed out" : g_readyFrame ? "reported no Steam" : "ended before Steam was up");
+            w.unlock();
+            DropHelper();
+            return false;
+        }
+    }
+    if (before && g_local.load() != before)
+        std::fprintf(stderr, "[steam] the new helper's Steam id %016llX is not the one before (%016llX)\n",
+                     (unsigned long long)g_local.load(), (unsigned long long)before);
+    g_running = true;
+    std::fprintf(stderr, "[steam] Steam runs in helper process %lu (Steam id %016llX), %s in %.1f s\n", GetProcessId(g_helper),
+                 (unsigned long long)g_local.load(), why, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    // and our voice state (recording, the session's peers): a new helper starts with none
+    {
+        bool record;
+        std::vector<uint64_t> peers;
+        {
+            std::lock_guard v(g_voiceMutex);
+            record = g_voiceRecord;
+            peers = g_voicePeers;
+        }
+        VoicePeers(peers);
+        VoiceRecord(record);
+    }
+    // the lobbies this game hosts: the old helper's Steam lobbies went with it
+    std::lock_guard h(g_hostedMutex);
+    for (const auto& [session, record] : g_hostedRecords)
+    {
+        uint8_t head[8];
+        Put64(head, session);
+        g_out.Frame(kPublish, head, 8, record.data(), record.size());
+    }
+    if (!g_hostedRecords.empty()) std::fprintf(stderr, "[steam] %zu hosted lobbies published again\n", g_hostedRecords.size());
+    return true;
+}
+
+// The helper was lost while Steam was up: new ones are started, 2 s, then 10, 30, 60 and every 120 s, until one is up.
+void Restart()
+{
+    static const int kDelays[] = { 2, 10, 30, 60, 120 };
+    for (int attempt = 0;; ++attempt)
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(kDelays[(std::min)(attempt, 4)]));
+        if (LaunchHelper("started again")) break;
+    }
+    g_restarting = false;
 }
 
 } // namespace
@@ -270,56 +470,7 @@ bool Start(Receiver receiver)
         return direct::Start(receiver);
     }
     g_receiver = receiver;
-    // The old Reader has exited before it clears g_running. Release the old
-    // pipe/process handles before launching a new helper.
-    {
-        std::lock_guard writeLock(g_out.m);
-        if (g_out.h != INVALID_HANDLE_VALUE) CloseHandle(g_out.h);
-        g_out.h = INVALID_HANDLE_VALUE;
-    }
-    if (g_in != INVALID_HANDLE_VALUE) { CloseHandle(g_in); g_in = INVALID_HANDLE_VALUE; }
-    if (g_helper) { CloseHandle(g_helper); g_helper = nullptr; }
-    {
-        std::lock_guard stateLock(g_mutex);
-        g_ready = 0;
-        g_lists.clear();
-        g_joins.clear();
-    }
-    if (!Launch()) return false;
-    std::thread(Reader).detach();
-    std::unique_lock w(g_mutex);
-    if (!g_cv.wait_for(w, std::chrono::seconds(20), [] { return g_ready != 0; }) || g_ready != 1)
-    {
-        std::fprintf(stderr, "[steam] Steam not available (helper %s)\n", g_ready ? "reported no Steam" : "timed out");
-        if (!g_ready) TerminateProcess(g_helper, 1);
-        return false;
-    }
-    g_running = true;
-    std::fprintf(stderr, "[steam] Steam runs in helper process %lu (Steam id %016llX)\n", GetProcessId(g_helper),
-                 (unsigned long long)g_local.load());
-    // Republish all desired hosted sessions to the newly initialized helper.
-    // Do not hold g_hostedMutex while writing to the helper pipe.
-    std::map<uint64_t, std::vector<uint8_t>> hosted;
-    {
-        std::lock_guard hostedLock(g_hostedMutex);
-        hosted = g_hostedRecords;
-    }
-    for (const auto& [id, record] : hosted)
-    {
-        uint8_t head[8];
-        Put64(head, id);
-        g_out.Frame(kPublish, head, 8, record.data(), record.size());
-    }
-    bool record;
-    std::vector<uint64_t> peers;
-    {
-        std::lock_guard voiceLock(g_voiceMutex);
-        record = g_voiceRecord;
-        peers = g_voicePeers;
-    }
-    VoicePeers(peers);
-    VoiceRecord(record);
-    return true;
+    return LaunchHelper("started");
 }
 
 void VoiceSetHandlers(const VoiceHandlers& handlers)
@@ -354,12 +505,22 @@ void VoicePeers(const std::vector<uint64_t>& peers)
 }
 
 bool Running() { return g_inproc ? direct::Running() : g_running.load(); }
+
+namespace {
+// A call that does nothing because the helper ended (issue #30's "no lobbies after the first match"); a new one is
+// on its way (Restart).
+void NoteStopped(const char* what, std::atomic<int>& logged)
+{
+    if (g_launched != std::chrono::steady_clock::time_point{} && logged.fetch_add(1) < 10)
+        std::fprintf(stderr, "[steam] %s skipped: no helper process right now (a new one is being started)\n", what);
+}
+} // namespace
 uint64_t LocalId() { return g_inproc ? direct::LocalId() : g_local.load(); }
 
 bool Send(uint64_t peer, bool reliable, const void* data, size_t size)
 {
     if (g_inproc) return direct::Send(peer, reliable, data, size);
-    if (!g_running) return false;
+    if (!g_running) { static std::atomic<int> logged{ 0 }; NoteStopped("a packet send", logged); return false; }
     uint8_t head[9];
     Put64(head, peer);
     head[8] = reliable ? 1 : 0;
@@ -371,9 +532,9 @@ void PublishLobby(uint64_t sessionId, const std::vector<uint8_t>& record)
     if (g_inproc) return direct::PublishLobby(sessionId, record);
     {
         std::lock_guard l(g_hostedMutex);
-        g_hostedRecords[sessionId] = record;
+        g_hostedRecords[sessionId] = record;            // a new helper publishes it again
     }
-    if (!g_running && !Start(g_receiver)) return;
+    if (!g_running) { static std::atomic<int> logged{ 0 }; NoteStopped("publishing a hosted lobby", logged); return; }
     uint8_t head[8];
     Put64(head, sessionId);
     g_out.Frame(kPublish, head, 8, record.data(), record.size());
@@ -396,8 +557,7 @@ std::vector<std::vector<uint8_t>> ListLobbies(int max, int timeoutMs)
 {
     if (g_inproc) return direct::ListLobbies(max, timeoutMs);
     std::vector<std::vector<uint8_t>> out;
-    if (!g_running && !Start(g_receiver)) return out;
-    if (!g_running) return out;
+    if (!g_running) { static std::atomic<int> logged{ 0 }; NoteStopped("a lobby search", logged); return out; }
     uint32_t request;
     {
         std::lock_guard l(g_mutex);
@@ -419,6 +579,83 @@ std::vector<std::vector<uint8_t>> ListLobbies(int max, int timeoutMs)
     return out;
 }
 
+bool WebApiTicket(const std::string& identity, std::string& hex, uint32_t& handle, int timeoutMs)
+{
+    if (g_inproc) return direct::WebApiTicket(identity, hex, handle, timeoutMs);
+    if (!g_running || identity.size() > 256) return false;
+    uint32_t request;
+    {
+        std::lock_guard l(g_mutex);
+        request = g_nextRequest++;
+    }
+    std::vector<uint8_t> body(4 + identity.size());
+    Put32(body.data(), request);
+    std::memcpy(body.data() + 4, identity.data(), identity.size());
+    if (!g_out.Frame(kTicket, body.data(), body.size())) return false;
+    std::unique_lock l(g_mutex);
+    g_cv.wait_for(l, std::chrono::milliseconds(timeoutMs + 3000), [&] { return g_tickets.count(request) || !g_running; });
+    const auto it = g_tickets.find(request);
+    if (it == g_tickets.end()) return false;
+    handle = it->second.first;
+    hex = std::move(it->second.second);
+    g_tickets.erase(it);
+    return handle != 0 && !hex.empty();
+}
+
+void CancelTicket(uint32_t handle)
+{
+    if (g_inproc) { direct::CancelTicket(handle); return; }
+    uint8_t body[4];
+    Put32(body, handle);
+    if (g_running && handle) g_out.Frame(kCancelTicket, body, 4);
+}
+
+std::vector<FriendInfo> Friends(int timeoutMs)
+{
+    if (g_inproc) return direct::Friends();
+    if (!g_running) return {};
+    uint32_t request;
+    {
+        std::lock_guard l(g_mutex);
+        request = g_nextRequest++;
+    }
+    uint8_t body[4];
+    Put32(body, request);
+    if (!g_out.Frame(kFriends, body, 4)) return {};
+    std::unique_lock l(g_mutex);
+    g_cv.wait_for(l, std::chrono::milliseconds(timeoutMs), [&] { return g_friendLists.count(request) || !g_running; });
+    std::vector<FriendInfo> out;
+    if (const auto it = g_friendLists.find(request); it != g_friendLists.end())
+    {
+        out = std::move(it->second);
+        g_friendLists.erase(it);
+    }
+    return out;
+}
+
+bool InviteToSession(uint64_t sessionId, uint64_t friendId, int timeoutMs)
+{
+    if (g_inproc) return direct::InviteToSession(sessionId, friendId);
+    if (!g_running) return false;
+    uint32_t request;
+    {
+        std::lock_guard l(g_mutex);
+        request = g_nextRequest++;
+    }
+    uint8_t body[20];
+    Put32(body, request);
+    Put64(body + 4, sessionId);
+    Put64(body + 12, friendId);
+    if (!g_out.Frame(kInvite, body, 20)) return false;
+    std::unique_lock l(g_mutex);
+    g_cv.wait_for(l, std::chrono::milliseconds(timeoutMs), [&] { return g_invites.count(request) || !g_running; });
+    const auto it = g_invites.find(request);
+    if (it == g_invites.end()) return false;
+    const bool sent = it->second;
+    g_invites.erase(it);
+    return sent;
+}
+
 bool TakeJoinRequest(std::vector<uint8_t>& record)
 {
     if (g_inproc) return direct::TakeJoinRequest(record);
@@ -430,18 +667,149 @@ bool TakeJoinRequest(std::vector<uint8_t>& record)
 }
 
 // ---- helper side
-int RunBridge()
+namespace {
+// Crash reports (issue #30): the helper's stderr is the game's log. A crash prints the exception, where
+// it happened (module + offset) and the crashing thread's return addresses; abort(), std::terminate and
+// pure calls say so before the process ends. Faults Steam's own code may catch are logged (5 at most) as
+// first-chance exceptions: if Steam then ends the process itself, they are the clue.
+void ModuleOf(const void* addr, char* out, size_t n, uintptr_t& offset)
+{
+    HMODULE mod = nullptr;
+    offset = uintptr_t(addr);
+    out[0] = 0;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCWSTR>(addr), &mod) && mod)
+    {
+        wchar_t path[MAX_PATH];
+        const DWORD len = GetModuleFileNameW(mod, path, MAX_PATH);
+        const wchar_t* name = path;
+        for (DWORD i = 0; i < len; ++i) if (path[i] == L'\\' || path[i] == L'/') name = path + i + 1;
+        std::snprintf(out, n, "%ls", name);
+        offset = uintptr_t(addr) - uintptr_t(mod);
+    }
+}
+void LogFrames(const char* why)
+{
+    void* frames[32];
+    const USHORT n = CaptureStackBackTrace(0, 32, frames, nullptr);
+    char line[1400];
+    int k = std::snprintf(line, sizeof(line), "[steam-helper]   %s, thread %lu, return addresses:", why, GetCurrentThreadId());
+    for (USHORT i = 0; i < n && k < int(sizeof(line)) - 80; ++i)
+    {
+        char mod[64];
+        uintptr_t off = 0;
+        ModuleOf(frames[i], mod, sizeof(mod), off);
+        k += std::snprintf(line + k, sizeof(line) - k, " %s+%llX", mod[0] ? mod : "?", (unsigned long long)off);
+    }
+    std::fprintf(stderr, "%s\n", line);
+}
+LONG WINAPI CrashFilter(EXCEPTION_POINTERS* e)
+{
+    static std::atomic<bool> once{ false };
+    if (!once.exchange(true))
+    {
+        const EXCEPTION_RECORD* r = e->ExceptionRecord;
+        char mod[64];
+        uintptr_t off = 0;
+        ModuleOf(r->ExceptionAddress, mod, sizeof(mod), off);
+        std::fprintf(stderr, "[steam-helper] crashed: exception 0x%08lX at %s+0x%llX%s\n", r->ExceptionCode, mod[0] ? mod : "?",
+                     (unsigned long long)off,
+                     r->ExceptionCode == 0xC0000005 && r->NumberParameters >= 2 ? (r->ExceptionInformation[0] ? " (writing)" : " (reading)") : "");
+        LogFrames("the crashing thread");
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+LONG CALLBACK FirstChance(EXCEPTION_POINTERS* e)
+{
+    const DWORD code = e->ExceptionRecord->ExceptionCode;
+    if (code != 0xC0000005 && code != 0xC000001D && code != 0xC00000FD && code != 0x80000003 && code != 0xC0000374)
+        return EXCEPTION_CONTINUE_SEARCH;
+    static std::atomic<int> logged{ 0 };
+    if (logged.fetch_add(1) < 5)
+    {
+        char mod[64];
+        uintptr_t off = 0;
+        ModuleOf(e->ExceptionRecord->ExceptionAddress, mod, sizeof(mod), off);
+        std::fprintf(stderr, "[steam-helper] exception 0x%08lX at %s+0x%llX (first chance: a crash only if nothing handles it)\n",
+                     code, mod[0] ? mod : "?", (unsigned long long)off);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+void InstallCrashReports()
+{
+    SetUnhandledExceptionFilter(CrashFilter);
+    static bool once = false;
+    if (once) return;
+    once = true;
+    AddVectoredExceptionHandler(1, FirstChance);
+    std::signal(SIGABRT, [](int) { std::fprintf(stderr, "[steam-helper] abort() called\n"); LogFrames("abort"); });
+    std::set_terminate([] {
+        std::fprintf(stderr, "[steam-helper] std::terminate (an unhandled C++ exception)\n");
+        LogFrames("terminate");
+        std::abort();
+    });
+    _set_purecall_handler([] {
+        std::fprintf(stderr, "[steam-helper] pure virtual call\n");
+        LogFrames("pure call");
+        std::abort();
+    });
+}
+} // namespace
+
+int RunBridge(int argc, char** argv)
 {
     std::setvbuf(stderr, nullptr, _IONBF, 0);
-    const HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    InstallCrashReports();
+    // TTT2_STEAM_HELPER_CRASHTEST=1 (diagnostics): the helper crashes before Steam starts - the crash report
+    // and the game's exit-code line can be checked without Steam.
+    if (const char* e = std::getenv("TTT2_STEAM_HELPER_CRASHTEST"); e && *e == '1')
+    {
+        volatile int* nowhere = nullptr;
+        *nowhere = 1;
+    }
+    // the frame pipes: their handle values from the game (stdout is the log - Steam's libraries print there)
+    HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
     g_out.h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (argc >= 4)
+    {
+        in = HANDLE(uintptr_t(std::strtoull(argv[2], nullptr, 16)));
+        g_out.h = HANDLE(uintptr_t(std::strtoull(argv[3], nullptr, 16)));
+    }
     if (!in || in == INVALID_HANDLE_VALUE || !g_out.h || g_out.h == INVALID_HANDLE_VALUE) return 2;
-    const bool ok = direct::Start([](uint64_t from, bool reliable, const uint8_t* data, size_t size) {
-        uint8_t head[9];
-        Put64(head, from);
-        head[8] = reliable ? 1 : 0;
-        g_out.Frame(kRecv, head, 9, data, size);
-    });
+    // TTT2_STEAM_HELPER_FAKE=1 (tests of the bridge itself - no Steam is touched): READY with a made-up Steam id,
+    // sends dropped, lobbies only logged, searches empty. With it, TTT2_STEAM_HELPER_JUNK_AFTER=<s> prints text to
+    // stdout after s seconds (it must reach the log, not the frames) and TTT2_STEAM_HELPER_EXIT_AFTER=<s> ends the
+    // helper after s seconds (the game must start a new one).
+    const char* fakeEnv = std::getenv("TTT2_STEAM_HELPER_FAKE");
+    const bool fake = fakeEnv && *fakeEnv == '1';
+    constexpr uint64_t kFakeId = 0x0110000100000F0Full;
+    bool ok = false;
+    if (fake)
+    {
+        ok = true;
+        std::fprintf(stderr, "[steam-helper] fake Steam (TTT2_STEAM_HELPER_FAKE=1): no Steam in this helper\n");
+        if (const char* e = std::getenv("TTT2_STEAM_HELPER_JUNK_AFTER"))
+            std::thread([s = std::atoi(e)] {
+                std::this_thread::sleep_for(std::chrono::seconds(s));
+                std::printf("src\\steamnetworkingsockets\\clientlib\\steamnetworkingsockets_p2p_ice.cpp (628) : false\n");
+                std::fflush(stdout);
+                std::fprintf(stderr, "[steam-helper] fake: printed a line to stdout\n");
+            }).detach();
+        if (const char* e = std::getenv("TTT2_STEAM_HELPER_EXIT_AFTER"))
+            std::thread([s = std::atoi(e)] {
+                std::this_thread::sleep_for(std::chrono::seconds(s));
+                std::fprintf(stderr, "[steam-helper] fake: ending the helper\n");
+                ExitProcess(9);
+            }).detach();
+    }
+    else
+        ok = direct::Start([](uint64_t from, bool reliable, const uint8_t* data, size_t size) {
+            uint8_t head[9];
+            Put64(head, from);
+            head[8] = reliable ? 1 : 0;
+            g_out.Frame(kRecv, head, 9, data, size);
+        });
+    InstallCrashReports();                          // again: Steam may have put its own filter in
     VoiceHandlers voice;
     voice.pcm = [](uint64_t peer, const int16_t* samples, size_t count, uint32_t rate) {
         uint8_t head[12];
@@ -457,7 +825,7 @@ int RunBridge()
     };
     direct::VoiceSetHandlers(voice);
     uint8_t ready[9] = { uint8_t(ok ? 1 : 0) };
-    Put64(ready + 1, ok ? direct::LocalId() : 0);
+    Put64(ready + 1, ok ? (fake ? kFakeId : direct::LocalId()) : 0);
     g_out.Frame(kReady, ready, 9);
     if (!ok) return 1;
     std::thread([] {
@@ -475,7 +843,10 @@ int RunBridge()
         if (type == kSend && p.size() >= 9)
             direct::Send(Get64(p.data()), p[8] != 0, p.data() + 9, p.size() - 9);
         else if (type == kPublish && p.size() >= 8)
+        {
+            if (fake) std::fprintf(stderr, "[steam-helper] fake: lobby of session %016llX published\n", (unsigned long long)Get64(p.data()));
             direct::PublishLobby(Get64(p.data()), std::vector<uint8_t>(p.begin() + 8, p.end()));
+        }
         else if (type == kRemove && p.size() >= 8)
             direct::RemoveLobby(Get64(p.data()));
         else if (type == kVoiceRecord && p.size() >= 1)
@@ -485,6 +856,49 @@ int RunBridge()
             std::vector<uint64_t> peers(p.size() / 8);
             for (size_t i = 0; i < peers.size(); ++i) peers[i] = Get64(p.data() + i * 8);
             direct::VoicePeers(peers);
+        }
+        else if (type == kTicket && p.size() >= 4 && p.size() <= 4 + 256)
+        {
+            const uint32_t request = Get32(p.data());
+            std::string identity(p.begin() + 4, p.end());
+            std::thread([request, identity] {
+                std::string hex;
+                uint32_t handle = 0;
+                if (!direct::WebApiTicket(identity, hex, handle, 10000)) handle = 0, hex.clear();
+                std::vector<uint8_t> body(8 + hex.size());
+                Put32(body.data(), request);
+                Put32(body.data() + 4, handle);
+                if (!hex.empty()) std::memcpy(body.data() + 8, hex.data(), hex.size());
+                g_out.Frame(kTicketResult, body.data(), body.size());
+            }).detach();
+        }
+        else if (type == kCancelTicket && p.size() >= 4)
+            direct::CancelTicket(Get32(p.data()));
+        else if (type == kFriends && p.size() >= 4)
+        {
+            const uint32_t request = Get32(p.data());
+            std::vector<uint8_t> body(8);
+            Put32(body.data(), request);
+            const std::vector<FriendInfo> list = direct::Friends();
+            Put32(body.data() + 4, uint32_t(list.size()));
+            for (const FriendInfo& f : list)
+            {
+                const size_t len = (std::min)(f.name.size(), size_t(128)), at = body.size();
+                body.resize(at + 11 + len);
+                Put64(body.data() + at, f.id);
+                body[at + 8] = f.inGame ? 1 : 0;
+                body[at + 9] = uint8_t(len);
+                body[at + 10] = uint8_t(len >> 8);
+                if (len) std::memcpy(body.data() + at + 11, f.name.data(), len);
+            }
+            g_out.Frame(kFriendsResult, body.data(), body.size());
+        }
+        else if (type == kInvite && p.size() >= 20)
+        {
+            uint8_t body[5];
+            Put32(body, Get32(p.data()));
+            body[4] = direct::InviteToSession(Get64(p.data() + 4), Get64(p.data() + 12)) ? 1 : 0;
+            g_out.Frame(kInviteResult, body, 5);
         }
         else if (type == kList && p.size() >= 12)
         {
@@ -507,6 +921,7 @@ int RunBridge()
         }
     }
     // The game closed its end (it exited or crashed): Steam leaves the lobbies with this process.
+    std::fprintf(stderr, "[steam-helper] the game closed its pipe - the helper exits\n");
     return 0;
 }
 

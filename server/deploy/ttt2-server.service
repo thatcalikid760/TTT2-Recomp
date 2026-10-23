@@ -1,0 +1,48 @@
+# systemd unit for ttt2-server (server/README.md "Linux service"). Install:
+#   sudo useradd --system --home /opt/ttt2-server ttt2
+#   sudo mkdir -p /opt/ttt2-server/data && sudo cp ttt2-server /opt/ttt2-server/
+#   sudo -u ttt2 /opt/ttt2-server/ttt2-server -config /opt/ttt2-server/server.toml   (writes server.toml; edit it)
+#   sudo chown -R ttt2:ttt2 /opt/ttt2-server && sudo chmod 600 /opt/ttt2-server/server.toml
+#   sudo cp ttt2-server.service /etc/systemd/system/ && sudo systemctl enable --now ttt2-server
+#   sudo install -m 755 ttt2admin /usr/local/bin/ttt2admin   (then: ttt2admin players)
+# Logs: journalctl -u ttt2-server. Reload server.toml (name, MOTD, news, limits, admin panel): systemctl reload ttt2-server.
+# Admin commands (players, kick, ban, bans, matches, ...; help lists them), through the loopback admin port:
+#   ttt2admin <command>   (the same as: sudo -u ttt2 /opt/ttt2-server/ttt2-server -config /opt/ttt2-server/server.toml admin <command>)
+#   e.g. ttt2admin kick <name> 30 griefing / ttt2admin ban <steam id> 7 cheating / ttt2admin bans / ttt2admin matches
+# Web admin panel (off by default; README.md "Admin panel"): ttt2admin panel-setup (the login, shown once), then
+#   admin_panel = true in server.toml and systemctl reload ttt2-server; open TCP 28201 (admin_panel_port) in the
+#   firewall for your own address only, if you can.
+[Unit]
+Description=TTT2 community server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ttt2
+Group=ttt2
+WorkingDirectory=/opt/ttt2-server
+ExecStart=/opt/ttt2-server/ttt2-server -config /opt/ttt2-server/server.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/ttt2-server
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+MemoryMax=1G
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

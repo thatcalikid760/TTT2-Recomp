@@ -1,4 +1,5 @@
 #include "guest_heap.h"
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 
@@ -40,8 +41,11 @@ GuestHeap::Block* GuestHeap::firstFit(size_t need)
     return nullptr;
 }
 
+std::atomic<uint64_t> g_guestHeapOps{ 0 };   // allocations + frees (rollback.cpp measures them per frame)
+
 void* GuestHeap::Alloc(size_t size, size_t alignment)
 {
+    g_guestHeapOps.fetch_add(1, std::memory_order_relaxed);
     if (alignment < 16) alignment = 16;
     std::lock_guard lock(m_mutex);
 
@@ -124,6 +128,7 @@ static void ReportForeign(const char* what, void* ptr)
 void GuestHeap::Free(void* ptr)
 {
     if (!ptr) return;
+    g_guestHeapOps.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard lock(m_mutex);
     Block* b = resolve(ptr);
     if (!b) { ReportForeign("free", ptr); return; }

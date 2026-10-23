@@ -2,6 +2,7 @@
 // Opt-in, isolated large YUV draw offload. Include after Vertex and Surface in
 // gpu_render.cpp, under TTT2_D3D11_MOVIE_BACKEND. Everything else keeps using the
 // software renderer. CPU EDRAM is committed only after successful GPU readback.
+#include "gpu_adapter.h"
 #include "gpu_shader_subset.h"
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -87,7 +88,13 @@ struct Backend {
         // A failed initialization is discarded as a whole by the caller; a
         // half-initialized device can never be used on the next draw.
         D3D_FEATURE_LEVEL actual;const D3D_FEATURE_LEVEL levels[]={D3D_FEATURE_LEVEL_11_1,D3D_FEATURE_LEVEL_11_0};
-        Check(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,levels,2,D3D11_SDK_VERSION,&device,&actual,&context),"D3D11CreateDevice");
+        // The same GPU as the renderer (gpu_adapter.h).
+        const Microsoft::WRL::ComPtr<IDXGIAdapter1> preferred = PreferredGpuAdapter();
+        HRESULT created = D3D11CreateDevice(preferred.Get(), preferred ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels, 2,
+                                            D3D11_SDK_VERSION, &device, &actual, &context);
+        if (FAILED(created) && preferred)
+            created = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels, 2, D3D11_SDK_VERSION, &device, &actual, &context);
+        Check(created, "D3D11CreateDevice");
         auto code=Compile("struct V{float4 p:POSITION;float4 a[16]:TEXCOORD0;};struct O{float4 p:SV_Position;float4 a[16]:TEXCOORD0;};O main(V v){O o;o.p=v.p;[unroll]for(int i=0;i<16;++i)o.a[i]=v.a[i];return o;}","vs_5_0");
         Check(device->CreateVertexShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&vs),"CreateVertexShader");
         D3D11_INPUT_ELEMENT_DESC elements[17]{};elements[0]={"POSITION",0,DXGI_FORMAT_R32G32B32A32_FLOAT,0,0,D3D11_INPUT_PER_VERTEX_DATA,0};

@@ -24,7 +24,9 @@ inline bool KTraceOn()
     return on != 0;
 }
 
+void RollbackImportNote(const char* name);   // kernel/rollback.cpp: the online tasks' imports (diagnostics)
 inline void KTrace(const char* name)
 {
     if (KTraceOn()) std::fprintf(stderr, "[k] %s\n", name);
+    RollbackImportNote(name);
 }

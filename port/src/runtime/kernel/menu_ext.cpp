@@ -23,6 +23,9 @@
 #include "sys_ui.h"
 #include "profiles.h"
 #include "keyboard_keys.h"
+#include "menu_host.h"
+#include "server_ui.h"
+#include "gin_service.h"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -41,6 +44,7 @@
 #include "button_prompts.h"
 
 extern "C" PPC_FUNC(__imp__sub_82346060);
+extern "C" PPC_FUNC(__imp__sub_826002C8);
 extern "C" PPC_FUNC(__imp__sub_82A8C170);
 extern "C" PPC_FUNC(__imp__sub_823756A8);
 extern "C" PPC_FUNC(__imp__sub_8256CD28);
@@ -51,6 +55,8 @@ extern "C" PPC_FUNC(__imp__sub_8241B9D0);
 extern "C" PPC_FUNC(__imp__sub_8256C708);
 extern "C" PPC_FUNC(__imp__sub_82374700);
 extern "C" PPC_FUNC(__imp__sub_823747C0);
+extern "C" PPC_FUNC(__imp__sub_8241F988);
+extern "C" PPC_FUNC(__imp__sub_8241B588);
 extern void (*g_uiFrameHook)(PPCContext& ctx, uint8_t* base);
 void XamNotifyEnqueueEvent(uint32_t id, uint32_t param);
 
@@ -228,7 +234,8 @@ namespace sysui {
 
 enum class Screen { None, Profiles, Name, Graphics, Voice, Update };
 constexpr int kRows = 9;
-constexpr uint16_t kUp = 0x0001, kDown = 0x0002, kLeft = 0x0004, kRight = 0x0008, kStart = 0x0010, kA = 0x1000, kB = 0x2000;
+constexpr uint16_t kUp = 0x0001, kDown = 0x0002, kLeft = 0x0004, kRight = 0x0008, kStart = 0x0010, kA = 0x1000, kB = 0x2000,
+                   kY = 0x8000;
 constexpr uint32_t kNameTextId = 0x7F02;              // the name dialog's message (text lookup hook)
 
 struct Row { std::string label, value, help; };
@@ -267,6 +274,7 @@ constexpr uint32_t kBoxTextId = 0x7F03;
 enum class BoxStyle { Information, Confirmation, List };
 std::mutex g_boxMutex;
 std::vector<SysUiMessageBox> g_boxQueue;
+std::vector<SysUiTextBox> g_textQueue;      // text boxes (SysUiShowTextBox) waiting
 struct BoxState
 {
     bool showing = false, releasing = false;
@@ -274,8 +282,12 @@ struct BoxState
     BoxStyle style = BoxStyle::Information;
     int cursor = 0;
     uint16_t prev = 0;
+    bool typing = false;                    // the box is a text box: `edit` and its note
+    SysUiTextBox edit;
+    std::string note;
+    int upFrames = 0, goneFrames = 0;       // frames on screen; frames in a row the game's window was closed
 } g_box;
-std::atomic<bool> g_boxOwns{ false };
+std::atomic<bool> g_boxOwns{ false }, g_boxDismiss{ false };
 uint32_t g_boxText = 0;
 std::atomic<uint32_t> g_boxBlock{ 0 }, g_boxFont{ 0 }, g_boxSize{ 0 };
 std::mutex g_labelMutex;
@@ -313,7 +325,7 @@ void BuildProfiles(Ui& ui)
 {
     ui.rows.clear();
     for (const profiles::Profile& p : profiles::List())
-        ui.rows.push_back({ p.name, "", "Play as " + p.name + "." });
+        ui.rows.push_back({ p.name, "", "Play as " + p.name + ". Y: rename." });
     if (ui.rows.size() < profiles::kMaxProfiles)
         ui.rows.push_back({ "CREATE NEW PROFILE", "", "Make a new profile with its own save data." });
 }
@@ -386,7 +398,7 @@ void HideDialog(PPCContext& ctx, uint8_t* base)
 // More rows than the frame's 9 scroll (Draw).
 enum GraphicsRow
 {
-    kPreset, kVsync, kRenderScale, kUpscaler, kFsrMode, kAntiAliasing, kFiltering, kSharpen, kMotionBlur, kBrightness, kFps,
+    kPreset, kVsync, kRenderScale, kUpscaler, kFsrMode, kAntiAliasing, kFiltering, kSharpen, kMotionBlur, kShadows, kBrightness, kFps,
     kDefault, kGraphicsRows
 };
 void BuildGraphics(Ui& ui)
@@ -414,6 +426,7 @@ void BuildGraphics(Ui& ui)
           "Anisotropic filtering keeps floors and walls sharp at an angle." },
         { "SHARPENING", sharpen[g.sharpen], g.upscaler ? "Sharpen the final image (FSR 1's RCAS when it enlarges)." : "Sharpen the final image." },
         { "MOTION BLUR", g.motionBlur ? "ON" : "OFF", "The game's blur on fast moves. OFF keeps every frame crisp." },
+        { "SHADOWS", g.shadows ? "ON" : "OFF", "OFF: fighters and stage objects cast no shadows. Lighter on the GPU." },
         { "BRIGHTNESS", std::to_string(g.brightness), "Adjust the brightness of the picture." },
         { "FPS COUNTER", g.fpsCounter ? "ON" : "OFF", "Show frames per second in the corner. The game runs at a fixed 60." },
         { "DEFAULT", "", "Reset to default settings." },
@@ -440,6 +453,7 @@ void ChangeGraphics(int row, int dir)
     case kFiltering: g.anisotropy = step(g.anisotropy, int(display_settings::Anisotropies().size())); break;
     case kSharpen: g.sharpen = step(g.sharpen, 4); break;
     case kMotionBlur: g.motionBlur = !g.motionBlur; break;
+    case kShadows: g.shadows = !g.shadows; break;
     case kBrightness: g.brightness = std::clamp(g.brightness + dir, 0, 10); break;
     case kFps: g.fpsCounter = !g.fpsCounter; break;
     case kDefault: if (dir > 0) g = {}; break;
@@ -760,6 +774,13 @@ std::string Upper(std::string s)
 }
 std::string BoxMessage(const BoxState& b)
 {
+    if (b.typing)
+    {
+        // the text with a cursor; a long one shows its end (the window is about 44 characters wide)
+        std::string shown = b.edit.masked ? std::string(b.edit.text.size(), '*') : b.edit.text;
+        if (shown.size() > 40) shown = "..." + shown.substr(shown.size() - 37);
+        return b.edit.prompt + "\n\n" + shown + "_\n\n" + (b.note.empty() ? b.edit.hint : b.note);
+    }
     if (b.style != BoxStyle::List) return b.box.text;
     std::string m = b.box.text + "\n";
     for (size_t i = 0; i < b.box.buttons.size(); ++i)
@@ -789,7 +810,9 @@ void ShowBox(PPCContext& ctx, uint8_t* base, const BoxState& b)
         GuestFrame frame(ctx, base, 0x100);
         ctx.r3.u64 = 0;
         ctx.r4.u64 = kBoxTextId;
-        ctx.r5.u64 = 1;                               // information: the A button's label
+        // the window's label set: 1 = the A button's label (information); 0 = OK / CANCEL (texts 0x3D8 / 0x3DC,
+        // replaced by the box's labels - with 1 a confirmation's second button reads BACK, MEASURED 2026-10-21)
+        ctx.r5.u64 = b.style == BoxStyle::Confirmation ? 0 : 1;
         if (b.style == BoxStyle::Confirmation) sub_8241FAF0(ctx, base);   // lib::WindowShowConfirmation
         else sub_8241FB70(ctx, base);                                    // lib::WindowShowInformation
     }
@@ -808,12 +831,99 @@ void UpdateBox(PPCContext& ctx, uint8_t* base, const BoxState& b)
     ctx.r6.u64 = g_boxText;
     sub_8241B9D0(ctx, base);                          // the window lays its message out again
 }
+// CTRL+V in a text box: the clipboard's first line (ASCII; the box keeps the characters it takes).
+std::string ClipboardText()
+{
+    std::string out;
+    if (!OpenClipboard(nullptr)) return out;
+    if (HANDLE h = GetClipboardData(CF_UNICODETEXT))
+        if (const auto* w = static_cast<const wchar_t*>(GlobalLock(h)))
+        {
+            for (size_t i = 0; w[i] && w[i] != L'\r' && w[i] != L'\n' && out.size() < 512; ++i)
+                if (w[i] >= 0x20 && w[i] < 0x7F) out.push_back(char(w[i]));
+            GlobalUnlock(h);
+        }
+    CloseClipboard();
+    return out;
+}
+
+// A text box on screen: typed characters edit the text, ENTER / A / START confirm (after `check`), ESC / B cancel.
+void TypeFrame(PPCContext& ctx, uint8_t* base, BoxState& b, uint16_t pressed)
+{
+    std::vector<uint32_t> chars;
+    {
+        std::lock_guard l(g_charMutex);
+        chars.swap(g_chars);
+    }
+    bool changed = false;
+    int answer = -1;                                     // 0 confirm, 1 cancel
+    auto add = [&](uint32_t c) {
+        const bool alnum = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+        if (!alnum && (c < 0x20 || c >= 0x7F || b.edit.allowed.find(char(c)) == std::string::npos)) return;
+        if (b.edit.text.size() >= b.edit.maxLength) { b.note = "No more characters fit."; changed = true; return; }
+        b.edit.text.push_back(char(c));
+        b.note.clear();
+        changed = true;
+    };
+    for (const uint32_t c : chars)
+    {
+        if (c == '\r') { answer = 0; break; }
+        if (c == 0x1B) { answer = 1; break; }
+        if (c == '\b')
+        {
+            if (!b.edit.text.empty()) b.edit.text.pop_back();
+            b.note.clear();
+            changed = true;
+        }
+        else if (c == 0x16)                              // CTRL+V
+            for (const char p : ClipboardText()) add(uint8_t(p));
+        else add(c);
+    }
+    if (answer < 0) answer = (pressed & (kA | kStart)) ? 0 : (pressed & kB) ? 1 : -1;
+    if (answer == 0 && b.edit.check)
+    {
+        const std::string why = b.edit.check(b.edit.text);
+        if (!why.empty())
+        {
+            b.note = why;
+            MenuSound(ctx, base, kSoundCancel);
+            UpdateBox(ctx, base, b);
+            return;
+        }
+    }
+    if (answer < 0)
+    {
+        if (changed) UpdateBox(ctx, base, b);
+        return;
+    }
+    MenuSound(ctx, base, answer == 0 ? kSoundDecide : kSoundCancel);
+    HideDialog(ctx, base);
+    b.showing = false;
+    b.releasing = true;
+    b.typing = false;
+    g_textEntry = false;
+    std::fprintf(stderr, "[sys-ui] text box %s\n", answer == 0 ? "confirmed" : "cancelled");   // never the text
+    const std::function<void(bool, const std::string&)> done = std::move(b.edit.done);
+    const std::string text = std::move(b.edit.text);
+    b.edit = SysUiTextBox{};
+    if (done) done(answer == 0, text);
+}
+
 void BoxFrame(PPCContext& ctx, uint8_t* base)
 {
     BoxState& b = g_box;
     const uint16_t now = HostControllerButtons();
     const uint16_t pressed = now & ~b.prev;
     b.prev = now;
+    if (g_boxDismiss.exchange(false) && b.showing)
+    {
+        HideDialog(ctx, base);
+        b.showing = false;
+        b.releasing = true;
+        if (b.typing) { b.typing = false; b.edit = SysUiTextBox{}; g_textEntry = false; }
+        std::fprintf(stderr, "[sys-ui] message box closed\n");
+        return;
+    }
     if (b.releasing)
     {
         if (now == 0) { b.releasing = false; g_boxOwns = false; }   // the answer's press stays ours
@@ -823,17 +933,59 @@ void BoxFrame(PPCContext& ctx, uint8_t* base)
     {
         {
             std::lock_guard l(g_boxMutex);
-            if (g_boxQueue.empty()) return;
-            b.box = std::move(g_boxQueue.front());
-            g_boxQueue.clear();
+            if (!g_textQueue.empty())
+            {
+                b.edit = std::move(g_textQueue.front());
+                g_textQueue.clear();
+                b.typing = true;
+            }
+            else if (!g_boxQueue.empty())
+            {
+                b.box = std::move(g_boxQueue.front());
+                g_boxQueue.clear();
+                b.typing = false;
+            }
+            else return;
+        }
+        if (b.typing)
+        {
+            b.box = SysUiMessageBox{};
+            b.box.buttons = { "OK", "CANCEL" };
+            b.box.cancel = 1;
+            b.note.clear();
+            {
+                std::lock_guard l(g_charMutex);
+                g_chars.clear();
+            }
+            g_textEntry = true;
         }
         const size_t n = b.box.buttons.size();
         const bool shortLabels = n == 2 && b.box.buttons[0].size() <= 8 && b.box.buttons[1].size() <= 8;
         b.style = n == 1 ? BoxStyle::Information : shortLabels ? BoxStyle::Confirmation : BoxStyle::List;
         b.cursor = std::clamp(b.box.active, 0, int(n) - 1);
         b.showing = true;
+        b.upFrames = b.goneFrames = 0;
         g_boxOwns = true;
         ShowBox(ctx, base, b);
+        return;
+    }
+    // The box holds the controller, so it must stay on screen: if the game closed its window (a window of the game's
+    // own opened over it and went), it is shown again. Never an unseen box the next press answers (server_ui.cpp,
+    // 2026-10-23).
+    if (++b.upFrames > 30)
+    {
+        b.goneFrames = menu_host::WindowShowing(ctx, base) ? 0 : b.goneFrames + 1;
+        if (b.goneFrames >= 10)
+        {
+            std::fprintf(stderr, "[sys-ui] the %s was off the screen - shown again\n", b.typing ? "text box" : "message box");
+            b.upFrames = b.goneFrames = 0;
+            ShowBox(ctx, base, b);
+            return;
+        }
+    }
+    if (b.typing)
+    {
+        TypeFrame(ctx, base, b, pressed);
         return;
     }
     int choice = -1;
@@ -1249,6 +1401,8 @@ void Frame(PPCContext& ctx, uint8_t* base)
     KeyboardFrame(ctx, base);
     VoicePanelFrame(ctx, base);
     Ui& ui = g_ui;
+    // A text box over Select Profile (a rename): it takes the typed characters and the controller until it closes.
+    if (ui.screen == Screen::Profiles && SysUiBoxBusy()) { Pressed(ui); return; }
     const uint16_t pressed = Pressed(ui);
     if (ui.releasing)
     {
@@ -1425,6 +1579,42 @@ void Frame(PPCContext& ctx, uint8_t* base)
         {
             MenuSound(ctx, base, kSoundCancel);
             Close(ctx, base, ui, false);                 // stays on the logo, signed out
+            return;
+        }
+        if ((pressed & kY) && ui.cursor < int(profiles::List().size()))
+        {
+            // Rename: the game's confirmation window with the name to edit (a PC keyboard types it, as for a new
+            // profile). Nobody is signed in on this screen, so no gamertag the game holds goes stale; the save
+            // folder goes by the profile's XUID, which stays.
+            const int index = ui.cursor;
+            SysUiTextBox box;
+            box.prompt = "New name for this profile.";
+            box.text = profiles::List()[size_t(index)].name;
+            box.hint = "Letters, digits and spaces - at most 15.";
+            box.allowed = " ";
+            box.maxLength = profiles::kMaxName;
+            box.check = [index](const std::string& text) -> std::string {
+                const std::string name = profiles::Normalize(text);
+                if (!profiles::ValidName(name)) return "Use letters, digits and spaces.";
+                const std::vector<profiles::Profile> list = profiles::List();
+                for (size_t i = 0; i < list.size(); ++i)
+                {
+                    std::string a = list[i].name, b = name;
+                    for (char& c : a) c = char(std::toupper(static_cast<unsigned char>(c)));
+                    for (char& c : b) c = char(std::toupper(static_cast<unsigned char>(c)));
+                    if (int(i) != index && a == b) return "That name is already used.";
+                }
+                return "";
+            };
+            box.done = [index](bool ok, const std::string& text) {
+                if (!ok) return;
+                if (profiles::Rename(index, text) == 0)
+                {
+                    BuildProfiles(g_ui);
+                    g_ui.shown.clear();                  // the rows are written again
+                }
+            };
+            if (SysUiShowTextBox(std::move(box))) MenuSound(ctx, base, kSoundDecide);
             return;
         }
         Draw(ctx, base, ui);
@@ -1750,25 +1940,115 @@ void Frame(PPCContext& ctx, uint8_t* base)
 
 } // namespace keyui
 
+std::atomic<uint32_t> g_frameCount{ 0 };
+
+} // namespace
+
+// ---- menu_host.h: the calls the port's other screens (server_ui.cpp) make
+namespace menu_host {
+std::string CurrentFrame(PPCContext& ctx, uint8_t* base) { return keyui::CurrentFrame(ctx, base); }
+void SetText(PPCContext& ctx, uint8_t* base, const std::string& widget, const std::string& text) { MenuSetText(ctx, base, widget, text); }
+void SetVisible(PPCContext& ctx, uint8_t* base, const std::string& widget, bool visible)
+{
+    GuestFrame frame(ctx, base, 0x100);
+    ctx.r3.u64 = visible ? 1 : 0;
+    ctx.r4.u64 = GuestStr(base, widget);
+    sub_8256C5A0(ctx, base);                              // lib::MenuSetVisible(bool, widget)
+}
+void SetFocusable(PPCContext& ctx, uint8_t* base, const std::string& widget, bool focusable)
+{
+    GuestFrame frame(ctx, base, 0x100);
+    ctx.r3.u64 = focusable ? 1 : 0;
+    ctx.r4.u64 = GuestStr(base, widget);
+    sub_8256C638(ctx, base);                              // lib::MenuSetFocusable(bool, widget)
+}
+void MovieVisible(PPCContext& ctx, uint8_t* base, const std::string& movie, bool visible) { MenuMovieVisible(ctx, base, movie, visible); }
+int Cursor(PPCContext& ctx, uint8_t* base, const std::string& menu) { return keyui::MenuCursor(ctx, base, menu); }
+void PlaySound(PPCContext& ctx, uint8_t* base, Sound sound) { MenuSound(ctx, base, sound); }
+bool WindowShowing(PPCContext& ctx, uint8_t* base)
+{
+    GuestFrame frame(ctx, base, 0x100);
+    sub_8241E828(ctx, base);                              // lib::WindowIsShowing
+    return (ctx.r3.u32 & 0xFF) != 0;
+}
+void KeyHint(PPCContext& ctx, uint8_t* base, uint32_t key, const std::string& text)
+{
+    // a text as the window's hints take them (the game passes its text table's entries): length byte in front
+    static std::map<std::string, uint32_t> pool;
+    auto it = pool.find(text);
+    if (it == pool.end()) it = pool.emplace(text, TableText(base, text.c_str())).first;
+    GuestFrame frame(ctx, base, 0x100);
+    ctx.r3.u64 = key;
+    ctx.r4.u64 = it->second;
+    sub_8241FAB8(ctx, base);                              // lib::WindowPrintKeyInfoText(key, text)
+}
+uint32_t FrameCount() { return g_frameCount.load(); }
+} // namespace menu_host
+
+namespace {
+
 // Runs on the game's main thread once per frame (end of VdSwap, registers restored after): the
-// system UI, and a diagnostics trigger - C:/ttt2/port/ui.trigger holding a frame name switches
-// the menu to that frame.
+// system UI, and a diagnostics trigger - C:/ttt2/port/ui.trigger, one command per line: a frame name
+// switches the menu to that frame, "text <widget>=<text>" sets a widget's text ("\\n" = new line),
+// "cursor <menu>=<index>" moves a menu's cursor, "movie <name>=0|1" hides / shows a menu movie,
+// "telop <widget>" aims the bottom bar, "box <text>|<button>|<button>" shows a message box (UI mock-ups).
 void UiFrame(PPCContext& ctx, uint8_t* base)
 {
+    g_frameCount.fetch_add(1);
     sysui::Frame(ctx, base);
     keyui::Frame(ctx, base);
+    server_ui::Frame(ctx, base);
     static uint32_t tick = 0;
     if (++tick % 30) return;
     FILE* f = std::fopen("C:/ttt2/port/ui.trigger", "rb");
     if (!f) return;
-    char name[128] = {};
-    const size_t n = std::fread(name, 1, sizeof(name) - 1, f);
+    std::string text;
+    char chunk[4096];
+    for (size_t n; (n = std::fread(chunk, 1, sizeof(chunk), f)) > 0 && text.size() < 65536;) text.append(chunk, n);
     std::fclose(f);
     DeleteFileA("C:/ttt2/port/ui.trigger");
-    name[n] = 0;
-    for (char* p = name; *p; ++p) if (*p == '\r' || *p == '\n') { *p = 0; break; }
-    std::fprintf(stderr, "[menu-ext] ui trigger: '%s'\n", name);
-    if (*name) SwitchFrame(ctx, base, name);
+    for (size_t at = 0; at < text.size();)
+    {
+        size_t end = text.find('\n', at);
+        if (end == std::string::npos) end = text.size();
+        std::string line = text.substr(at, end - at);
+        at = end + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        std::fprintf(stderr, "[menu-ext] ui trigger: '%s'\n", line.c_str());
+        const size_t eq = line.find('=');
+        if (line.rfind("text ", 0) == 0 && eq != std::string::npos)
+        {
+            std::string value = line.substr(eq + 1);
+            for (size_t p; (p = value.find("\\n")) != std::string::npos;) value.replace(p, 2, "\n");
+            MenuSetText(ctx, base, line.substr(5, eq - 5), value);
+        }
+        else if (line.rfind("cursor ", 0) == 0 && eq != std::string::npos)
+            MenuSetCursor(ctx, base, line.substr(7, eq - 7), std::atoi(line.c_str() + eq + 1));
+        else if (line.rfind("movie ", 0) == 0 && eq != std::string::npos)
+            MenuMovieVisible(ctx, base, line.substr(6, eq - 6), line[eq + 1] == '1');
+        else if (line.rfind("telop ", 0) == 0)
+            MenuTelopTarget(ctx, base, line.substr(6));
+        else if (line.rfind("box ", 0) == 0)
+        {
+            SysUiMessageBox box;
+            std::string rest = line.substr(4);
+            for (size_t p; (p = rest.find("\\n")) != std::string::npos;) rest.replace(p, 2, "\n");
+            size_t bar = rest.find('|');
+            box.text = rest.substr(0, bar);
+            while (bar != std::string::npos)
+            {
+                const size_t next = rest.find('|', bar + 1);
+                box.buttons.push_back(rest.substr(bar + 1, next == std::string::npos ? std::string::npos : next - bar - 1));
+                bar = next;
+            }
+            if (box.buttons.empty()) box.buttons.push_back("OK");
+            box.cancel = int(box.buttons.size()) - 1;
+            SysUiShowMessageBox(std::move(box));
+        }
+        else
+            SwitchFrame(ctx, base, line.c_str());
+    }
 }
 struct UiHookInstall { UiHookInstall() { g_uiFrameHook = UiFrame; } } g_uiHookInstall;
 } // namespace
@@ -1780,7 +2060,7 @@ bool SysUiOwnsInput()
            keyui::g_capture.load();
 }
 bool SysUiKeyCaptureActive() { return keyui::g_capture.load() || sysui::g_voiceCapture.load(); }
-uint16_t SysUiGameButtonMask() { return keyui::g_gameMask.load(); }
+uint16_t SysUiGameButtonMask() { return keyui::g_gameMask.load() & server_ui::GameButtonMask(); }
 void SysUiOnKey(int vk)
 {
     if (sysui::g_voiceCapture.load()) { sysui::g_voiceKey = vk; return; }
@@ -1799,7 +2079,7 @@ bool SysUiShowMessageBox(SysUiMessageBox box)
 {
     if (KeyboardBusy()) return false;                 // one dialog window at a time
     std::lock_guard l(sysui::g_boxMutex);
-    if (sysui::g_boxOwns.load() || !sysui::g_boxQueue.empty() || box.buttons.empty()) return false;
+    if (sysui::g_boxOwns.load() || !sysui::g_boxQueue.empty() || !sysui::g_textQueue.empty() || box.buttons.empty()) return false;
     sysui::g_boxQueue.push_back(std::move(box));
     return true;
 }
@@ -1807,12 +2087,31 @@ bool SysUiShowKeyboard(SysUiKeyboard keyboard)
 {
     {
         std::lock_guard l(sysui::g_boxMutex);
-        if (sysui::g_boxOwns.load() || !sysui::g_boxQueue.empty()) return false;
+        if (sysui::g_boxOwns.load() || !sysui::g_boxQueue.empty() || !sysui::g_textQueue.empty()) return false;
     }
     std::lock_guard l(sysui::g_kbMutex);
     if (sysui::g_kbOwns.load() || !sysui::g_kbQueue.empty()) return false;
     sysui::g_kbQueue.push_back(std::move(keyboard));
     return true;
+}
+bool SysUiShowTextBox(SysUiTextBox box)
+{
+    std::lock_guard l(sysui::g_boxMutex);
+    if (sysui::g_boxOwns.load() || !sysui::g_boxQueue.empty() || !sysui::g_textQueue.empty()) return false;
+    sysui::g_textQueue.push_back(std::move(box));
+    return true;
+}
+void SysUiDismissBox()
+{
+    std::lock_guard l(sysui::g_boxMutex);
+    sysui::g_boxQueue.clear();
+    sysui::g_textQueue.clear();
+    sysui::g_boxDismiss = true;
+}
+bool SysUiBoxBusy()
+{
+    std::lock_guard l(sysui::g_boxMutex);
+    return sysui::g_boxOwns.load() || !sysui::g_boxQueue.empty() || !sysui::g_textQueue.empty();
 }
 void SysUiOnChar(uint32_t ch)
 {
@@ -1835,6 +2134,7 @@ menu_doc::PcLists PcLists()
     lists.modes = { "WINDOWED", "BORDERLESS", "FULLSCREEN" };
     for (const display_settings::Resolution& r : display_settings::Resolutions())
         lists.resolutions.push_back(std::to_string(r.width) + "x" + std::to_string(r.height));
+    lists.serverRow = server_ui::Enabled();
     return lists;
 }
 
@@ -1849,6 +2149,19 @@ PPC_FUNC(NativeSetWindowMode) { (void)base; display_settings::SetMode(static_cas
 PPC_FUNC(NativeGetWindowMode) { (void)base; ctx.r3.u64 = static_cast<uint32_t>(display_settings::GetMode()); }
 PPC_FUNC(NativeSetResolution) { (void)base; display_settings::SetResolutionIndex(static_cast<int>(ctx.r3.u32)); }
 PPC_FUNC(NativeGetResolution) { (void)base; ctx.r3.u64 = static_cast<uint32_t>(display_settings::GetResolutionIndex()); }
+PPC_FUNC(NativeSetSharpness) { (void)base; display_settings::SetSharpness(static_cast<int>(ctx.r3.u32)); }
+PPC_FUNC(NativeSetAntiAliasing) { (void)base; display_settings::SetAntiAliasing(static_cast<int>(ctx.r3.u32)); }
+PPC_FUNC(NativeSetTextureFilter) { (void)base; display_settings::SetTextureFilter(static_cast<int>(ctx.r3.u32)); }
+PPC_FUNC(NativeSetVSync) { (void)base; display_settings::SetVSync(ctx.r3.u32 == 0); }     // ON, OFF
+PPC_FUNC(NativeSetShadows) { (void)base; display_settings::SetShadows(ctx.r3.u32 == 0); } // ON, OFF
+// The room's Friend Invite: the native it replaces runs first (lib::OnlinePlayerMatchOperationMenuSetValue, sub_826002C8:
+// the room closes its operation menu - MEASURED 2026-10-23: the friend picker opened while the menu stayed on screen,
+// over the picker), then the Steam friend picker.
+PPC_FUNC(NativeFriendInvite)
+{
+    __imp__sub_826002C8(ctx, base);
+    server_ui::FriendInvite();
+}
 PPC_FUNC(NativeTrue) { (void)base; ctx.r3.u64 = 1; }
 
 // lib::ExitGameWindow - the exit dialog's lib::WindowGetValue: -1 while it waits, 0 for the
@@ -1876,6 +2189,21 @@ PPC_FUNC(NativeSwitchProfileWindow)
         std::fprintf(stderr, "[menu] switch profile confirmed\n");
 }
 
+// lib::ServerListKeyInfo - the server list page's lib::WindowPrintKeyInfo (menu_doc.cpp renames it in the page's
+// OnTick): the page's own hints, with the server list's in front of the first of each frame.
+PPC_FUNC(NativeServerListKeyInfo)
+{
+    static uint32_t lastFrame = 0;
+    if (menu_host::FrameCount() != lastFrame)
+    {
+        lastFrame = menu_host::FrameCount();
+        const PPCContext saved = ctx;
+        server_ui::KeyHints(ctx, base);
+        ctx = saved;
+    }
+    __imp__sub_8241F988(ctx, base);
+}
+
 struct HostNative { const char* name; uint32_t signature; PPCFunc* fn; };
 const HostNative kNatives[] = {
     // main menu: the 9th item (STORE in the game, EXIT here) is shown when this is true
@@ -1889,10 +2217,27 @@ const HostNative kNatives[] = {
     { "DisplaySettingSetDispRes", kSetterInt, NativeSetResolution },
     { "DisplaySettingGetWindowMode", kGetterInt, NativeGetWindowMode },
     { "DisplaySettingGetResolution", kGetterInt, NativeGetResolution },
+    // VSYNC / SHARPNESS / ANTI-ALIASING / TEXTURE FILTERING (preview and store both apply live)
+    { "MenuOptionDisplayVSyncOnOff", kSetterInt, NativeSetVSync },
+    { "DisplaySettingSetVSyncOn", kSetterInt, NativeSetVSync },
+    { "MenuOptionDisplaySharpening", kSetterInt, NativeSetSharpness },
+    { "DisplaySettingSetSharpen", kSetterInt, NativeSetSharpness },
+    { "MenuOptionDisplayEdgeSmooth", kSetterInt, NativeSetAntiAliasing },
+    { "DisplaySettingSetEdgesAA", kSetterInt, NativeSetAntiAliasing },
+    { "MenuOptionDisplayTexFilters", kSetterInt, NativeSetTextureFilter },
+    { "DisplaySettingSetTexFilt", kSetterInt, NativeSetTextureFilter },
+    { "MenuOptionDisplayShadowsOff", kSetterInt, NativeSetShadows },
+    { "DisplaySettingSetShadows", kSetterInt, NativeSetShadows },
+    // the Player Match room's Friend Invite (menu_doc.cpp AddFriendInvite): the signature of the native it replaces,
+    // OnlinePlayerMatchOperationMenuSetValue (sub_826002C8, two arguments - MEASURED 2026-10-23: with a one-int
+    // setter's the call failed and the item did nothing)
+    { "OnlinePlayerMatchSteamFriendInviteOpen", 0x8209FB4C, NativeFriendInvite },
     // the exit confirmation's answer
     { "ExitGameWindow", kGetterInt, NativeExitGameWindow },
     // the switch-profile confirmation's answer
     { "SwitchProfileWindow", kGetterInt, NativeSwitchProfileWindow },
+    // the server list's key hints (its OnTick's lib::WindowPrintKeyInfo, same signature)
+    { "ServerListKeyInfo", 0x8209FB64, NativeServerListKeyInfo },
 };
 // Guest code addresses routed to the host natives: the interior of the development menu loader
 // sub_823450B0 (never called in retail; nothing indirect-calls into a function's middle).
@@ -1978,9 +2323,31 @@ PPC_FUNC(sub_8256CD28)
             if (const uint32_t w = FindWidget(ctx, base, modeName)) GWrite32(base, w + 368, uint32_t(display_settings::GetMode()));
             if (const uint32_t w = FindWidget(ctx, base, resName))
                 GWrite32(base, w + 368, uint32_t(display_settings::GetResolutionIndex()));
+            static const uint32_t sharpName = GuestCString(base, "SelectValueMenuItemMode007-04-08");
+            static const uint32_t aaName = GuestCString(base, "SelectValueMenuItemMode007-04-09");
+            static const uint32_t filterName = GuestCString(base, "SelectValueMenuItemMode007-04-10");
+            if (const uint32_t w = FindWidget(ctx, base, sharpName)) GWrite32(base, w + 368, uint32_t(display_settings::GetSharpness()));
+            if (const uint32_t w = FindWidget(ctx, base, aaName)) GWrite32(base, w + 368, uint32_t(display_settings::GetAntiAliasing()));
+            if (const uint32_t w = FindWidget(ctx, base, filterName)) GWrite32(base, w + 368, uint32_t(display_settings::GetTextureFilter()));
+            static const uint32_t vsyncName = GuestCString(base, "SelectValueMenuItemMode007-04-11");
+            if (const uint32_t w = FindWidget(ctx, base, vsyncName)) GWrite32(base, w + 368, display_settings::GetVSync() ? 0u : 1u);
+            static const uint32_t shadowsName = GuestCString(base, "SelectValueMenuItemMode007-04-12");
+            if (const uint32_t w = FindWidget(ctx, base, shadowsName)) GWrite32(base, w + 368, display_settings::GetShadows() ? 0u : 1u);
         }
-        else if (const uint32_t w = FindWidget(ctx, base, delayName))
-            GWrite32(base, w + 368, display_settings::GetInputDelayOn() ? 1u : 0u);
+        else
+        {
+            if (const uint32_t w = FindWidget(ctx, base, delayName))
+                GWrite32(base, w + 368, display_settings::GetInputDelayOn() ? 1u : 0u);
+            // ONLINE NETCODE (cursor = the setting), CUSTOM INPUT DELAY and CUSTOM ROLLBACK (= frames - 1)
+            static const uint32_t netName = GuestCString(base, "SelectValueMenuItemMode007-01-08");
+            static const uint32_t customDelayName = GuestCString(base, "SelectValueMenuItemMode007-01-09");
+            static const uint32_t customRollbackName = GuestCString(base, "SelectValueMenuItemMode007-01-10");
+            if (const uint32_t w = FindWidget(ctx, base, netName)) GWrite32(base, w + 368, uint32_t(display_settings::GetNetcode()));
+            if (const uint32_t w = FindWidget(ctx, base, customDelayName))
+                GWrite32(base, w + 368, uint32_t(display_settings::GetCustomDelay() - 1));
+            if (const uint32_t w = FindWidget(ctx, base, customRollbackName))
+                GWrite32(base, w + 368, uint32_t(display_settings::GetCustomRollback() - 1));
+        }
     }
     ctx = saved;
 }
@@ -1996,16 +2363,26 @@ PPC_FUNC(sub_82374700)
         static const uint32_t delayName = GuestCString(base, "SelectValueMenuItemMode007-01-07");
         if (const uint32_t w = FindWidget(ctx, base, delayName))
             display_settings::SetInputDelayOn(GRead32(base, w + 368) == 1);
+        static const uint32_t netName = GuestCString(base, "SelectValueMenuItemMode007-01-08");
+        static const uint32_t customDelayName = GuestCString(base, "SelectValueMenuItemMode007-01-09");
+        static const uint32_t customRollbackName = GuestCString(base, "SelectValueMenuItemMode007-01-10");
+        if (const uint32_t w = FindWidget(ctx, base, netName)) display_settings::SetNetcode(int(GRead32(base, w + 368)));
+        if (const uint32_t w = FindWidget(ctx, base, customDelayName)) display_settings::SetCustomDelay(int(GRead32(base, w + 368)) + 1);
+        if (const uint32_t w = FindWidget(ctx, base, customRollbackName))
+            display_settings::SetCustomRollback(int(GRead32(base, w + 368)) + 1);
     }
     ctx = saved;
 }
 
-// lib::GameOptionResetToDefaults (impl sub_823747C0): Game Options' DEFAULT resets INPUT DELAY too
-// (its cursor follows when the page re-initialises BATTLE POSITION's).
+// lib::GameOptionResetToDefaults (impl sub_823747C0): Game Options' DEFAULT resets INPUT DELAY and
+// the online netcode rows too (their cursors follow when the page re-initialises BATTLE POSITION's).
 PPC_FUNC(sub_823747C0)
 {
     __imp__sub_823747C0(ctx, base);
     display_settings::SetInputDelayOn(false);
+    display_settings::SetNetcode(display_settings::NetStandard);
+    display_settings::SetCustomDelay(1);
+    display_settings::SetCustomRollback(display_settings::kMaxRollback);
 }
 
 // TitleMode::Impl::state_title_main: the logo waiting for START (sub_82622B70); impl+40 counts the
@@ -2119,6 +2496,47 @@ PPC_FUNC(sub_8237F5D0)
             return;
         }
     }
+    if ((ctx.r4.u32 >> 16) == 0x0300 && id >= 0x0660 && id <= 0x0698)
+    {
+        // The information bar's tips (the bottom bar of the menus and loading screens; text bank 0x0300, MEASURED
+        // 2026-10-22): on a community server every other tip is the server's - its players right now ("TTT2 Test
+        // Server: 12 players online, 4 playing.", server_ui.cpp) and its news lines, taking turns.
+        const std::vector<std::string> news = gin_service::News();
+        const std::string status = server_ui::StatusLine();
+        static std::mutex m;
+        static uint32_t lastId = 0, turn = 0, lastText = 0, statusText = 0;
+        static std::map<std::string, uint32_t> texts;
+        std::lock_guard l(m);
+        if (!news.empty() || !status.empty())
+        {
+            if (id != lastId)                             // a new tip (the bar may ask again for the same one)
+            {
+                lastId = id;
+                ++turn;
+                lastText = 0;
+                const uint32_t slot = turn / 2;
+                if ((turn & 1) && !status.empty() && (news.empty() || (slot & 1) == 0))
+                {
+                    // the counts change: one guest text, written again each time
+                    sysui::WriteTableText(base, statusText, 160, status);
+                    lastText = statusText;
+                }
+                else if ((turn & 1) && !news.empty())
+                {
+                    // guest text for each line seen (at most 64: lines from a server that keeps changing them are not shown)
+                    const std::string& line = news[(status.empty() ? slot : slot / 2) % news.size()];
+                    const auto it = texts.find(line);
+                    if (it != texts.end()) lastText = it->second;
+                    else if (texts.size() < 64) lastText = texts[line] = TableText(base, line.c_str());
+                }
+            }
+            if (lastText)
+            {
+                ctx.r3.u64 = lastText;
+                return;
+            }
+        }
+    }
     const uint32_t lr = uint32_t(ctx.lr);
     const bool corner = (id == 0x09 || id == 0x0A || id == 0x0B) && lr >= 0x82277000 && lr < 0x82278000;
     const bool logo = id == 0x05 && lr >= 0x82646000 && lr < 0x82647000;
@@ -2130,6 +2548,33 @@ PPC_FUNC(sub_8237F5D0)
         static const uint32_t empty = TableText(base, "");
         ctx.r3.u64 = empty;
         return;
+    }
+    // TTT2_TEXT_DUMP=<hex id>: when an id up to 0x100 above it is first looked up (its bank loaded by then)
+    static const uint32_t dumpAt = std::getenv("TTT2_TEXT_DUMP") ? uint32_t(std::strtoul(std::getenv("TTT2_TEXT_DUMP"), nullptr, 16)) : 0xFFFFFFFFu;
+    const bool dump = id >= dumpAt && id < dumpAt + 0x100;   // any id in that range
+    if (dump)
+    {
+        // research: every text id 0..0xFFF of each text manager, once
+        static std::mutex m;
+        static std::map<uint32_t, bool> done;
+        bool first;
+        {
+            std::lock_guard l(m);
+            first = !done[ctx.r3.u32];
+            done[ctx.r3.u32] = true;
+        }
+        if (first)
+        {
+            std::fprintf(stderr, "[text-dump] manager %08X (first asked for %08X by %08X)\n", ctx.r3.u32, ctx.r4.u32, uint32_t(ctx.lr));
+            PPCContext copy = ctx;
+            for (uint32_t i = 0; i < 0x1000; ++i)
+            {
+                copy.r3 = ctx.r3;
+                copy.r4.u64 = (ctx.r4.u32 & 0xFFFF0000u) | i;
+                __imp__sub_8237F5D0(copy, base);
+                if (copy.r3.u32 && base[copy.r3.u32]) std::fprintf(stderr, "[text-dump] %04X '%s'\n", i, GuestString(base, copy.r3.u32, 160).c_str());
+            }
+        }
     }
     __imp__sub_8237F5D0(ctx, base);
     static const bool trace = std::getenv("TTT2_TEXT_TRACE") != nullptr;
@@ -2181,10 +2626,12 @@ PPC_FUNC(sub_82346060)
             }
             ctx.r4.u64 = GuestCopy(base, edited.data(), edited.size());
             ctx.r5.u64 = edited.size();
-            std::fprintf(stderr, "[menu] Options / main menu: PC rows and EXIT added (%u -> %zu bytes)\n", size, edited.size());
+            const bool online = std::string(reinterpret_cast<const char*>(doc), size).find("MenuItemOnline07-leaderboard") != std::string::npos;
+            std::fprintf(stderr, "[menu] %s (%u -> %zu bytes)\n",
+                         online ? "ONLINE MODE menu: SERVER row added" : "Options / main menu: PC rows and EXIT added", size, edited.size());
         }
         else if (!why.empty())
-            std::fprintf(stderr, "[menu] Options / main menu left unchanged: %s\n", why.c_str());
+            std::fprintf(stderr, "[menu] menu document left unchanged: %s\n", why.c_str());
     }
     __imp__sub_82346060(ctx, base);
 }
@@ -2213,8 +2660,20 @@ PPC_FUNC(sub_82A8C170)
 // (MEASURED 2026-10-22: the room's bar is START GAME CHAT, BACK TOGGLE LOG DISPLAY, Y MENU
 // DISPLAY, A OK, B CLOSE / LEAVE).
 extern "C" PPC_FUNC(__imp__sub_8241B588);
+// TTT2_SRV_TRACE=1 logs each key / text pair once: which key number is which button.
 PPC_FUNC(sub_8241B588)
 {
+    static const bool trace = EnvFlag("TTT2_SRV_TRACE");
+    if (trace && ctx.r5.u32)
+    {
+        static std::mutex m;
+        static std::map<std::string, int> seen;
+        const std::string text = GuestString(base, ctx.r5.u32, 48);
+        const std::string k = std::to_string(ctx.r4.u32) + " " + text;
+        std::lock_guard l(m);
+        if (seen[k]++ == 0)
+            std::fprintf(stderr, "[keyhint] key %u side %u '%s' lr %08X\n", ctx.r4.u32, ctx.r7.u32, text.c_str(), uint32_t(ctx.lr));
+    }
     const uint32_t window = ctx.r3.u32, key = ctx.r4.u32 & 0xFFFF, r6 = ctx.r6.u32, r7 = ctx.r7.u32;
     __imp__sub_8241B588(ctx, base);
     if (key != 0xE026) return;

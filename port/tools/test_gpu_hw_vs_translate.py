@@ -28,10 +28,10 @@ def build(folder, negative):
     (folder / "parity_adapter.h").write_text(ADAPTER)
     translate = (KERNEL / "gpu_hw_translate.h").read_text()
     if negative:
-        old = 'v = "float4(XN8(d0, " + S + "), XN8(d0 >> 8, " + S + "), XN8(d0 >> 16, " + S + "), XN8(d0 >> 24, " + S + "))";'
+        old = '"f = float4(XN8(d0, s), XN8(d0 >> 8, s), XN8(d0 >> 16, s), XN8(d0 >> 24, s)); if (all) f *= 255.0;"'
         if translate.count(old) != 1:
             raise SystemExit("FAIL: negative-control anchor changed")
-        translate = translate.replace(old, 'v = "float4(XN8(d0 >> 24, " + S + "), XN8(d0 >> 16, " + S + "), XN8(d0 >> 8, " + S + "), XN8(d0, " + S + "))";')
+        translate = translate.replace(old, '"f = float4(XN8(d0 >> 24, s), XN8(d0 >> 16, s), XN8(d0 >> 8, s), XN8(d0, s)); if (all) f *= 255.0;"')
     (folder / "gpu_hw_translate.h").write_text(translate)
     for name in BACKEND_HEADERS:
         (folder / name).write_text((KERNEL / name).read_text())

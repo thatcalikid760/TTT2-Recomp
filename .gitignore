@@ -17,6 +17,7 @@
 !/port/
 !/tools/
 !/re/
+!/server/
 
 /port/*
 !/port/CMakeLists.txt
@@ -111,3 +112,10 @@ Thumbs.db
 !/.github/assets/*.png
 # README screenshots (.github/assets/screens/*.jpg): captures of the port running, added at the
 # owner's request (2026-10-14) - the only game imagery allowed in the repository.
+
+# --- ttt2-server: local data, configuration and builds (keys, bans, logs never belong in git) ---
+server/data/
+server/server.toml
+server/dist/
+server/*.exe
+server/ttt2-server

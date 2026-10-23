@@ -1,0 +1,88 @@
+{{define "dashboard"}}{{template "top" .}}
+{{- with .Data}}
+<section class="cards" aria-label="The server now">
+<div class="card">
+<p class="card-label"><span class="dot ok" aria-hidden="true"></span>Online</p>
+<p class="card-value" data-stat="online">{{.State.Stats.Online}}</p>
+<p class="card-sub">of {{.MaxPlayers}} places</p>
+</div>
+<div class="card">
+<p class="card-label"><span class="dot accent" aria-hidden="true"></span>Playing</p>
+<p class="card-value" data-stat="playing">{{.State.Stats.Playing}}</p>
+<p class="card-sub">in recorded matches</p>
+</div>
+<div class="card">
+<p class="card-label"><span class="dot info" aria-hidden="true"></span>Rooms open</p>
+<p class="card-value" data-stat="rooms">{{.State.Stats.Rooms}}</p>
+<p class="card-sub"><span data-stat="inRooms">{{.State.Stats.InRooms}}</span> players in them</p>
+</div>
+<div class="card">
+<p class="card-label"><span class="dot violet" aria-hidden="true"></span>Matches, 24 h</p>
+<p class="card-value" data-stat="matches24h">{{.State.Stats.Matches24h}}</p>
+<p class="card-sub"><a href="/matches">Match history</a></p>
+</div>
+<div class="card">
+<p class="card-label"><span class="dot danger" aria-hidden="true"></span>Bans in force</p>
+<p class="card-value" data-stat="bans">{{.State.Stats.Bans}}</p>
+<p class="card-sub"><a href="/bans">Kicks included</a></p>
+</div>
+<div class="card">
+<p class="card-label"><span class="dot muted" aria-hidden="true"></span>Uptime</p>
+<p class="card-value"><time datetime="{{iso $.Started}}" data-ts="{{unix $.Started}}" data-fmt="since">{{between $.Started $.Now}}</time></p>
+<p class="card-sub">{{.Known}} players seen in all</p>
+</div>
+</section>
+
+<div class="dash">
+<section class="panel" aria-labelledby="online-title">
+<div class="panel-head">
+<h2 id="online-title">Online players</h2>
+<input type="search" class="filter" data-filter="online-rows" placeholder="Filter by name, ID, state" aria-label="Filter the online players" hidden>
+</div>
+<div class="table-wrap">
+<table class="list">
+<thead><tr><th scope="col">Player</th><th scope="col">Now</th><th scope="col">Online for</th><th scope="col">IP address</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+<tbody id="online-rows" data-live="players">
+{{- range .State.Players}}
+<tr data-id="{{.ID}}">
+<td data-label="Player"><a class="who" href="/player?steam={{.ID}}">{{.Name}}</a>{{if not .Verified}} <span class="tag warn" title="Steam did not check this login">unverified</span>{{end}}<span class="mono sub">{{.ID}}</span></td>
+<td data-label="Now" class="wide-sm">{{template "state" .}}</td>
+<td data-label="Online for"><time datetime="{{iso (fromUnix .Since)}}" data-ts="{{.Since}}" data-fmt="since" title="{{datetime (fromUnix .Since)}}">{{between (fromUnix .Since) $.Now}}</time></td>
+<td data-label="IP address" class="mono">{{.IP}}</td>
+<td data-label="" class="row-actions">
+<a class="btn sm warn-ghost" href="/player?steam={{.ID}}#kick" data-act="kick" data-id="{{.ID}}" data-name="{{.Name}}">Kick</a>
+<a class="btn sm danger-ghost" href="/player?steam={{.ID}}#ban" data-act="ban" data-id="{{.ID}}" data-name="{{.Name}}">Ban</a>
+</td>
+</tr>
+{{- end}}
+</tbody>
+</table>
+</div>
+<p class="empty" data-empty="online-rows"{{if .State.Players}} hidden{{end}}>Nobody is online.</p>
+<p class="empty" data-nomatch="online-rows" hidden>No online player matches the filter.</p>
+</section>
+
+<section class="panel" aria-labelledby="feed-title">
+<div class="panel-head">
+<h2 id="feed-title">Activity</h2>
+<span class="muted small">newest first</span>
+</div>
+<ol class="feed" id="feed" data-live="feed" aria-live="polite" aria-relevant="additions">
+{{- range .Feed}}
+<li class="ev ev-{{.Kind}}" data-seq="{{.Seq}}"><span class="ev-dot" aria-hidden="true"></span><p class="ev-text">
+{{- $j := .Joiner}}{{range $i, $w := .Who}}{{if $i}}{{$j}}{{end}}<a class="who" href="/player?steam={{$w.ID}}">{{or $w.Name $w.ID}}</a>{{end}}{{if .Who}} {{end}}{{.Text}}</p>{{template "ago" (at $.Now .AtTime)}}</li>
+{{- end}}
+</ol>
+<p class="empty" data-empty="feed"{{if .Feed}} hidden{{end}}>Nothing yet. Players joining and leaving, matches, kicks and bans show up here while a panel page is open.</p>
+</section>
+</div>
+{{- end}}
+{{template "bottom" .}}{{end}}
+
+{{/* What an online player is doing (a livePlayer); panel.js draws the same. */}}
+{{define "state"}}
+{{- if eq .State "match"}}<span class="tag {{if .Ranked}}violet{{else}}ok{{end}}">{{if .Ranked}}Ranked match{{else}}In a match{{end}}</span>
+{{- with .Vs}} <span class="vs">vs {{range $i, $w := .}}{{if $i}}, {{end}}<a href="/player?steam={{$w.ID}}">{{$w.Name}}</a>{{end}}</span>{{end}}
+{{- else if eq .State "room"}}<span class="tag accent">{{if .Ranked}}Ranked room{{else}}Hosting a room{{end}} {{.Filled}}/{{.Max}}</span>
+{{- else}}<span class="tag" title="In the menus, or a guest in another player's room">Online</span>{{end}}
+{{- end}}

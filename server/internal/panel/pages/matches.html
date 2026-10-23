@@ -1,0 +1,57 @@
+{{define "matches"}}{{template "top" .}}
+{{- with .Data}}
+<form class="toolbar" method="get" action="/matches" role="search">
+<label class="search-box">{{template "icon" "search"}}<span class="sr-only">A player's name or Steam ID</span>
+<input type="search" name="q" value="{{.Query}}" maxlength="64" placeholder="A player's name or Steam ID">
+</label>
+<label class="select-box"><span class="sr-only">Kind</span>
+<select name="kind" data-autosubmit>
+<option value=""{{if eq .Kind ""}} selected{{end}}>Every kind</option>
+<option value="ranked"{{if eq .Kind "ranked"}} selected{{end}}>Ranked</option>
+<option value="player"{{if eq .Kind "player"}} selected{{end}}>Player matches</option>
+</select>
+</label>
+<button type="submit" class="btn primary">Search</button>
+{{- if or .Query .Kind}} <a class="btn ghost" href="/matches">Clear</a>{{end}}
+</form>
+<p class="hint">A name finds the matches played under it then or by whoever has it now: a player reporting a cheater by the name the game showed finds the match, and the cheater's Steam ID.</p>
+
+<section class="panel">
+<div class="panel-head">
+<h2>{{if or .Query .Kind}}Matches found{{else}}Newest matches{{end}}</h2>
+<span class="muted small">newest first</span>
+</div>
+{{- if .Matches}}
+{{template "matchtable" (matchTable $ .Matches "")}}
+{{template "pager" (pagerMore "/matches" .Page .More "q" .Query "kind" .Kind)}}
+{{- else}}
+<p class="empty">{{if or .Query .Kind}}No match found.{{else}}No match recorded yet.{{end}}{{if gt .Page 1}} <a href="{{pageURL "/matches" 1 "q" .Query "kind" .Kind}}">Back to the newest</a>{{end}}</p>
+{{- end}}
+</section>
+{{- end}}
+{{template "bottom" .}}{{end}}
+
+{{/* A table of matches (the Matches page, a player's page: Self is that player). */}}
+{{define "matchtable"}}
+<div class="table-wrap">
+<table class="list">
+<thead><tr><th scope="col">Started</th><th scope="col">Players</th><th scope="col">Kind</th><th scope="col">Length</th><th scope="col">Result</th></tr></thead>
+<tbody>
+{{- range .Rows}}
+<tr>
+<td data-label="Started">{{template "ago" (at $.Now .Started)}}</td>
+<td data-label="Players" class="wide-sm"><span class="versus">
+{{- range $i, $p := .Players}}{{if $i}}<span class="vs-sep">vs</span>{{end}}<span class="fighter">
+{{- if eq (print $p.SteamID) $.Self}}<b>{{$p.Name}}</b>{{else}}<a class="who" href="/player?steam={{$p.SteamID}}">{{$p.Name}}</a>{{end}}
+{{- if gt $p.LocalPlayers 1}} <span class="tag" title="{{$p.LocalPlayers}} players at that PC">x{{$p.LocalPlayers}}</span>{{end}}
+{{- if eq $p.Won 1}} <span class="tag ok">won</span>{{else if eq $p.Won 0}} <span class="tag">lost</span>{{end}}</span>
+{{- end}}</span></td>
+<td data-label="Kind">{{if eq .Kind "ranked"}}<span class="tag violet">Ranked</span>{{else}}<span class="tag">Player match</span>{{end}}</td>
+<td data-label="Length">{{if .Open}}<span class="tag accent">in play</span>{{else}}{{.Took}}{{end}}</td>
+<td data-label="Result"><span class="tag {{.ResultClass}}">{{.ResultText}}</span></td>
+</tr>
+{{- end}}
+</tbody>
+</table>
+</div>
+{{end}}

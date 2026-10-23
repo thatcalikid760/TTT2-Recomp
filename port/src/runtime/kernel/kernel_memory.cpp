@@ -7,6 +7,9 @@
 #include <cstdlib>
 #include <cstring>
 
+void LogGuestAlloc(const char* what, uint32_t addr, uint32_t size, PPCContext& ctx);   // rollback_probe.cpp
+void RollbackNoteAllocation(uint32_t addr, uint32_t size, PPCContext& ctx);            // rollback.cpp
+
 // NtAllocateVirtualMemory(r3=PVOID* BaseAddress, r4=PSIZE_T RegionSize, r5=AllocType, r6=Protect)
 // The whole guest space is committed, so honor a requested address as-is; otherwise carve from the heap.
 PPC_FUNC(__imp__NtAllocateVirtualMemory)
@@ -28,6 +31,8 @@ PPC_FUNC(__imp__NtAllocateVirtualMemory)
     }
     GWrite32(base, basePtr, addr);
     GWrite32(base, sizePtr, rounded);
+    LogGuestAlloc("virtual", addr, rounded, ctx);
+    if (!reqBase) RollbackNoteAllocation(addr, rounded, ctx);
     ctx.r3.u32 = STATUS_SUCCESS;
 }
 
@@ -45,15 +50,19 @@ PPC_FUNC(__imp__NtFreeVirtualMemory)
 PPC_FUNC(__imp__ExAllocatePool)
 {
     KTrace("ExAllocatePool");
-    void* p = g_virtualHeap.Alloc(ctx.r3.u32 ? ctx.r3.u32 : 16, 16);
+    const uint32_t size = ctx.r3.u32 ? ctx.r3.u32 : 16;
+    void* p = g_virtualHeap.Alloc(size, 16);
     ctx.r3.u32 = p ? GuestAddr(base, p) : 0;
+    LogGuestAlloc("pool", ctx.r3.u32, size, ctx);
 }
 PPC_FUNC(__imp__ExAllocatePoolTypeWithTag)
 {
     KTrace("ExAllocatePoolTypeWithTag");
-    void* p = g_virtualHeap.Alloc(ctx.r3.u32 ? ctx.r3.u32 : 16, 16);
+    const uint32_t size = ctx.r3.u32 ? ctx.r3.u32 : 16;
+    void* p = g_virtualHeap.Alloc(size, 16);
     if (p) std::memset(p, 0, ctx.r3.u32);
     ctx.r3.u32 = p ? GuestAddr(base, p) : 0;
+    LogGuestAlloc("pool-tag", ctx.r3.u32, size, ctx);
 }
 PPC_FUNC(__imp__ExFreePool)
 {
@@ -70,6 +79,7 @@ PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx)
     const uint32_t flags = ctx.r3.u32;
     void* p = g_physicalHeap.Alloc(size ? size : 0x1000, align);
     ctx.r3.u32 = p ? GuestAddr(base, p) : 0;
+    LogGuestAlloc("physical", ctx.r3.u32, size, ctx);
     static const bool diag = [] { const char* e = std::getenv("TTT2_DIAG_BAKE"); return e && *e == '1'; }();
     if (diag && size >= 0x40000)
         std::fprintf(stderr, "[diag-bake] phys alloc flags=%08X size=%08X protect=%08X align=%08X -> %08X\n",

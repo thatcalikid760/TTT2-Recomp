@@ -1,0 +1,31 @@
+{{define "bans"}}{{template "top" .}}
+<details class="panel add-ban"{{if not .Data}} open{{end}}>
+<summary class="panel-head"><h2>Ban a Steam ID</h2><span class="muted small">online or not</span></summary>
+<div class="panel-body">{{template "banform" (blank $)}}</div>
+</details>
+
+<section class="panel">
+<div class="panel-head">
+<h2>In force</h2>
+<input type="search" class="filter" data-filter="ban-rows" placeholder="Filter by name, ID, reason" aria-label="Filter the bans" hidden>
+</div>
+<div class="table-wrap">
+<table class="list">
+<thead><tr><th scope="col">Player</th><th scope="col">Kind</th><th scope="col">Ends</th><th scope="col">Reason</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+<tbody id="ban-rows" data-live="bans">
+{{- range .Data}}
+<tr data-id="{{.SteamID}}">
+<td data-label="Player"><a class="who" href="/player?steam={{.SteamID}}">{{or .Name "(never logged in)"}}</a><span class="mono sub">{{.SteamID}}</span></td>
+<td data-label="Kind">{{if .Kick}}<span class="tag warn">Kick</span>{{else}}<span class="tag danger">Ban</span>{{end}}</td>
+<td data-label="Ends">{{if .Until.IsZero}}<span class="tag danger">never</span>{{else}}<span data-until="{{unix .Until}}" title="{{datetime .Until}}">until {{datetime .Until}}</span>{{end}}</td>
+<td data-label="Reason" class="reason wide-sm">{{or .Reason "-"}}</td>
+<td data-label="" class="row-actions">{{template "unbanform" (target $ .SteamID .Name .Kick)}}</td>
+</tr>
+{{- end}}
+</tbody>
+</table>
+</div>
+<p class="empty" data-empty="ban-rows"{{if .Data}} hidden{{end}}>Nobody is banned or kicked.</p>
+<p class="empty" data-nomatch="ban-rows" hidden>No ban matches the filter.</p>
+</section>
+{{template "bottom" .}}{{end}}

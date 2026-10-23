@@ -1,0 +1,63 @@
+{{define "players"}}{{template "top" .}}
+{{- with .Data}}
+<form class="toolbar" method="get" action="/players" role="search">
+<label class="search-box">{{template "icon" "search"}}<span class="sr-only">Search players</span>
+<input type="search" name="q" value="{{.Query}}" maxlength="64" placeholder="Name (or part of it) or Steam ID">
+</label>
+<label class="select-box"><span class="sr-only">Show</span>
+<select name="show" data-autosubmit>
+<option value=""{{if eq .Show ""}} selected{{end}}>Everyone</option>
+<option value="online"{{if eq .Show "online"}} selected{{end}}>Online now</option>
+<option value="offline"{{if eq .Show "offline"}} selected{{end}}>Offline</option>
+<option value="banned"{{if eq .Show "banned"}} selected{{end}}>Banned or kicked</option>
+</select>
+</label>
+<button type="submit" class="btn primary">Search</button>
+{{- if or .Query .Show}} <a class="btn ghost" href="/players">Clear</a>{{end}}
+</form>
+
+<section class="panel">
+<div class="panel-head">
+<h2>{{if or .Query .Show}}{{.Total}} {{if eq .Total 1}}player matches{{else}}players match{{end}}{{else}}{{.Total}} {{if eq .Total 1}}player{{else}}players{{end}} seen{{end}}</h2>
+{{- if .Rows}}<span class="muted small">{{.First}}-{{.Last}}, most recently seen first</span>{{end}}
+</div>
+{{- if .Rows}}
+<div class="table-wrap">
+<table class="list">
+<thead><tr><th scope="col">Player</th><th scope="col">Steam ID</th><th scope="col">Now</th><th scope="col">Last seen</th><th scope="col">First seen</th><th scope="col" class="num">Logins</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+<tbody>
+{{- range .Rows}}
+<tr>
+<td data-label="Player"><a class="who" href="/player?steam={{.SteamID}}">{{.Name}}</a>{{if not .Verified}} <span class="tag warn" title="Steam did not check their last login">unverified</span>{{end}}</td>
+<td data-label="Steam ID" class="mono">{{.SteamID}}</td>
+<td data-label="Now">{{if .Online}}<span class="tag ok">online</span> {{end}}{{if .Banned}}<span class="tag danger">{{if .Ban.Kick}}kicked{{else}}banned{{end}}</span> <span class="muted small">{{until .Ban}}</span>{{end}}{{if not (or .Online .Banned)}}<span class="muted">-</span>{{end}}</td>
+<td data-label="Last seen">{{template "ago" (at $.Now .LastSeen)}}</td>
+<td data-label="First seen">{{template "local" .FirstSeen}}</td>
+<td data-label="Logins" class="num">{{.Logins}}</td>
+<td data-label="" class="row-actions">
+<a class="btn sm ghost" href="/player?steam={{.SteamID}}">Details</a>
+<a class="btn sm ghost" href="/matches?q={{.SteamID}}">Matches</a>
+</td>
+</tr>
+{{- end}}
+</tbody>
+</table>
+</div>
+{{template "pager" (pager "/players" .Page .Pages "q" .Query "show" .Show)}}
+{{- else}}
+<p class="empty">{{if or .Query .Show}}No player matches.{{else}}No player has been here yet.{{end}}{{if gt .Page 1}} <a href="{{pageURL "/players" 1 "q" .Query "show" .Show}}">Back to the first page</a>{{end}}</p>
+{{- end}}
+</section>
+{{- end}}
+{{template "bottom" .}}{{end}}
+
+{{/* Page links: newer / older, or 1..n. */}}
+{{define "pager"}}
+{{- if or .Prev .Next}}
+<nav class="pager" aria-label="Pages">
+{{- if .Prev}}<a class="btn sm ghost" href="{{.Prev}}" rel="prev">&larr; {{.PrevLabel}}</a>{{else}}<span></span>{{end}}
+<span class="muted small">{{.Text}}</span>
+{{- if .Next}}<a class="btn sm ghost" href="{{.Next}}" rel="next">{{.NextLabel}} &rarr;</a>{{else}}<span></span>{{end}}
+</nav>
+{{- end}}
+{{end}}

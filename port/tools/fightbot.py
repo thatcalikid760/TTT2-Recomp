@@ -87,7 +87,11 @@ def main():
     ap.add_argument("--shot-dir", default=".")
     ap.add_argument("--join-ref", help="screenshot of 'Press START button of controller in use' (after a match): "
                                        "when a screenshot matches it, both players press START")
+    ap.add_argument("--instance", default="", help="TTT2_INSTANCE tag of the game to drive (pad_inject<tag>.txt)")
     args = ap.parse_args()
+    global INJECT, FRAME
+    INJECT = Path(f"C:/ttt2/port/pad_inject{args.instance}.txt")
+    FRAME = Path(f"C:/ttt2/port/fbdump{args.instance}.bmp")
     rng = random.Random(args.seed)
     end = time.time() + args.seconds
     next_shot = time.time() + args.shots if args.shots else float("inf")

@@ -36,6 +36,26 @@ struct SysUiKeyboard
 };
 // False while another keyboard or a message box is showing.
 bool SysUiShowKeyboard(SysUiKeyboard keyboard);
+// A line of text typed in the game's confirmation window (OK / CANCEL): `prompt` above it, the text with a cursor,
+// `hint` under it. Typed characters are letters, digits and those in `allowed`; ENTER / A confirm, ESC / B cancel,
+// BACKSPACE deletes, CTRL+V pastes (what fits). On confirm `check` may refuse the text with a note shown in the
+// window instead of the hint; otherwise `done` runs (on the game's main thread) with ok and the text.
+struct SysUiTextBox
+{
+    std::string prompt, text, hint;
+    std::string allowed;                    // extra characters, e.g. ".:-[]" for an address
+    size_t maxLength = 64;
+    bool masked = false;                    // a password: shown as *
+    std::function<std::string(const std::string& text)> check;
+    std::function<void(bool ok, const std::string& text)> done;
+};
+// False while a message box or text box is showing.
+bool SysUiShowTextBox(SysUiTextBox box);
+// Closes the message box or text box on screen without an answer (its `done` does not run), e.g. "Connecting..."
+// once the connection is made.
+void SysUiDismissBox();
+// True while a message box or text box is showing or about to (another one has to wait).
+bool SysUiBoxBusy();
 
 // The game asked to sign a profile in (XamShowSigninUI with nobody signed in). Its sign-in states
 // draw nothing, so the last used profile is signed in directly. Returns false when the UI cannot
@@ -72,3 +92,4 @@ uint16_t HostControllerButtons();
 // The triggers are not buttons: true while any connected pad holds one.
 bool HostTriggerHeld();
 void HostPulseStart();
+void HostPulseDown();

@@ -1,0 +1,5 @@
+dist
+data
+server.toml
+*.exe
+ttt2-server

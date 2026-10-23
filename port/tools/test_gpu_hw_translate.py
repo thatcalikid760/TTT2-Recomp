@@ -33,6 +33,12 @@ uint32_t GRead32(uint8_t* b,uint32_t a){uint32_t v;std::memcpy(&v,b+a,4);return 
 inline void GWrite32(uint8_t* b,uint32_t a,uint32_t v){v=__builtin_bswap32(v);std::memcpy(b+a,&v,4);}
 int GuestFaultReport(EXCEPTION_POINTERS*) {return EXCEPTION_CONTINUE_SEARCH;}
 bool DiagSkinDescribe(uint32_t,char*,size_t) {return false;}
+#include <vector>
+HANDLE g_mainThreadHandle = nullptr;   // main.cpp (frame cost reports)
+bool DirtyMeasureOn() {return false;}   // rollback_probe.cpp / write_watch.cpp (rollback's dirty-page bookkeeping)
+void WriteWatchPublish(int, const PVOID*, size_t) {}
+void WriteWatchDrain(int, uint32_t, uint32_t, std::vector<uint32_t>&) {}
+void GpuNoteMemory(int, uint32_t, uint32_t) {}
 #pragma comment(lib, "user32.lib")   // the presenter's window queries (GetClientRect ...)
 #include "display_settings.h"
 namespace display_settings {   // the backend's display settings: windowed 1280x720 (render scale 1)
@@ -42,12 +48,12 @@ int GetResolutionIndex() { return 0; }
 Resolution GetResolution() { return { 1280, 720 }; }
 void SetMode(int) {}
 void SetResolutionIndex(int) {}
-uint32_t Generation() { return 0; }
+uint32_t Generation() { return 0; } int GetSharpness() { return 0; } int GetAntiAliasing() { return 0; } int GetTextureFilter() { return 0; } void SetSharpness(int) {} void SetAntiAliasing(int) {} void SetTextureFilter(int) {} bool GetVSync() { return true; } void SetVSync(bool) {}
 }
 '''
 # Kernel headers the hardware backend includes, copied next to the test translation unit.
 BACKEND_HEADERS = ("gpu_hw_d3d11.h", "gpu_render.h", "gpu_draw_profile.h", "gpu_d3d11_movie.h", "gpu_shader_subset.h",
-                   "display_settings.h")
+                   "display_settings.h", "gpu_adapter.h")
 
 
 def build(folder, negative):

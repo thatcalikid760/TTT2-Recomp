@@ -17,13 +17,13 @@ namespace timeline {
 enum Event : uint8_t
 {
     Swap, Vblank, CpVblankWait, CpRing, MainGpuWait, MainResourceWait, WorkerCounterWait, SkinJob, PoolSet,
-    PoolWake, Count_
+    PoolWake, RbDrain, CpPresent, CpIb, InputRead, Count_
 };
 inline const char* Name(uint8_t e)
 {
     static const char* names[] = { "swap", "vblank", "cp-vblank-wait", "cp-ring", "main-gpu-wait",
                                    "main-resource-wait", "worker-counter-wait", "skin-job", "pool-set",
-                                   "pool-wake" };
+                                   "pool-wake", "rb-drain", "cp-present", "cp-ib", "input-read" };
     return e < Count_ ? names[e] : "?";
 }
 

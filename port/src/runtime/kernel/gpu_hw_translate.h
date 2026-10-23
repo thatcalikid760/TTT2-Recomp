@@ -181,8 +181,28 @@ inline bool UsesRelativeTemps(const Alu& in)
 }
 
 // One vertex fetch of a translated vertex shader: dwords [index * stride + offset, + dwords)
-// relative to fetch-constant `slot`'s base are read (the CPU-side upload range).
-struct VsFetch { uint32_t slot, stride; int32_t offset; uint32_t dwords, format = 0; };
+// relative to fetch-constant `slot`'s base are read (the CPU-side upload range; 0 dwords: a format
+// not decoded, nothing read). The rest is how the fetch decodes - all of it reaches the shader per draw
+// (VsFetchDescriptors), none of it is compiled in.
+struct VsFetch
+{
+    uint32_t slot, stride; int32_t offset; uint32_t dwords, format = 0;
+    bool isSigned = false, numFormatAll = false; int32_t expAdjust = 0; uint32_t dstSwizzle = 0;
+};
+constexpr uint32_t kMaxVsFetches = 32;
+// Guest dwords one vertex fetch of this format reads (0: not decoded - the fetch yields 0, 0, 0, 1).
+inline uint32_t VsFetchDwords(uint32_t fmt)
+{
+    switch (fmt)
+    {
+    case FMT_32_FLOAT: case FMT_8_8_8_8: case FMT_8: case FMT_5_6_5: case FMT_1_5_5_5: case FMT_4_4_4_4:
+    case FMT_8_8: case FMT_16_16: case FMT_16_16_FLOAT: case FMT_2_10_10_10: return 1;
+    case FMT_32_32_FLOAT: case FMT_16_16_16_16: case FMT_16_16_16_16_FLOAT:  return 2;
+    case FMT_32_32_32_FLOAT:                                                    return 3;
+    case FMT_32_32_32_32_FLOAT:                                                 return 4;
+    default:                                                                    return 0;
+    }
+}
 
 class Writer
 {
@@ -514,15 +534,22 @@ public:
         // is honoured exactly in the parity path, approximated by the slot sampler otherwise.
         if (in.magFilter() != 3) out << "        smp.z = " << (in.magFilter() == 1 ? 1 : 0) << ";\n";
         if (cube) out << "        if (isCube) { smp.x = 2; smp.y = 2; }\n";
+        // Computed LOD (the hardware's own mip selection): SampleGrad with the derivatives of the
+        // native coordinate before XNativeUV's wrap (a wrap would put a seam of huge derivatives -
+        // the smallest level - along it). Level 0 otherwise, and in vertex shaders.
+        const bool grad = in.useComputedLod() && !vertex;
+        if (grad && !exactFilter) out << "        float2 xg = uv * texScale[" << slot << "].xy, gx = ddx(xg), gy = ddy(xg);\n";
+        const char* op = grad ? ".SampleGrad(xs[" : ".SampleLevel(xs[";
+        const char* tail = grad ? ", gx, gy);\n" : ", 0);\n";
         if (exactFilter)
             out << "        float4 f = " << (cube ? "XExactSampleA(" : "XExactSample(") << t << ", uv, "
                 << (cube ? "face, " : "") << "texInfo[" << slot << "].zw, smp);\n";
         else if (cube)
-            out << "        float4 f = " << t << ".SampleLevel(xs[" << (slot & 15) << "], float3(XNativeUV(uv, smp, texScale["
-                << slot << "]), face), 0);\n";
+            out << "        float4 f = " << t << op << (slot & 15) << "], float3(XNativeUV(uv, smp, texScale["
+                << slot << "]), face)" << tail;
         else
-            out << "        float4 f = " << t << ".SampleLevel(xs[" << (slot & 15) << "], XNativeUV(uv, smp, texScale["
-                << slot << "]), 0);\n";
+            out << "        float4 f = " << t << op << (slot & 15) << "], XNativeUV(uv, smp, texScale["
+                << slot << "])" << tail;
         out << "        f = XSwz(XRemap(f, texInfo[" << slot << "].y), texInfo[" << slot << "].x);\n";
         const std::string dst = R(in.dstRegister());
         const uint32_t dsw = in.dstSwizzle();
@@ -540,11 +567,22 @@ public:
     // round(src) clamped at 0, the address base + (index * stride + offset) dwords, and the
     // guest data arrives as host-order dwords (each big-endian guest dword swapped on upload),
     // so GRead16/GRead8 at a dword address are the dword's high half / high byte.
+    // The fetch constant, stride, offset, format, signedness, number format, exponent adjust and
+    // destination swizzle are not compiled in: the game's D3D patches exactly those fields per vertex
+    // layout at run time (MEASURED: a vertex shader in the game files and its run-time copies differ
+    // only in the vfetch dwords; 568 run-time copies came from far fewer shaders), so one compiled
+    // shader serves every layout and can be built ahead of time from the files. The draw passes them
+    // per fetch (vfDesc[i], VsFetchDescriptors - i = the fetch's position in program order); XFetch
+    // (VsPrelude) decodes. The HLSL text depends only on fields the game never patches.
     void VFetch_(const VFetch& in)
     {
         if (!vertex) { unsupported = "vertex fetch in pixel shader"; return; }
+        // The fetch constant is one of the patched fields: a file's shader carries a placeholder
+        // (MEASURED: slot 96 - no fetch constant - in some), so a slot past 95 is not a reason to
+        // refuse the shader; that fetch reads nothing (VsFetchDescriptors leaves it invalid). A mini
+        // fetch before any full one is a structural problem, though.
+        if (in.isMiniFetch() && lastSlot == ~0u) { unsupported = "vertex fetch without a fetch constant"; return; }
         const uint32_t slot = in.isMiniFetch() ? lastSlot : in.constIndex() * 3 + in.constIndexSel();
-        if (slot >= 96) { unsupported = "vertex fetch without a fetch constant"; return; }
         uint32_t stride = in.isMiniFetch() ? lastStride : in.stride();
         if (!stride) stride = lastStride;
         if (!in.isMiniFetch()) { lastSlot = slot; lastStride = stride; }
@@ -555,64 +593,26 @@ public:
             unsupported = "vertex fetch index is not the vertex index";
             return;
         }
-        const uint32_t fmt = in.format();
-        const std::string S = in.signedRfMode() ? "true" : "false";
-        uint32_t dwords = 1;
-        std::string v;
-        switch (fmt)
-        {
-        case FMT_32_FLOAT:            v = "float4(asfloat(d0), 0, 0, 1)"; break;
-        case FMT_32_32_FLOAT:         v = "float4(asfloat(d0), asfloat(d1), 0, 1)"; dwords = 2; break;
-        case FMT_32_32_32_FLOAT:      v = "float4(asfloat(d0), asfloat(d1), asfloat(d2), 1)"; dwords = 3; break;
-        case FMT_32_32_32_32_FLOAT:   v = "float4(asfloat(d0), asfloat(d1), asfloat(d2), asfloat(d3))"; dwords = 4; break;
-        case FMT_8_8_8_8:
-            v = "float4(XN8(d0, " + S + "), XN8(d0 >> 8, " + S + "), XN8(d0 >> 16, " + S + "), XN8(d0 >> 24, " + S + "))";
-            if (in.numFormatAll()) v += " * 255.0";
-            break;
-        case FMT_8:                   v = "float4(XN8(d0 >> 24, " + S + ").xxx, 1)"; break;
-        case FMT_5_6_5:
-            v = "float4(((d0 >> 27) & 31) / 31.0, ((d0 >> 21) & 63) / 63.0, ((d0 >> 16) & 31) / 31.0, 1)"; break;
-        case FMT_1_5_5_5:
-            v = "float4(((d0 >> 26) & 31) / 31.0, ((d0 >> 21) & 31) / 31.0, ((d0 >> 16) & 31) / 31.0, (d0 >> 31) ? 1.0 : 0.0)"; break;
-        case FMT_4_4_4_4:
-            v = "float4(((d0 >> 24) & 15) / 15.0, ((d0 >> 20) & 15) / 15.0, ((d0 >> 16) & 15) / 15.0, ((d0 >> 28) & 15) / 15.0)"; break;
-        case FMT_8_8:                 v = "float4(XN8(d0 >> 16, " + S + "), XN8(d0 >> 24, " + S + "), 0, 1)"; break;
-        case FMT_16_16:
-            v = "float4(XN16(d0, " + S + "), XN16(d0 >> 16, " + S + "), 0, 1)";
-            if (in.numFormatAll()) v += " * float4(65535.0, 65535.0, 1.0, 1.0)";
-            break;
-        case FMT_16_16_16_16:
-            v = "float4(XN16(d0, " + S + "), XN16(d0 >> 16, " + S + "), XN16(d1, " + S + "), XN16(d1 >> 16, " + S + "))";
-            dwords = 2;
-            break;
-        case FMT_16_16_FLOAT:         v = "float4(f16tof32(d0 & 0xFFFF), f16tof32(d0 >> 16), 0, 1)"; break;
-        case FMT_16_16_16_16_FLOAT:
-            v = "float4(f16tof32(d0 & 0xFFFF), f16tof32(d0 >> 16), f16tof32(d1 & 0xFFFF), f16tof32(d1 >> 16))";
-            dwords = 2;
-            break;
-        case FMT_2_10_10_10:
-            v = "float4((d0 & 0x3FF) / 1023.0, ((d0 >> 10) & 0x3FF) / 1023.0, ((d0 >> 20) & 0x3FF) / 1023.0, ((d0 >> 30) & 3) / 3.0)";
-            break;
-        default:                      v = "float4(0, 0, 0, 1)"; dwords = 0; break;   // not decoded on CPU either
-        }
-        if (dwords) fetches.push_back({ slot, stride, in.offset(), dwords, fmt });
-        // vfRegion.w = 0: the slot holds no vertex fetch constant - the CPU returns before
+        if (fetches.size() >= kMaxVsFetches) { unsupported = "more than 32 vertex fetches"; return; }
+        const uint32_t i = uint32_t(fetches.size());
+        VsFetch f{ slot, stride, in.offset(), VsFetchDwords(in.format()), in.format() };
+        f.isSigned = in.signedRfMode();
+        f.numFormatAll = in.numFormatAll();
+        f.expAdjust = in.expAdjust();
+        f.dstSwizzle = in.dstSwizzle();
+        fetches.push_back(f);
+        // vfRegion[slot].w = 0: the slot holds no vertex fetch constant - the CPU returns before
         // touching the destination register.
-        out << "    if (vfRegion[" << slot << "].w != 0) {\n"
-            << "        uint vi = (uint)max(0.0, floor(" << R(0) << ".x + 0.5));\n"
-            << "        int fa = (int)(vi * " << stride << "u) + (" << in.offset() << ");\n";
-        for (uint32_t d = 0; d < 4; ++d)
-            out << "        uint d" << d << " = " << (d < dwords ? "XVd(" + Num(slot) + ", fa + " + Num(d) + ")" : std::string("0")) << ";\n";
-        out << "        float4 f = " << v << ";\n";
-        if (in.expAdjust()) out << "        f *= exp2(" << in.expAdjust() << ".0);\n";
         const std::string dst = R(in.dstRegister());
-        const uint32_t dsw = in.dstSwizzle();
-        for (int i = 0; i < 4; ++i)
+        // The value itself was decoded at the top (xf[i], TranslateVertexShader): every fetch reads the
+        // untouched vertex index (checked above), so where it runs does not change what it reads.
+        out << "    if (XFetchOn(" << i << "u)) {\n"
+            << "        float4 f = xf[" << i << "];\n"
+            << "        uint sw = vfDesc[" << i << "].w >> 16;\n";
+        for (int c = 0; c < 4; ++c)
         {
-            uint32_t s = (dsw >> (i * 3)) & 7;
-            if (s < 4) out << "        " << dst << "." << "xyzw"[i] << " = f." << "xyzw"[s] << ";\n";
-            else if (s == 4) out << "        " << dst << "." << "xyzw"[i] << " = 0.0;\n";
-            else if (s == 5) out << "        " << dst << "." << "xyzw"[i] << " = 1.0;\n";
+            const std::string d = dst + "." + "xyzw"[c];
+            out << "        { uint s = (sw >> " << (3 * c) << ") & 7; if (s < 6) " << d << " = XSel(f, s); }\n";
         }
         out << "    }\n";
         if ((in.dstRegister() & 63) == 0) r0Written = true;
@@ -880,11 +880,74 @@ struct VsStateCB
     uint32_t vte; float xs, xo, ys;
     float yo, zs, zo, pitch;
     float rows; uint32_t noClip, pad[2];
+    uint32_t vfDesc[detail::kMaxVsFetches][4];   // the fetches' parameters (VsFetchDescriptors)
 };
+
+// The draw's per-fetch parameters for a translated vertex shader (its fetches in program order).
+inline void VsFetchDescriptors(const VsTranslation& t, uint32_t desc[detail::kMaxVsFetches][4])
+{
+    for (uint32_t i = 0; i < detail::kMaxVsFetches; ++i)
+    {
+        desc[i][0] = desc[i][1] = desc[i][2] = desc[i][3] = 0;
+        if (i >= t.fetches.size() || t.fetches[i].slot >= 96) continue;   // no fetch constant: no fetch
+        const detail::VsFetch& f = t.fetches[i];
+        desc[i][0] = f.slot;
+        desc[i][1] = f.stride;
+        desc[i][2] = uint32_t(f.offset);
+        desc[i][3] = (f.format & 63) | (f.isSigned ? 1u << 6 : 0u) | (f.numFormatAll ? 1u << 7 : 0u) |
+                     (uint32_t(f.expAdjust) & 63) << 8 | (f.dstSwizzle & 0xFFF) << 16 | 1u << 31;
+    }
+}
+
+// vfDesc[i] = fetch i's { slot, stride, offset, format | signed << 6 | number format << 7 |
+// exponent adjust (6 bits) << 8 | destination swizzle << 16 | 1 << 31 } (VsFetchDescriptors).
+inline std::string VsFetchHlsl()
+{
+    auto C = [](uint32_t fmt, const char* body) { return "    case " + detail::Num(fmt) + "u: " + body + " break;\n"; };
+    return std::string(R"(
+bool XFetchOn(uint i) { uint4 d = vfDesc[i]; return (d.w >> 31) != 0 && vfRegion[d.x].w != 0; }
+// Destination swizzle component s (0-3 x..w, 4 = 0, 5 = 1), chosen without indexing the vector.
+float XSel(float4 f, uint s) { return s == 0 ? f.x : s == 1 ? f.y : s == 2 ? f.z : s == 3 ? f.w : s == 4 ? 0.0 : 1.0; }
+float4 XFetch(uint i, float index)
+{
+    uint4 d = vfDesc[i];
+    uint slot = d.x;
+    uint vi = (uint)max(0.0, floor(index + 0.5));
+    int fa = (int)(vi * d.y) + (int)d.z;
+    bool s = ((d.w >> 6) & 1) != 0;
+    bool all = ((d.w >> 7) & 1) != 0;
+    int ea = ((int)(d.w << 18)) >> 26;
+    uint d0 = XVd(slot, fa);
+    float4 f = float4(0, 0, 0, 1);
+    [branch] switch (d.w & 63)
+    {
+)") +
+        C(FMT_32_FLOAT, "f = float4(asfloat(d0), 0, 0, 1);") +
+        C(FMT_32_32_FLOAT, "f = float4(asfloat(d0), asfloat(XVd(slot, fa + 1)), 0, 1);") +
+        C(FMT_32_32_32_FLOAT, "f = float4(asfloat(d0), asfloat(XVd(slot, fa + 1)), asfloat(XVd(slot, fa + 2)), 1);") +
+        C(FMT_32_32_32_32_FLOAT, "f = float4(asfloat(d0), asfloat(XVd(slot, fa + 1)), asfloat(XVd(slot, fa + 2)), asfloat(XVd(slot, fa + 3)));") +
+        C(FMT_8_8_8_8, "f = float4(XN8(d0, s), XN8(d0 >> 8, s), XN8(d0 >> 16, s), XN8(d0 >> 24, s)); if (all) f *= 255.0;") +
+        C(FMT_8, "f = float4(XN8(d0 >> 24, s).xxx, 1);") +
+        C(FMT_5_6_5, "f = float4(((d0 >> 27) & 31) / 31.0, ((d0 >> 21) & 63) / 63.0, ((d0 >> 16) & 31) / 31.0, 1);") +
+        C(FMT_1_5_5_5, "f = float4(((d0 >> 26) & 31) / 31.0, ((d0 >> 21) & 31) / 31.0, ((d0 >> 16) & 31) / 31.0, (d0 >> 31) ? 1.0 : 0.0);") +
+        C(FMT_4_4_4_4, "f = float4(((d0 >> 24) & 15) / 15.0, ((d0 >> 20) & 15) / 15.0, ((d0 >> 16) & 15) / 15.0, ((d0 >> 28) & 15) / 15.0);") +
+        C(FMT_8_8, "f = float4(XN8(d0 >> 16, s), XN8(d0 >> 24, s), 0, 1);") +
+        C(FMT_16_16, "f = float4(XN16(d0, s), XN16(d0 >> 16, s), 0, 1); if (all) f *= float4(65535.0, 65535.0, 1.0, 1.0);") +
+        C(FMT_16_16_16_16, "{ uint d1 = XVd(slot, fa + 1); f = float4(XN16(d0, s), XN16(d0 >> 16, s), XN16(d1, s), XN16(d1 >> 16, s)); }") +
+        C(FMT_16_16_FLOAT, "f = float4(f16tof32(d0 & 0xFFFF), f16tof32(d0 >> 16), 0, 1);") +
+        C(FMT_16_16_16_16_FLOAT, "{ uint d1 = XVd(slot, fa + 1); f = float4(f16tof32(d0 & 0xFFFF), f16tof32(d0 >> 16), f16tof32(d1 & 0xFFFF), f16tof32(d1 >> 16)); }") +
+        C(FMT_2_10_10_10, "f = float4((d0 & 0x3FF) / 1023.0, ((d0 >> 10) & 0x3FF) / 1023.0, ((d0 >> 20) & 0x3FF) / 1023.0, ((d0 >> 30) & 3) / 3.0);") +
+        R"(    default: break;
+    }
+    if (ea != 0) f *= exp2((float)ea);
+    return f;
+}
+)";
+}
 
 inline const char* VsPrelude()
 {
-    return R"(
+    static const std::string text = std::string(R"(
 cbuffer XenosVsConstants : register(b0) { float4 c[512]; };
 cbuffer XenosVsState : register(b1)
 {
@@ -894,6 +957,7 @@ cbuffer XenosVsState : register(b1)
     uint vte; float vpXs; float vpXo; float vpYs;
     float vpYo; float vpZs; float vpZo; float surfPitch;
     float surfRows; uint noClip; uint2 vsPad;
+    uint4 vfDesc[32];
 };
 ByteAddressBuffer vdata : register(t0);
 float4 XC(int i) { return (uint)i < 512u ? c[(uint)i] : float4(0, 0, 0, 0); }
@@ -908,7 +972,8 @@ uint XVd(uint slot, int dw)
 float XN8(uint u, bool s)  { u &= 0xFF;   return s ? max(-1.0, (float)((int)(u << 24) >> 24) / 127.0) : (float)u / 255.0; }
 float XN16(uint u, bool s) { u &= 0xFFFF; return s ? max(-1.0, (float)((int)(u << 16) >> 16) / 32767.0) : (float)u / 65535.0; }
 struct XVs { float4 pos; float4 o[16]; bool wrotePos; };
-)";
+)") + VsFetchHlsl();
+    return text.c_str();
 }
 
 // Translate vertex-shader microcode (host-order dwords). r0.x holds the vertex index.
@@ -923,7 +988,8 @@ inline VsTranslation TranslateVertexShader(const std::vector<uint32_t>& code)
     else EmitProgram(code, w, branching, result.unsupported);
     // With loops/calls the program order is not the execution order: a register-0 write could
     // precede a fetch at run time. Only straight-line shaders get the index-range guarantee.
-    if (result.unsupported.empty() && branching && w.r0Written && !w.fetches.empty())
+    if (result.unsupported.empty() && branching && w.r0Written &&
+        std::any_of(w.fetches.begin(), w.fetches.end(), [](const detail::VsFetch& f) { return f.dwords != 0; }))
         result.unsupported = "vertex fetch after a possible index-register write (branching)";
     if (!result.unsupported.empty()) return result;
 
@@ -936,6 +1002,11 @@ inline VsTranslation TranslateVertexShader(const std::vector<uint32_t>& code)
     else
         for (uint32_t r : w.regs)
             f << "    float4 r" << r << " = " << (r == 0 ? std::string("float4((float)index, 0, 0, 0)") : std::string("float4(0, 0, 0, 0)")) << ";\n";
+    // The vertex fetches, decoded in one loop (one copy of XFetch's format switch: D3DCompile spent
+    // ~0.94 s per vertex shader with one per fetch - MEASURED, fxc_bench.py).
+    if (!w.fetches.empty())
+        f << "    float4 xf[" << w.fetches.size() << "];\n"
+          << "    [loop] for (uint xfi = 0; xfi < " << w.fetches.size() << "u; ++xfi) xf[xfi] = XFetch(xfi, (float)index);\n";
     f << "    float4 oPos = float4(0, 0, 0, 0); float4 oI[16];\n"
          "    [unroll] for (int oz = 0; oz < 16; ++oz) oI[oz] = float4(0, 0, 0, 0);\n"
          "    bool wrotePos = false;\n"
@@ -1025,7 +1096,9 @@ inline void VsFetchRanges(const VsTranslation& t, uint32_t minIndex, uint32_t ma
     for (uint32_t s = 0; s < 96; ++s) used[s] = false;
     for (const detail::VsFetch& f : t.fetches)
     {
+        if (!f.dwords) continue;                    // a format not decoded reads nothing
         const int64_t a = int64_t(minIndex) * f.stride + f.offset, b = int64_t(maxIndex) * f.stride + f.offset + f.dwords;
+        if (f.slot >= 96) continue;                 // no fetch constant: reads nothing
         if (!used[f.slot]) { lo[f.slot] = a; hi[f.slot] = b; used[f.slot] = true; }
         else { lo[f.slot] = (std::min)(lo[f.slot], a); hi[f.slot] = (std::max)(hi[f.slot], b); }
     }
@@ -1034,7 +1107,9 @@ inline void VsFetchRanges(const VsTranslation& t, uint32_t minIndex, uint32_t ma
 // Compute kernel for parity tests: inputs[16] per item in t32, outputs (color, killed) in u0.
 inline std::string ParityComputeHlsl(const PsTranslation& t)
 {
-    return std::string(PsPrelude()) + t.function + R"(
+    // Compute shaders have no screen-space derivatives: zero gradients sample level 0 (the
+    // interpreter's sampling; the harness binds single-level textures anyway).
+    return std::string("#define ddx(v) ((v) * 0.0)\n#define ddy(v) ((v) * 0.0)\n") + PsPrelude() + t.function + R"(
 StructuredBuffer<float4> parityIn : register(t32);
 RWStructuredBuffer<float4> parityOut : register(u0);
 [numthreads(64, 1, 1)]

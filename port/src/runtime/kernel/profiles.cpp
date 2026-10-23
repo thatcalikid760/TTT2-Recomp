@@ -167,4 +167,20 @@ int Create(const std::string& rawName)
     return int(g_list.size()) - 1;
 }
 
+int Rename(int index, const std::string& rawName)
+{
+    const std::string name = Normalize(rawName);
+    std::lock_guard l(g_mutex);
+    LoadLocked();
+    if (index < 0 || index >= int(g_list.size()) || index == g_active || !ValidName(name)) return 1;
+    auto upper = [](std::string s) { for (char& c : s) c = char(std::toupper(static_cast<unsigned char>(c))); return s; };
+    for (int i = 0; i < int(g_list.size()); ++i)
+        if (i != index && upper(g_list[i].name) == upper(name)) return 2;
+    std::fprintf(stderr, "[profiles] renamed '%s' to '%s' (%016llX)\n", g_list[index].name.c_str(), name.c_str(),
+                 static_cast<unsigned long long>(g_list[index].xuid));
+    g_list[index].name = name;
+    SaveLocked();
+    return 0;
+}
+
 } // namespace profiles

@@ -342,6 +342,9 @@ struct TFetch
     uint32_t srcSwizzle()  const { return (w0 >> 26) & 0x3F; }
     uint32_t dstSwizzle()  const { return w1 & 0xFFF; }
     uint32_t magFilter()   const { return (w1 >> 12) & 0x3; }   // 0 point, 1 linear, 3 = fetch constant's
+    // dword 1 bit 28 use_computed_lod: the hardware picks the mip level from the coordinate's screen-space
+    // derivatives (every TTT2 tfetch but 121 of 23,718; the rest sample level 0).
+    bool     useComputedLod() const { return (w1 >> 28) & 1; }
     // FetchOpDimension, dword 2 bits 14-15 (Xenia ucode.h): 0 1D, 1 2D, 2 3D/stacked, 3 cube.
     // TTT2's pixel shaders use 2D (w2 = 0x4000) and cube (0xC000) fetches.
     uint32_t dimension()   const { return (w2 >> 14) & 0x3; }
@@ -600,6 +603,17 @@ struct Texture
     // dword0 bits 2-9: per-component sign x,y,z,w (2 bits each): 0 unsigned, 1 signed,
     // 2 unsigned biased, 3 gamma (Xenia TextureSign). Recorded for the format census.
     uint32_t signs = 0;
+    // Mip levels and minification (Xenia xenos.h xe_gpu_texture_fetch_t): dword 3 bits 21-22 min
+    // filter, 23-24 mip filter (0 point, 1 linear, 2 base level only), 25-27 anisotropic filter
+    // (0 off, 1..5 = 1:1..16:1); dword 4 bits 2-5 / 6-9 the first / last level, 12-21 the LOD bias
+    // (signed, 1/32 steps); dword 5 bit 11 packed mips, bits 12-31 the mip levels' physical page.
+    uint32_t minFilter = 1, mipFilter = 2, aniso = 0, mipMin = 0, mipMax = 0;
+    int32_t lodBias = 0;
+    bool packedMips = false;
+    uint32_t mipBase = 0;
+    // Where the image starts inside the storage at `base` (texels): a packed mip level's offset in
+    // its tile (TextureMipLevel). 0 for every fetch-constant texture.
+    uint32_t originX = 0, originY = 0;
 };
 
 // Bytes from one cube face (array slice) to the next: each face is a whole 2D surface - block
@@ -664,9 +678,65 @@ Texture DecodeTexture(const uint32_t* regs, uint32_t slot)
     t.border = c[5] & 3;
     t.dimension = (c[5] >> 9) & 3;
     t.signs = (c[0] >> 2) & 0xFF;
+    t.minFilter = (c[3] >> 21) & 3;
+    t.mipFilter = (c[3] >> 23) & 3;
+    t.aniso = (c[3] >> 25) & 7;
+    t.mipMin = (c[4] >> 2) & 0xF;
+    t.mipMax = (c[4] >> 6) & 0xF;
+    t.lodBias = int32_t(c[4] << 10) >> 22;
+    t.packedMips = (c[5] >> 11) & 1;
+    t.mipBase = (c[5] >> 12) ? PhysToGuest((c[5] >> 12) << 12) : 0;
     if (!t.pitch) t.pitch = t.width;
     t.valid = t.base != 0 && t.width > 0 && t.height > 0;
     return t;
+}
+
+// Where a mip level is stored (Xenos; the layout Xenia's texture_util.cc GetGuestTextureLayout /
+// GetPackedMipOffset describes): level 0 at the base address with the fetch constant's pitch; levels
+// 1+ back to back from the mip address, each sized from the base's power-of-two-rounded dimensions
+// (tiled: whole 32x32-block tiles), every level 4 KB aligned. With packed mips, the levels from the
+// first whose shorter side is 16 texels or less share one level's storage, each at its own texel
+// offset in it. `variant` (TTT2_MIP_CENSUS only): 1 no packing, 2 sizes not rounded to powers of
+// two, 4 a packed level-0 chain's levels from the mip address.
+struct MipLevel { uint32_t base = 0, pitch = 1, rows = 1, x = 0, y = 0, width = 1, height = 1; };   // pitch / rows: the storage, texels
+inline uint32_t Log2Ceil(uint32_t v) { return v <= 1 ? 0u : 32u - uint32_t(__builtin_clz(v - 1)); }
+inline void PackedMipOffset(uint32_t width, uint32_t height, uint32_t level, uint32_t& x, uint32_t& y)
+{
+    const uint32_t lw = Log2Ceil(width), lh = Log2Ceil(height), ls = std::min(lw, lh);
+    const uint32_t packedBase = ls > 4 ? ls - 4 : 0, p = level - packedBase;
+    x = y = 0;
+    if (p < 3) { if (lw > lh) y = 16u >> p; else x = 16u >> p; }
+    else if (lw > lh) x = (1u << (lw - packedBase)) >> (p - 2);
+    else y = (1u << (lh - packedBase)) >> (p - 2);
+}
+inline uint32_t TextureBlockBytes(uint32_t format)
+{
+    if (!IsBlockCompressed(format)) return std::max<uint32_t>(FormatBpp(format) / 8, 1);
+    return (format == FMT_DXT1 || format == FMT_DXT3A || format == FMT_DXT5A || format == FMT_CTX1) ? 8 : 16;
+}
+bool TextureMipLevel(const Texture& t, uint32_t level, MipLevel& m, uint32_t variant = 0)
+{
+    const uint32_t bw = IsBlockCompressed(t.format) ? 4 : 1, bpb = TextureBlockBytes(t.format);
+    m.width = std::max(t.width >> level, 1u); m.height = std::max(t.height >> level, 1u);
+    const uint32_t ls = Log2Ceil(std::min(t.width, t.height));
+    const uint32_t packedLevel = t.packedMips && !(variant & 1) ? (ls > 4 ? ls - 4 : 0) : 99u;
+    m.x = m.y = 0;
+    if (level >= packedLevel) PackedMipOffset(t.width, t.height, level, m.x, m.y);
+    if (level == 0 || (packedLevel == 0 && !(variant & 4))) { m.base = t.base; m.pitch = t.pitch; m.rows = t.height; return true; }
+    if (!t.mipBase) return false;
+    const uint32_t w2 = (variant & 2) ? t.width : 1u << Log2Ceil(t.width), h2 = (variant & 2) ? t.height : 1u << Log2Ceil(t.height);
+    uint32_t addr = t.mipBase;
+    const uint32_t last = std::min(level, packedLevel);
+    for (uint32_t l = 1; l <= 15; ++l)
+    {
+        const uint32_t lw = std::max(w2 >> l, 1u), lh = std::max(h2 >> l, 1u);
+        uint32_t cols = (lw + bw - 1) / bw, rows = (lh + bw - 1) / bw;
+        if (t.tiled) { cols = (cols + 31) & ~31u; rows = (rows + 31) & ~31u; }
+        else cols = ((cols * bpb + 255) & ~255u) / bpb;
+        if (l == last) { m.base = addr; m.pitch = cols * bw; m.rows = rows * bw; return true; }
+        addr += (cols * rows * bpb + 4095) & ~4095u;
+    }
+    return false;
 }
 
 // Normalize one texture dword to the little-endian bit layout consumed by BC
@@ -1531,6 +1601,57 @@ bool DepthCompare(uint32_t func, float src, float dst)
 #include "gpu_hw_d3d11.h"
 #endif
 
+// main.cpp --build-shaders: the game's shaders into the disk cache ahead of time (gpu_hw_d3d11.h).
+int GpuPrebuildShaders(const std::vector<std::filesystem::path>& files, unsigned threads)
+{
+#if defined(TTT2_GPU_HW_BACKEND)
+    return ttt2_hw::Backend::PrebuildShaders(files, threads);
+#else
+    (void)files; (void)threads;
+    return 3;
+#endif
+}
+// main.cpp --translate vs|ps <file>: the HLSL for one microcode file (host-order dwords).
+int GpuTranslateFile(const char* kind, const char* path)
+{
+#if defined(TTT2_GPU_HW_BACKEND)
+    FILE* f = std::fopen(path, "rb");
+    if (!f) return 2;
+    std::vector<uint32_t> code;
+    uint32_t w;
+    while (std::fread(&w, 4, 1, f) == 1) code.push_back(w);
+    std::fclose(f);
+    if (std::strcmp(kind, "vs") == 0)
+    {
+        const ttt2_hw::VsTranslation t = ttt2_hw::TranslateVertexShader(code);
+        if (!t.unsupported.empty()) { std::printf("// unsupported: %s\n", t.unsupported.c_str()); return 1; }
+        const std::string hlsl = ttt2_hw::VertexShaderHlsl(t);
+        std::printf("// text key %016llX, %zu fetches\n%s", (unsigned long long)ttt2_hw::Fnv(hlsl.data(), hlsl.size()), t.fetches.size(), hlsl.c_str());
+    }
+    else
+    {
+        const ttt2_hw::PsTranslation t = ttt2_hw::TranslatePixelShader(code);
+        if (!t.unsupported.empty()) { std::printf("// unsupported: %s\n", t.unsupported.c_str()); return 1; }
+        const std::string hlsl = ttt2_hw::PixelShaderHlsl(t);
+        std::printf("// text key %016llX\n%s", (unsigned long long)ttt2_hw::Fnv(hlsl.data(), hlsl.size()), hlsl.c_str());
+    }
+    return 0;
+#else
+    (void)kind; (void)path;
+    return 3;
+#endif
+}
+
+// main.cpp: has this exe's prebuild completed for this user's cache?
+bool GpuShaderPrebuildCurrent()
+{
+#if defined(TTT2_GPU_HW_BACKEND)
+    return ttt2_hw::Backend::PrebuildCurrent();
+#else
+    return true;
+#endif
+}
+
 bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr,
                     bool index32, const GpuShader& vsRef, const GpuShader& psRef)
 {
@@ -1575,6 +1696,8 @@ bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr
     std::vector<uint32_t> idx(numIdx);
     std::vector<uint8_t> cut(numIdx, 0);
     bool anyCut = false;
+    extern void GpuNoteMemory(int kind, uint32_t addr, uint32_t bytes);
+    if (srcSel != 2 && indexAddr) GpuNoteMemory(2, indexAddr, numIdx * (index32 ? 4 : 2));
     for (uint32_t i = 0; i < numIdx; ++i)
     {
         uint32_t raw;

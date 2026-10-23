@@ -200,8 +200,27 @@ std::mutex g_ringMutex;
 uint64_t g_ringSwaps[4] = {};
 uint64_t g_ringAdvances = 0, g_ringDeficitHist[6] = {};
 }
+void ResimScratchAdvance();   // resim_scratch.cpp: a new scratch slot while re-simulating
 PPC_FUNC(sub_82AD5BA0)
 {
+    ResimScratchAdvance();
+    // TTT2_RB_GPUMEM=1: each ring object once (regions +68, size +4, bases +8...).
+    static const bool gpuMem = [] { const char* e = std::getenv("TTT2_RB_GPUMEM"); return e && *e == '1'; }();
+    if (gpuMem)
+    {
+        static std::mutex m;
+        static std::set<uint32_t> seen;
+        std::lock_guard l(m);
+        if (seen.insert(ctx.r3.u32).second)
+        {
+            const uint32_t o = ctx.r3.u32, n = GRead32(base, o + 68);
+            char line[512];
+            int k = std::snprintf(line, sizeof(line), "[gpu-mem] vertex ring %08X: %u regions of %08X bytes, index %u, cursor %08X, bases",
+                                  o, n, GRead32(base, o + 4), GRead32(base, o + 20), GRead32(base, o + 24));
+            for (uint32_t i = 0; i < n && i < 12 && k < 450; ++i) k += std::snprintf(line + k, sizeof(line) - k, " %08X", GRead32(base, o + 8 + 4 * i));
+            std::fprintf(stderr, "%s (caller %08X)\n", line, uint32_t(ctx.lr));
+        }
+    }
     if (DiagSkin())
     {
         std::lock_guard lock(g_ringMutex);
@@ -292,9 +311,34 @@ bool DiagSkinDescribe(uint32_t addr, char* out, size_t size)
 // sub_824F58B8(job) kicks a job of the pool threads (sub_824F5458, which poll for work with
 // Sleep(1) while idle) and waits for it by entering the job's lock (+24). Every 10 s: waits,
 // total and longest wait (ms).
+void RollbackNoteJobObject(uint32_t addr, uint32_t size);   // rollback.cpp
+void RollbackJobTrace(const char* what, uint32_t obj, bool after);
+bool RollbackInResimDraw();
+void RollbackResimTime(int id, double ms);
+struct ResimTimer
+{
+    int id;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~ResimTimer() { if (RollbackInResimDraw()) RollbackResimTime(id, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count()); }
+};
+// The pool job threads' loop (sub_824F5458, r3 = the job): rollback's job wait learns which host thread
+// runs which job (rollback.cpp RollbackNotePoolThread).
+void RollbackNotePoolThread(uint32_t job);
+void RollbackNotePoolThreadExit(uint32_t job);
+extern "C" PPC_FUNC(__imp__sub_824F5458);
+PPC_FUNC(sub_824F5458)
+{
+    const uint32_t job = ctx.r3.u32;
+    RollbackNotePoolThread(job);
+    __imp__sub_824F5458(ctx, base);
+    RollbackNotePoolThreadExit(job);
+}
 extern "C" PPC_FUNC(__imp__sub_824F58B8);
 PPC_FUNC(sub_824F58B8)
 {
+    RollbackNoteJobObject(ctx.r3.u32, 0xA8);
+    RollbackJobTrace("kick", ctx.r3.u32, false);
+    const ResimTimer resimTimer{ 1 };
     static const bool on = [] { const char* e = std::getenv("TTT2_FRAMETIME"); return e && *e == '1'; }();
     if (!on)
     {
@@ -331,8 +375,48 @@ PPC_FUNC(sub_824F58B8)
 extern "C" PPC_FUNC(__imp__sub_82ACFF90);
 PPC_FUNC(sub_82ACFF90)
 {
+    RollbackNoteJobObject(ctx.r3.u32, 0x100);
+    const uint32_t obj = ctx.r3.u32;
+    RollbackJobTrace("group-wait", obj, false);
+    const ResimTimer resimTimer{ 0 };
     const timeline::Scope mark{ timeline::MainResourceWait, ctx.r3.u32 };
     __imp__sub_82ACFF90(ctx, base);
+    RollbackJobTrace("group-wait", obj, true);
+}
+extern "C" PPC_FUNC(__imp__sub_82AD06F8);
+PPC_FUNC(sub_82AD06F8)
+{
+    const uint32_t obj = ctx.r3.u32;
+    RollbackJobTrace("dispatch", obj, false);
+    const ResimTimer resimTimer{ 2 };
+    __imp__sub_82AD06F8(ctx, base);
+    RollbackJobTrace("dispatch", obj, true);
+}
+extern "C" PPC_FUNC(__imp__sub_82AD1B88);
+PPC_FUNC(sub_82AD1B88)
+{
+    const uint32_t obj = ctx.r3.u32;
+    RollbackJobTrace("frame-kick", obj, false);
+    const ResimTimer resimTimer{ 3 };
+    __imp__sub_82AD1B88(ctx, base);
+    RollbackJobTrace("frame-kick", obj, true);
+}
+#define RESIM_TIMED(addr, id) \
+    extern "C" PPC_FUNC(__imp__sub_##addr); \
+    PPC_FUNC(sub_##addr) { const ResimTimer resimTimer{ id }; __imp__sub_##addr(ctx, base); }
+RESIM_TIMED(82AD1DE8, 6)
+RESIM_TIMED(82AD2CC0, 7)
+RESIM_TIMED(82AD4D98, 8)
+RESIM_TIMED(82AE43E0, 10)
+
+extern "C" PPC_FUNC(__imp__sub_82AD0AF0);
+PPC_FUNC(sub_82AD0AF0)
+{
+    const uint32_t obj = ctx.r3.u32;
+    RollbackJobTrace("submit", obj, false);
+    const ResimTimer resimTimer{ 4 };
+    __imp__sub_82AD0AF0(ctx, base);
+    RollbackJobTrace("submit", obj, true);
 }
 extern "C" PPC_FUNC(__imp__sub_82738DA0);
 PPC_FUNC(sub_82738DA0)
@@ -370,6 +454,10 @@ TIMED_HOOK(82C12250)
 //   3: flight recorder - the main and command-processor threads all the time (1 kHz), and for
 //      every presented frame over 25 ms (HitchFrameGap) both threads' profiles over that gap.
 //   4: the main and command-processor threads all the time (1 kHz), a profile of each per 10 s.
+//   5: the main thread (1 kHz) only while a rollback re-simulation runs, its updates and its draws
+//      apart, a profile of each per 10 s.
+bool RollbackResimulating();   // rollback.cpp
+bool RollbackResimDraw();
 namespace hitch {
 struct Sample { int64_t at; uint32_t chain[24]; uint32_t depth; uint64_t host[32]; uint32_t hostDepth; };
 struct Target
@@ -397,7 +485,7 @@ int Mode()
 {
     static const int mode = [] {
         const char* e = std::getenv("TTT2_HITCH_PROFILE");
-        return e && *e >= '1' && *e <= '4' ? *e - '0' : 0;
+        return e && *e >= '1' && *e <= '5' ? *e - '0' : 0;
     }();
     return mode;
 }
@@ -456,6 +544,51 @@ extern "C" struct GuestContextRegistry
     std::atomic<uint32_t> count;
     GuestContextSlot slots[512];
 } g_guestContextRegistry;
+
+uint32_t GuestEntryOfThread(DWORD tid)   // rollback.cpp diagnostics
+{
+    const uint32_t n = (std::min)(g_guestContextRegistry.count.load(), 512u);
+    for (uint32_t i = 0; i < n; ++i)
+        if (g_guestContextRegistry.slots[i].tid == tid) return g_guestContextRegistry.slots[i].entry;
+    return 0;
+}
+
+// rollback.cpp's watchdog: every guest thread's current guest call chain (racy reads of live
+// contexts - diagnostics only).
+void DumpGuestThreads()
+{
+    const uint32_t n = (std::min)(g_guestContextRegistry.count.load(), 512u);
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        const GuestContextSlot& s = g_guestContextRegistry.slots[i];
+        if (!s.ctx) continue;
+        char line[512];
+        int k = std::snprintf(line, sizeof(line), "[threads] %u entry %08X lr %08X:", s.tid, s.entry, uint32_t(s.ctx->lr));
+        uint32_t frame = s.ctx->r1.u32;
+        for (int d = 0; d < 12 && frame && frame < 0xFFFFFFF0u && k < int(sizeof(line)) - 12; ++d)
+        {
+            const uint32_t prev = GRead32(g_base, frame);
+            if (!prev || prev <= frame || prev - frame > 0x10000) break;
+            k += std::snprintf(line + k, sizeof(line) - k, " %08X", GRead32(g_base, prev - 8));
+            frame = prev;
+        }
+        std::fprintf(stderr, "%s\n", line);
+    }
+}
+
+// rollback.cpp's watchdog: the live contexts (racy reads - diagnostics only).
+int GuestContexts(DWORD* tids, uint32_t* entries, PPCContext** ctxs, int max)
+{
+    const uint32_t n = (std::min)(g_guestContextRegistry.count.load(), 512u);
+    int k = 0;
+    for (uint32_t i = 0; i < n && k < max; ++i)
+    {
+        const GuestContextSlot& s = g_guestContextRegistry.slots[i];
+        if (!s.ctx) continue;
+        tids[k] = s.tid; entries[k] = s.entry; ctxs[k] = s.ctx; ++k;
+    }
+    return k;
+}
 
 PPCContext* GuestContextOf(DWORD tid)
 {
@@ -580,9 +713,32 @@ void Loop()
     const bool always = mode >= 2;
     const int64_t step = Freq() / (always ? 1000 : 2000);   // 1 / 0.5 ms
     int64_t windowStart = Now();
+    std::vector<Sample> resimUpdate, resimDraw;   // mode 5
     for (;;)
     {
         if (!always && !g_active.load(std::memory_order_acquire)) { Sleep(1); continue; }
+        if (mode == 5)
+        {
+            Target* t = g_main.load();
+            if (t && RollbackResimulating())
+            {
+                const bool draw = RollbackResimDraw();
+                g_busy = true;
+                Sample s;
+                if (Take(*t, s)) (draw ? resimDraw : resimUpdate).push_back(s);
+                g_busy = false;
+            }
+            const int64_t now = Now();
+            if (now - windowStart >= Freq() * 10)
+            {
+                if (!resimUpdate.empty()) Report("[profile] re-simulated updates, last 10 s", resimUpdate, 40, 40, 30);
+                if (!resimDraw.empty()) Report("[profile] re-simulated draws, last 10 s", resimDraw, 40, 40, 30);
+                resimUpdate.clear(); resimDraw.clear();
+                windowStart = now;
+            }
+            while (Now() < now + step) YieldProcessor();
+            continue;
+        }
         std::vector<Target*> targets;
         {
             std::lock_guard l(g_targetsMutex);
@@ -734,21 +890,55 @@ void HitchFrameGap(double ms)
 namespace heapstat {
 struct Counts { uint64_t allocs = 0, frees = 0; double allocMs = 0, freeMs = 0, slowest = 0; uint32_t slowestSize = 0; };
 thread_local Counts t_counts;
+thread_local uint64_t t_ops = 0;          // always counted (rollback.cpp: heap use per frame)
+std::atomic<uint64_t> g_ops{ 0 };
 inline double Ms(LARGE_INTEGER a, LARGE_INTEGER b)
 {
     static const double f = [] { LARGE_INTEGER q; QueryPerformanceFrequency(&q); return 1000.0 / double(q.QuadPart); }();
     return double(b.QuadPart - a.QuadPart) * f;
 }
 }
+bool RollbackOwnedCaller(const PPCContext& ctx);          // rollback.cpp: network code allocating?
+void RollbackNoteHeapBlock(uint32_t ptr, uint32_t size);
+void RollbackNoteHeapFree(uint32_t ptr);
+void RollbackHeapOp(bool alloc, uint32_t ptr, uint32_t size, const PPCContext& ctx);   // TTT2_RB_HEAPLOG
+bool RollbackArenaOn();                                     // rollback.cpp: the network's blocks from an arena
+uint32_t RollbackArenaAlloc(uint32_t size, bool zero, uint32_t align = 16);
+uint32_t RollbackArenaSize(uint32_t a);
+bool RollbackArenaFree(uint32_t a);
 extern "C" PPC_FUNC(__imp__sub_82BFA928);
 PPC_FUNC(sub_82BFA928)
 {
-    if (!hitch::On()) { __imp__sub_82BFA928(ctx, base); return; }
+    ++heapstat::t_ops;
+    heapstat::g_ops.fetch_add(1, std::memory_order_relaxed);
     const uint32_t size = ctx.r5.u32;
+    const bool owned = RollbackOwnedCaller(ctx);
+    if (owned && RollbackArenaOn())
+    {
+        // r3 heap, r4 flags (HEAP_ZERO_MEMORY 8), r5 size.
+        const PPCContext entry = ctx;
+        if (const uint32_t p = RollbackArenaAlloc(size, (ctx.r4.u32 & 8) != 0))
+        {
+            ctx.r3.u64 = p;
+            RollbackHeapOp(true, p, size, entry);
+            return;
+        }
+    }
+    if (!hitch::On())
+    {
+        const PPCContext entry = ctx;
+        __imp__sub_82BFA928(ctx, base);
+        if (owned) RollbackNoteHeapBlock(ctx.r3.u32, size);
+        RollbackHeapOp(true, ctx.r3.u32, size, entry);
+        return;
+    }
     LARGE_INTEGER a, b;
+    const PPCContext entry = ctx;
     QueryPerformanceCounter(&a);
     __imp__sub_82BFA928(ctx, base);
     QueryPerformanceCounter(&b);
+    if (owned) RollbackNoteHeapBlock(ctx.r3.u32, size);
+    RollbackHeapOp(true, ctx.r3.u32, size, entry);
     auto& c = heapstat::t_counts;
     const double ms = heapstat::Ms(a, b);
     ++c.allocs;
@@ -758,6 +948,11 @@ PPC_FUNC(sub_82BFA928)
 extern "C" PPC_FUNC(__imp__sub_82BFB220);
 PPC_FUNC(sub_82BFB220)
 {
+    ++heapstat::t_ops;
+    heapstat::g_ops.fetch_add(1, std::memory_order_relaxed);
+    if (RollbackArenaFree(ctx.r5.u32)) { ctx.r3.u64 = 1; return; }   // the network's arena block
+    RollbackNoteHeapFree(ctx.r5.u32);
+    RollbackHeapOp(false, ctx.r5.u32, 0, ctx);
     if (!hitch::On()) { __imp__sub_82BFB220(ctx, base); return; }
     LARGE_INTEGER a, b;
     QueryPerformanceCounter(&a);
@@ -770,12 +965,134 @@ PPC_FUNC(sub_82BFB220)
     if (ms > c.slowest) { c.slowest = ms; c.slowestSize = 0; }
 }
 
+// RtlReAllocateHeap (82BFB518: r3 heap, r4 flags, r5 block, r6 size) on an arena block: a new arena block,
+// the content copied, the old one freed (the guest heap would read a header the arena does not have).
+extern "C" PPC_FUNC(__imp__sub_82BFB518);
+PPC_FUNC(sub_82BFB518)
+{
+    const uint32_t old = ctx.r5.u32;
+    const uint32_t oldSize = old ? RollbackArenaSize(old) : 0;
+    if (!oldSize) { __imp__sub_82BFB518(ctx, base); return; }
+    const uint32_t size = ctx.r6.u32;
+    const uint32_t p = RollbackArenaAlloc(size, (ctx.r4.u32 & 8) != 0);
+    if (p) std::memcpy(base + p, base + old, oldSize < size ? oldSize : size);
+    if (p) RollbackArenaFree(old);
+    ctx.r3.u64 = p;
+}
+
+// Havok's large-block allocator (sub_82C7F5A0 = its alloc, r3 = the allocator): rollback.cpp checks the
+// free trees of every allocator seen after each rewind.
+void RollbackNoteLargeBlockAllocator(uint32_t obj);
+extern "C" PPC_FUNC(__imp__sub_82C7F5A0);
+PPC_FUNC(sub_82C7F5A0)
+{
+    RollbackNoteLargeBlockAllocator(ctx.r3.u32);
+    __imp__sub_82C7F5A0(ctx, base);
+}
+
+// The game's own heap: operator new sub_82A61BF8 -> sub_82A68428(heap handle, size, alignment, tag,
+// ...) -> the heap object's allocate (sub_82A68368; four heap kinds, r5 the alignment: 0 / 1 none);
+// operator delete sub_82A61C40 -> sub_82A67B48(handle, p). The online code calls these directly too
+// (MEASURED, static calls: 130 allocations, 149 frees from 0x82660000-0x82700000 and NACE). Blocks
+// the network owns come from its arena like the system heap's (MEASURED: the online event object
+// 0x00341F80, 0x38 bytes, operator new from 826B3790 - its +4 points at NACE's pending event; left in
+// the rewound heap while NACE's events were not, a rewind gave it back an event NACE had deleted, and
+// the next clear deleted it again: a virtual call through a null vtable, lr 82B54238, then garbage
+// frees). TTT2_RB_FINDBLOCK diagnostics see the game heap's blocks too.
+void RollbackFindBlock(bool alloc, uint32_t ptr, uint32_t size, const PPCContext& ctx);   // rollback.cpp
+extern "C" PPC_FUNC(__imp__sub_82A68428);
+PPC_FUNC(sub_82A68428)
+{
+    const PPCContext entry = ctx;
+    if (RollbackArenaOn() && RollbackOwnedCaller(ctx))
+    {
+        uint32_t align = 16;                     // a power of two at least the request (seen: 0, 4, 8, 12, 16)
+        while (align < ctx.r5.u32 && align < 4096) align <<= 1;
+        if (const uint32_t p = RollbackArenaAlloc(ctx.r4.u32, true, align))
+        {
+            ctx.r3.u64 = p;
+            RollbackFindBlock(true, p, entry.r4.u32, entry);
+            return;
+        }
+    }
+    __imp__sub_82A68428(ctx, base);
+    RollbackFindBlock(true, ctx.r3.u32, entry.r4.u32, entry);
+}
+extern "C" PPC_FUNC(__imp__sub_82A67B48);
+PPC_FUNC(sub_82A67B48)
+{
+    if (ctx.r4.u32 && RollbackArenaFree(ctx.r4.u32)) return;   // the network's arena block
+    __imp__sub_82A67B48(ctx, base);
+}
+
+// The online system's own allocator: sub_82661430(size) / sub_82661468(p) count the call (0x82F31434 /
+// 0x82F31438) and call the game's memory manager through the callbacks at 0x82E11734 / 0x82E11738 -
+// no RtlAllocateHeap, so the hooks above never see these blocks. NACE's library allocates through it
+// (its allocator object 0x82E1682C: vfunc 4 sub_826B2268 -> here, vfunc 8 -> the free). MEASURED: the
+// connection object (6568 bytes, keepalive counters conn+348 sent / +352 answered and the host's timer)
+// came from here into the rewound heap; a rewind set "sent" back below an answer that then arrived,
+// sent - answered wrapped (unsigned) past 4 and NACE declared the host lost - most matches under
+// 80 ms / 30 ms jitter / 3 % loss, and at ~900 frames even under 50 ms / 10 ms. With rollback its
+// blocks come from the network's arena (never rewound, host bookkeeping).
+extern "C" PPC_FUNC(__imp__sub_82661430);
+PPC_FUNC(sub_82661430)
+{
+    if (!RollbackArenaOn()) { __imp__sub_82661430(ctx, base); return; }
+    GWrite32(base, 0x82F31434u, GRead32(base, 0x82F31434u) + 1);
+    ctx.r3.u64 = RollbackArenaAlloc(ctx.r3.u32, true);
+}
+extern "C" PPC_FUNC(__imp__sub_82661468);
+PPC_FUNC(sub_82661468)
+{
+    if (ctx.r3.u32 && RollbackArenaFree(ctx.r3.u32))
+    {
+        GWrite32(base, 0x82F31438u, GRead32(base, 0x82F31438u) + 1);
+        return;
+    }
+    __imp__sub_82661468(ctx, base);
+}
+
+// The game's heap calls (RtlAllocateHeap / RtlFreeHeap, guest code) so far: this thread's, all threads'.
+void GameHeapOps(uint64_t& thread, uint64_t& all)
+{
+    thread = heapstat::t_ops;
+    all = heapstat::g_ops.load(std::memory_order_relaxed);
+}
+
 void ThreadIoTotals(uint64_t& calls, uint64_t& bytes, double& ms);   // kernel_io.cpp
 void CtabCacheCounts(uint64_t& calls, uint64_t& hits);              // d3dx_ctab_cache.cpp
 // The game's task runner (task->vtable[1] = step, called until it stops): name the task.
 extern "C" PPC_FUNC(__imp__sub_82A80AD8);
+void RollbackTaskStep(uint32_t task, uint32_t vtable, uint32_t step);   // rollback.cpp: the session's task census
+bool RollbackSkipTask(uint32_t step);                                    // rollback.cpp: tasks a re-simulation leaves out
+bool RollbackOnlineTask(uint32_t step);
+void RollbackOnlineStep(bool begin, uint32_t step);                      // rollback.cpp: online steps' writes, learned
+void RollbackOnlineTaskScope(bool in);
 PPC_FUNC(sub_82A80AD8)
 {
+    if (ctx.r3.u32)
+    {
+        const uint32_t vt = GRead32(base, ctx.r3.u32);
+        const uint32_t st = vt ? GRead32(base, vt + 4) : 0;
+        RollbackTaskStep(ctx.r3.u32, vt, st);
+        if (RollbackSkipTask(st)) { ctx.r3.u64 = 0; return; }   // a re-simulated update: not this task
+        if (st >= 0x82690000u && st < 0x826D0000u && !RollbackOnlineTask(st))
+        {
+            // The online system's step in a live session update: its writes are learned (rollback.cpp).
+            RollbackOnlineStep(true, st);
+            __imp__sub_82A80AD8(ctx, base);
+            RollbackOnlineStep(false, st);
+            return;
+        }
+        if (RollbackOnlineTask(st))
+        {
+            // The online system's own task: what it allocates is never rewound (rollback.cpp).
+            RollbackOnlineTaskScope(true);
+            __imp__sub_82A80AD8(ctx, base);
+            RollbackOnlineTaskScope(false);
+            return;
+        }
+    }
     static const bool on = [] { const char* e = std::getenv("TTT2_FRAMETIME"); return e && *e == '1'; }();
     if (!on && !hitch::On()) { __imp__sub_82A80AD8(ctx, base); return; }       // no diagnostics: nothing added
     const uint32_t task = ctx.r3.u32, vtable = task ? GRead32(base, task) : 0, step = vtable ? GRead32(base, vtable + 4) : 0;
@@ -818,4 +1135,12 @@ PPC_FUNC(sub_82A80AD8)
 }
 TIMED_HOOK(82258D60)
 TIMED_HOOK(825DEBD0)
-TIMED_HOOK(822D36C8)
+// The battle tick: rollback.cpp needs to know which updates ran the fight.
+void RollbackBattleTick(bool start);
+extern "C" PPC_FUNC(__imp__sub_822D36C8);
+PPC_FUNC(sub_822D36C8)
+{
+    RollbackBattleTick(true);
+    TimeCall("sub_822D36C8", ctx, base, __imp__sub_822D36C8);
+    RollbackBattleTick(false);
+}

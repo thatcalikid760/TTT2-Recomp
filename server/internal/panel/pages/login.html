@@ -1,0 +1,26 @@
+{{define "login"}}{{template "top" .}}
+<div class="login-card">
+<div class="login-brand">
+<span class="mark" aria-hidden="true">T2</span>
+<div>
+<p class="login-server">{{if .Server}}{{.Server}}{{else}}TTT2 Server{{end}}</p>
+<p class="muted small">Admin panel</p>
+</div>
+</div>
+<h1 class="login-title">Log in</h1>
+{{- with .Flash}}
+<div class="flash err" role="alert"><span class="flash-text">{{.}}</span></div>
+{{- end}}
+<form class="login" method="post" action="/login">
+<input type="hidden" name="username" value="admin" autocomplete="username">
+<label class="field" for="password"><span>Password</span>
+<input id="password" type="password" name="password" autocomplete="current-password" maxlength="200" required autofocus>
+</label>
+<label class="field" for="code"><span>Code from the authenticator app</span>
+<input id="code" type="text" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,7}" maxlength="7" required placeholder="123 456">
+</label>
+<button type="submit" class="btn primary block">Log in</button>
+</form>
+<p class="note small">The login is made with <code>ttt2admin panel-setup</code> on the server.</p>
+</div>
+{{template "bottom" .}}{{end}}
