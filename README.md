@@ -45,6 +45,15 @@ Steam must be running in the background for online play.
 
 **You need your own copy of the game.** This project contains no game files; the installer builds them on your PC from your disc image.
 
+## Reporting bugs
+
+Found a crash, a graphics glitch or something online that doesn't work? [**Report a bug**](https://github.com/thatcalikid760/TTT2-Recomp/issues/new?template=bug_report.yml) (needs a free GitHub account).
+
+Please include:
+- your version (shown in the top right when you pick your profile),
+- what happened and how to make it happen again,
+- your log file: press Win+R, type `%LOCALAPPDATA%\TTT2Recomp` and attach `log.txt`. It's replaced every time the game starts, so grab it before launching again.
+
 ## Legal
 
 Unofficial fan project, not affiliated with or endorsed by Bandai Namco or Microsoft. Tekken and all related characters and content are the property of their respective owners.
