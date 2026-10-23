@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -161,6 +162,28 @@ static void WriteFrontBufferBmp(const uint32_t* px)
     WriteBmpTo(path.c_str(), px);
 }
 
+// The mouse pointer: the game has no use for it, so it is hidden over the game while it has not
+// moved for a moment (playing with a controller or the keyboard) and comes back as soon as it moves.
+static bool g_cursorHidden = false;
+static void UpdateCursor(HWND wnd)
+{
+    static POINT last{ LONG_MIN, LONG_MIN };
+    static auto lastMove = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    POINT p{};
+    GetCursorPos(&p);
+    if (p.x != last.x || p.y != last.y) { last = p; lastMove = now; }
+    RECT rc{};
+    GetClientRect(wnd, &rc);
+    POINT local = p;
+    ScreenToClient(wnd, &local);
+    const bool over = GetForegroundWindow() == wnd && PtInRect(&rc, local);
+    const bool hide = over && now - lastMove > std::chrono::milliseconds(1500);
+    if (hide == g_cursorHidden) return;
+    g_cursorHidden = hide;
+    if (over) SetCursor(hide ? nullptr : LoadCursorA(nullptr, reinterpret_cast<LPCSTR>(IDC_ARROW)));
+}
+
 // The game window. Closing it quits (as the main menu's EXIT does); Alt+Enter switches between
 // windowed and borderless (Options -> Display Settings -> DISPLAY MODE offers all three).
 static LRESULT CALLBACK GameWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -193,6 +216,9 @@ static LRESULT CALLBACK GameWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
                                                                                               : display_settings::Windowed);
             return 0;
         }
+        break;
+    case WM_SETCURSOR:
+        if (g_cursorHidden && LOWORD(lp) == HTCLIENT) { SetCursor(nullptr); return TRUE; }
         break;
     case WM_SYSCHAR:
         return 0;                               // no beep for Alt+Enter or Alt+letter (Alt can be a game key)
@@ -295,6 +321,7 @@ static unsigned __stdcall PresentThread(void*)
                 if (!exclusive) ApplyWindowMode(wnd);
                 applied = generation;
             }
+            UpdateCursor(wnd);
             static const bool msgWait = [] { const char* e = std::getenv("TTT2_WINDOW_MSGWAIT"); return e && *e == '1'; }();
             if (msgWait) MsgWaitForMultipleObjects(0, nullptr, FALSE, 5, QS_ALLINPUT);
             else std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -317,6 +344,7 @@ static unsigned __stdcall PresentThread(void*)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
+        UpdateCursor(wnd);
         if (uint32_t fb = g_frontBufferPhys.load())
         {
             ConvertFrontBuffer(fb, staging);

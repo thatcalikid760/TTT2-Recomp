@@ -301,6 +301,8 @@ int KeyOf(Control c)
     case RT: return keyboard_keys::Key(keyboard_keys::RT);
     case Start: return keyboard_keys::Key(keyboard_keys::Start);
     case Back: return keyboard_keys::Key(keyboard_keys::Back);
+    case LS: return keyboard_keys::Key(keyboard_keys::LS);
+    case RS: return keyboard_keys::Key(keyboard_keys::RS);
     default: return 0;
     }
 }
@@ -452,7 +454,9 @@ void Paint(Style style, uint8_t* rgba, uint32_t width, uint32_t height, uint32_t
             if (ps) { RecolorDots(rgba, pitch, gl); ++painted; }
             continue;                                   // keyboard: the game's own button diagram
         }
-        if (!ps && (gl.kind == Kind::Stick || gl.kind == Kind::StickRed)) continue;   // sticks mean movement
+        // Keyboard: sticks mean movement and stay; except the right stick's red glyph, which the online
+        // session room's VOICE CHAT prompt uses as "press RS" (menu_ext.cpp) - drawn as RS's key.
+        if (!ps && (gl.kind == Kind::Stick || gl.kind == Kind::StickRed) && !(gl.kind == Kind::StickRed && gl.control == RS)) continue;
         PaintGlyph(rgba, pitch, gl, [&](Graphics& g, RectF r) {
             const bool red = gl.kind == Kind::ShoulderRed || gl.kind == Kind::TriggerRed || gl.kind == Kind::StickRed;
             if (ps)
@@ -471,7 +475,8 @@ void Paint(Style style, uint8_t* rgba, uint32_t width, uint32_t height, uint32_t
             // Keyboard: a key cap with the key this control is bound to.
             const bool ringed = gl.kind == Kind::FaceRinged;
             const size_t room = gl.kind == Kind::Menu ? 5 : (gl.kind == Kind::Shoulder || gl.kind == Kind::ShoulderRed) ? 4 : 3;
-            DrawKey(g, r, ShortKey(KeyOf(gl.control), room), red || ringed, r.Height * 0.22f);
+            const bool outlined = (red || ringed) && gl.kind != Kind::StickRed;   // RS's key: a plain key
+            DrawKey(g, r, ShortKey(KeyOf(gl.control), room), outlined, r.Height * 0.22f);
         });
         ++painted;
     }

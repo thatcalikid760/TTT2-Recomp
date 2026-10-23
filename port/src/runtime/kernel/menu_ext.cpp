@@ -37,6 +37,7 @@
 #include "discord_presence.h"
 #include "voice_chat.h"
 #include "updater.h"
+#include "button_prompts.h"
 
 extern "C" PPC_FUNC(__imp__sub_82346060);
 extern "C" PPC_FUNC(__imp__sub_82A8C170);
@@ -212,6 +213,14 @@ void MenuSound(PPCContext& ctx, uint8_t* base, uint32_t id)
     GuestFrame frame(ctx, base, 0x100);
     ctx.r3.u64 = id;
     sub_8259E948(ctx, base);
+}
+
+bool keyui_Foreground()
+{
+    DWORD process = 0;
+    const HWND w = GetForegroundWindow();
+    if (w) GetWindowThreadProcessId(w, &process);
+    return w && process == GetCurrentProcessId();
 }
 
 namespace sysui {
@@ -919,6 +928,144 @@ void KeyboardFrame(PPCContext& ctx, uint8_t* base)
     if (done) done(answer == 1, k.text);
 }
 
+// ---- the voice panel: VOICE CHAT's settings in the game's information window, opened with F7 or
+// the right stick's click (R3) in the menus or the online lobby - never at character select or in
+// a fight. The game's mode manager [0x82F30B94] holds the current mode at +12 (MEASURED
+// 2026-10-22: 16 the main menu and its submenus, Options included; 29 Online Mode's menus; 35 the
+// online session room;
+// 8 character select, 9 a fight). UP / DOWN choose a line, LEFT / RIGHT or A change it (a
+// player's line mutes / unmutes), B closes. The lines follow voice_chat as players come and go.
+constexpr uint32_t kVoicePanelTextId = 0x7F06;
+constexpr uint16_t kRightStick = 0x0080;
+struct VoicePanel
+{
+    bool showing = false, releasing = false;
+    int cursor = 0;
+    std::vector<uint64_t> peers;                     // the player lines' peers
+    std::string shown;                               // the text as last laid out
+} g_vp;
+std::atomic<bool> g_vpOwns{ false };
+uint32_t g_vpText = 0;
+std::atomic<uint32_t> g_vpBlock{ 0 }, g_vpFont{ 0 }, g_vpSize{ 0 };
+
+std::string VoicePanelText(VoicePanel& vp)
+{
+    static const char* const modes[] = { "OFF", "OPEN MIC", "PUSH TO TALK" };
+    const display_settings::Voice v = display_settings::GetVoice();
+    std::vector<std::string> lines = {
+        std::string("VOICE CHAT: ") + modes[v.mode] + (v.mode == display_settings::VoicePushToTalk ? " (" + keyboard_keys::KeyName(v.pushToTalkKey) + ")" : ""),
+        "VOICE VOLUME: " + std::to_string(v.volume),
+    };
+    vp.peers.clear();
+    for (const voice_chat::Player& p : voice_chat::Players())
+    {
+        std::string name = p.name;
+        for (char& c : name)
+            if (c < 0x20 || c > 0x7E || c == '~') c = '?';
+        if (name.size() > 20) name.resize(20);
+        lines.push_back(name + ": " + (p.muted ? "MUTED" : p.talking ? "TALKING" : "ON"));
+        vp.peers.push_back(p.peer);
+    }
+    vp.cursor = std::clamp(vp.cursor, 0, int(lines.size()) - 1);
+    std::string m = "VOICE CHAT\n";
+    for (size_t i = 0; i < lines.size(); ++i)
+    {
+        if (i == 2) m += "\n";
+        m += "\n" + (int(i) == vp.cursor ? "> " + lines[i] + " <" : lines[i]);
+    }
+    if (vp.peers.empty()) m += "\n\nNo players yet.";
+    if (voice_chat::AllMuted()) m += "\n\nF8: everyone is muted.";
+    m += "\n\nUP / DOWN: choose   LEFT / RIGHT: change   B: close";
+    return m;
+}
+void ShowVoicePanel(PPCContext& ctx, uint8_t* base, VoicePanel& vp)
+{
+    vp.shown = VoicePanelText(vp);
+    WriteTableText(base, g_vpText, 2000, vp.shown);
+    g_vpBlock = 0;
+    GuestFrame frame(ctx, base, 0x100);
+    ctx.r3.u64 = 0;
+    ctx.r4.u64 = kVoicePanelTextId;
+    ctx.r5.u64 = 1;
+    sub_8241FB70(ctx, base);                          // lib::WindowShowInformation(text id)
+}
+void UpdateVoicePanel(PPCContext& ctx, uint8_t* base, VoicePanel& vp)
+{
+    const std::string text = VoicePanelText(vp);
+    if (text == vp.shown) return;
+    vp.shown = text;
+    WriteTableText(base, g_vpText, 2000, text);
+    const uint32_t block = g_vpBlock.load();
+    if (!block) return;
+    GuestFrame frame(ctx, base, 0x100);
+    ctx.r3.u64 = block;
+    ctx.r4.u64 = g_vpFont.load();
+    ctx.r5.u64 = g_vpSize.load();
+    ctx.r6.u64 = g_vpText;
+    sub_8241B9D0(ctx, base);                          // the window lays its message out again
+}
+void VoicePanelFrame(PPCContext& ctx, uint8_t* base)
+{
+    VoicePanel& vp = g_vp;
+    static uint16_t prev = 0;
+    static bool prevF7 = false;
+    const uint16_t now = HostControllerButtons();
+    const uint16_t pressed = now & ~prev;
+    prev = now;
+    const bool front = keyui_Foreground();
+    const bool f7 = front && (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+    const bool f7Pressed = f7 && !prevF7;
+    prevF7 = f7;
+    if (vp.releasing)
+    {
+        if (now == 0) { vp.releasing = false; g_vpOwns = false; }
+        return;
+    }
+    if (!vp.showing)
+    {
+        if (!(f7Pressed || (pressed & kRightStick))) return;
+        // Only in the menus or the session room, with nothing else of ours open.
+        if (g_owns.load() || g_boxOwns.load() || g_kbOwns.load()) return;
+        const uint32_t manager = GRead32(base, 0x82F30B94);
+        const uint32_t mode = manager ? GRead32(base, manager + 12) : 0;
+        if (mode != 16 && mode != 29 && mode != 35) return;
+        std::fprintf(stderr, "[sys-ui] voice panel (mode %u)\n", mode);
+        vp.showing = true;
+        g_vpOwns = true;
+        MenuSound(ctx, base, kSoundDecide);
+        ShowVoicePanel(ctx, base, vp);
+        return;
+    }
+    const int lines = 2 + int(vp.peers.size());
+    if (pressed & (kUp | kDown))
+    {
+        vp.cursor = (vp.cursor + ((pressed & kUp) ? lines - 1 : 1)) % lines;
+        MenuSound(ctx, base, kSoundCursor);
+    }
+    else if (pressed & (kLeft | kRight | kA))
+    {
+        const int dir = (pressed & kLeft) ? -1 : 1;
+        display_settings::Voice v = display_settings::GetVoice();
+        if (vp.cursor == 0) { v.mode = (v.mode + dir + 3) % 3; display_settings::SetVoice(v); }
+        else if (vp.cursor == 1) { v.volume = std::clamp(v.volume + dir, 0, 10); display_settings::SetVoice(v); }
+        else if (size_t(vp.cursor - 2) < vp.peers.size())
+        {
+            const uint64_t peer = vp.peers[size_t(vp.cursor - 2)];
+            display_settings::SetVoiceMuted(peer, !display_settings::IsVoiceMuted(peer));
+        }
+        MenuSound(ctx, base, kSoundCursor);
+    }
+    else if ((pressed & (kB | kRightStick)) || f7Pressed)
+    {
+        MenuSound(ctx, base, kSoundCancel);
+        HideDialog(ctx, base);
+        vp.showing = false;
+        vp.releasing = true;
+        return;
+    }
+    UpdateVoicePanel(ctx, base, vp);
+}
+
 // Confirm: an empty name takes the suggestion; the new profile signs in.
 void Finish(PPCContext& ctx, uint8_t* base, Ui& ui)
 {
@@ -935,6 +1082,7 @@ void Frame(PPCContext& ctx, uint8_t* base)
 {
     BoxFrame(ctx, base);
     KeyboardFrame(ctx, base);
+    VoicePanelFrame(ctx, base);
     Ui& ui = g_ui;
     const uint16_t pressed = Pressed(ui);
     if (ui.releasing)
@@ -1463,7 +1611,8 @@ struct UiHookInstall { UiHookInstall() { g_uiFrameHook = UiFrame; } } g_uiHookIn
 bool SysUiRequestSignIn() { sysui::g_signInRequest = true; return true; }
 bool SysUiOwnsInput()
 {
-    return sysui::g_owns.load() || sysui::g_boxOwns.load() || sysui::g_kbOwns.load() || keyui::g_capture.load();
+    return sysui::g_owns.load() || sysui::g_boxOwns.load() || sysui::g_kbOwns.load() || sysui::g_vpOwns.load() ||
+           keyui::g_capture.load();
 }
 bool SysUiKeyCaptureActive() { return keyui::g_capture.load() || sysui::g_voiceCapture.load(); }
 uint16_t SysUiGameButtonMask() { return keyui::g_gameMask.load(); }
@@ -1724,6 +1873,12 @@ PPC_FUNC(sub_8241B9D0)
         sysui::g_kbFont = ctx.r4.u32;
         sysui::g_kbSize = ctx.r5.u32;
     }
+    else if (ctx.r6.u32 && ctx.r6.u32 == sysui::g_vpText)
+    {
+        sysui::g_vpBlock = ctx.r3.u32;
+        sysui::g_vpFont = ctx.r4.u32;
+        sysui::g_vpSize = ctx.r5.u32;
+    }
     else if (ctx.r6.u32 && ctx.r6.u32 == sysui::g_boxText)
     {
         sysui::g_boxBlock = ctx.r3.u32;
@@ -1772,6 +1927,11 @@ PPC_FUNC(sub_8237F5D0)
     if (id == sysui::kNameTextId && sysui::g_nameText)
     {
         ctx.r3.u64 = sysui::g_nameText;
+        return;
+    }
+    if (id == sysui::kVoicePanelTextId && sysui::g_vpText)
+    {
+        ctx.r3.u64 = sysui::g_vpText;
         return;
     }
     if (id == sysui::kKeyboardTextId && sysui::g_kbText)
@@ -1879,3 +2039,32 @@ PPC_FUNC(sub_82A8C170)
     __imp__sub_82A8C170(ctx, base);
 }
 
+
+// The key info bar (sub_8241B588: window, key glyph, text, -1, 0 - one entry per call, every frame,
+// from lib::WindowPrintKeyInfo). In the online session room (mode 35, see the voice panel) the
+// voice panel's button follows MENU DISPLAY (the Y glyph 0xE026): the right stick glyph 0x25C6
+// (RS, or R3 in the PlayStation styles); with keyboard prompts the red one 0x25C7, which
+// button_prompts.cpp draws as RS's key there (the plain stick keeps meaning movement)
+// (MEASURED 2026-10-22: the room's bar is START GAME CHAT, BACK TOGGLE LOG DISPLAY, Y MENU
+// DISPLAY, A OK, B CLOSE / LEAVE).
+extern "C" PPC_FUNC(__imp__sub_8241B588);
+PPC_FUNC(sub_8241B588)
+{
+    const uint32_t window = ctx.r3.u32, key = ctx.r4.u32 & 0xFFFF, r6 = ctx.r6.u32, r7 = ctx.r7.u32;
+    __imp__sub_8241B588(ctx, base);
+    if (key != 0xE026) return;
+    const uint32_t manager = GRead32(base, 0x82F30B94);
+    if (!manager || GRead32(base, manager + 12) != 35) return;
+    static const uint32_t text = TableText(base, "VOICE CHAT");
+    const PPCContext saved = ctx;
+    {
+        GuestFrame frame(ctx, base, 0x100);
+        ctx.r3.u64 = window;
+        ctx.r4.u64 = button_prompts::Current() == button_prompts::Style::Keyboard ? 0x25C7 : 0x25C6;
+        ctx.r5.u64 = text;
+        ctx.r6.u64 = r6;
+        ctx.r7.u64 = r7;
+        __imp__sub_8241B588(ctx, base);
+    }
+    ctx = saved;
+}

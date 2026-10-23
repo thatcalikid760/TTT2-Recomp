@@ -597,7 +597,7 @@ static uint16_t ParseButtons(const std::string& names, int* player = nullptr)
     static const std::pair<const char*, uint16_t> map[] = {
         { "START", 0x0010 }, { "BACK", 0x0020 }, { "UP", 0x0001 }, { "DOWN", 0x0002 },
         { "LEFT", 0x0004 }, { "RIGHT", 0x0008 }, { "A", 0x1000 }, { "B", 0x2000 },
-        { "X", 0x4000 }, { "Y", 0x8000 }, { "LB", 0x0100 }, { "RB", 0x0200 } };
+        { "X", 0x4000 }, { "Y", 0x8000 }, { "LB", 0x0100 }, { "RB", 0x0200 }, { "LS", 0x0040 }, { "RS", 0x0080 } };
     uint16_t b = 0;
     size_t pos = 0;
     while (pos <= names.size())

@@ -1,7 +1,7 @@
 """Drive a running tekken_recomp by injected pad presses and grab what is on screen.
 
 Each argument is one press, as in C:/ttt2/port/pad_inject.txt: BUTTONS[:hold_ms[:gap_ms]], with
-BUTTONS = names joined by '+' (START BACK UP DOWN LEFT RIGHT A B X Y LB RB) and P2 for player 2.
+BUTTONS = names joined by '+' (START BACK UP DOWN LEFT RIGHT A B X Y LB RB LS RS) and P2 for player 2.
 After the presses (and --wait seconds) the latest presented frame (fbdump.bmp, written every 60
 presents) is saved as PNG for viewing.
 

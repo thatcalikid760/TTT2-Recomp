@@ -1492,6 +1492,10 @@ private:
         }
         context_->OMSetRenderTargets(1, &rtv, nullptr);
         context_->RSSetViewports(1, &vp);
+        // The rasterizer state scissors: clip to this pass's own viewport, not the back buffer's
+        // size (an intermediate target at the render size is larger than a small window's buffer).
+        const D3D11_RECT clip{ LONG(vp.TopLeftX), LONG(vp.TopLeftY), LONG(std::ceil(vp.TopLeftX + vp.Width)), LONG(std::ceil(vp.TopLeftY + vp.Height)) };
+        context_->RSSetScissorRects(1, &clip);
         context_->PSSetShader(ps, nullptr, 0);
         ID3D11ShaderResourceView* v[2] = { srv, gammaSrv_.Get() };
         context_->PSSetShaderResources(0, 2, v);
@@ -3309,15 +3313,32 @@ private:
         storedSwap = false;
         if (!fb) return nullptr;
         auto it = resolved_.find(fb);
+        // Which source each front buffer is shown from, logged when it changes: 0 its GPU resolve;
+        // otherwise guest memory because 1 never resolved, 2 resolve invalidated, 3 resolve smaller
+        // than 1280x720, 4 the CPU wrote it after the resolve.
+        auto note = [&](int why) {
+            static uint32_t lastFb = 0;
+            static int lastWhy = -1, logged = 0;
+            if ((fb == lastFb && why == lastWhy) || logged >= 200) return;
+            lastFb = fb; lastWhy = why; ++logged;
+            const bool known = it != resolved_.end();
+            std::fprintf(stderr, "[front] %08X shown from %s (%d)%s\n", fb, why ? "guest memory" : "its GPU resolve", why,
+                         known ? (" resolve " + std::to_string(it->second.pitch) + "x" + std::to_string(it->second.height)).c_str() : "");
+        };
+        if (it == resolved_.end()) note(1);
+        else if (!it->second.valid) note(2);
+        else if (it->second.pitch < 1280 || it->second.height < 720) note(3);
         if (it != resolved_.end() && it->second.valid && it->second.pitch >= 1280 && it->second.height >= 720)
         {
             dirty_.Sync(fb, it->second.size, "front buffer");
             if (dirty_.Newest(fb, it->second.size) <= it->second.seq)
             {
+                note(0);
                 storedSwap = it->second.swapRB;
                 logicalW = it->second.pitch; logicalH = it->second.height;
                 return it->second.tex.Get();
             }
+            note(4);
             it->second.valid = false;
         }
         logicalW = 1280; logicalH = 720;
