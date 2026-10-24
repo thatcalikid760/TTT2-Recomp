@@ -28,7 +28,6 @@ namespace {
 constexpr uint8_t kVersion = 1;
 constexpr uint32_t kLoungeContext = 0x7E5E0010u;          // a session record's context: "this is a lounge" (port's id)
 constexpr int kCabinets = 20, kMaxMembers = 32, kRows = 8;  // kRows: menu_doc.cpp kLoungeRows
-constexpr int kBanks = 4, kPerBank = 5;                     // A1..A5, B1..B5, C1..C5, D1..D5
 constexpr size_t kChatLength = 80, kChatKept = 20;
 constexpr int64_t kPingMs = 2000, kMemberTimeoutMs = 10000, kHostTimeoutMs = 12000, kSnapshotMs = 3000;
 constexpr uint16_t kUp = 0x0001, kDown = 0x0002, kA = 0x1000, kB = 0x2000, kX = 0x4000;
@@ -65,7 +64,8 @@ std::string Upper(std::string s)
     for (char& c : s) c = char(std::toupper(static_cast<unsigned char>(c)));
     return s;
 }
-std::string CabinetName(int i) { return std::string(1, char('A' + i / kPerBank)) + std::to_string(i % kPerBank + 1); }
+// 01..20: unique ids (the concept's four banks of five: 01-05, 06-10, 11-15, 16-20)
+std::string CabinetName(int i) { return std::string(i + 1 < 10 ? "0" : "") + std::to_string(i + 1); }
 
 // ---- messages
 struct Writer

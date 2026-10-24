@@ -1,6 +1,6 @@
 // ONLINE MODE -> FIGHTING LOUNGE (TTT2 Fighting Lounge beta 0.0.1, a work in progress toward a 3D lounge - see
 // FIGHTING_LOUNGE.md): a room the players of the network share, with
-// 20 cabinets (A1..D5) and a text chat for everyone in it. A cabinet seats two players and keeps a queue; when both
+// 20 cabinets (01..20) and a text chat for everyone in it. A cabinet seats two players and keeps a queue; when both
 // seated players are ready, their games play an unranked PLAYER MATCH against each other (ranked::PlanLoungeMatch: the next
 // QUICK MATCH search pins them together, the online menus are walked there by button pulses), then go back to the lounge.
 // The winner stays seated and the next queued player takes the loser's seat (the loser joins the back of the queue).

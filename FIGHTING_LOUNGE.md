@@ -9,7 +9,7 @@ at arcade cabinets to fight.
 ![Courtyard lounge](.github/assets/lounge-concept-courtyard.png)
 ![Cabinet banks](.github/assets/lounge-concept-cabinets.png)
 
-A temple courtyard at dusk with four banks of five cabinets (A1-D5), a featured-match screen, benches for
+A temple courtyard at dusk with four banks of five cabinets (01-20), a featured-match screen, benches for
 spectators, and the players as TTT2 characters.
 
 ## Beta 0.0.1 (now)
@@ -18,7 +18,7 @@ Code: `port/src/runtime/kernel/lounge.h`, `lounge.cpp`; the menu row and page in
 
 - A lounge per network: the first game in hosts it, the others join; up to 32 players.
 - LOUNGE CHAT: a text chat for everyone in the lounge (80 characters a message).
-- 20 cabinets A1-D5 as rows of a menu page: sit, ready, leave, a queue per cabinet.
+- 20 cabinets 01-20 as rows of a menu page: sit, ready, leave, a queue per cabinet.
 - Both seated players ready: their games walk the online menus to PLAYER MATCH -> QUICK MATCH (unranked), and the search is pinned to
   the cabinet opponent (`ranked::PlanLoungeMatch`). Winner stays, the next in line takes the loser's seat.
 
