@@ -21,7 +21,7 @@ This project is built on **[shihabal3amri/tekken-tag-tournament-2-pc](https://gi
 - Rematch and quit reports need 0.2.3 on both sides; server owners need the new `ttt2-server` for the penalties.
 
 ### 0.2.2
-- **Delete profiles:** on Select Profile, press **X** on a profile and confirm. Its save data goes to the Recycle Bin, so it can be restored.
+- **Delete profiles:** on Select Profile, press Xbox **X** (PlayStation **Square**, keyboard **Z**) on a profile and confirm. Its save data goes to the Recycle Bin, so it can be restored.
 - Display Settings no longer shows 3D MODE / 3D DEPTH.
 - **Motion blur** has one switch again: the game's own in Display Settings (the copy in Graphics Settings is gone).
 - The online menu no longer shows "SEARCH FOR Xbox LIVE PARTY" (it did nothing).
@@ -36,8 +36,8 @@ This project is built on **[shihabal3amri/tekken-tag-tournament-2-pc](https://gi
 
 ### 0.1.9
 - **Update notifications:** when you pick your profile, the game checks for a newer version and shows your build number in the top right. If an update is out, click the notification to download it, then click again to install (right-click dismisses it).
-- **Voice chat in the lobby:** press **R3** (or **F7** on keyboard) in the menus or an online lobby to change voice mode and volume and to mute players without leaving the lobby. The lobby's button bar shows the shortcut for your controller.
-- **Steam profiles:** in that panel, select a player and press **X** (Square on PlayStation) to open their Steam profile.
+- **Voice chat in the lobby:** press the right stick: Xbox **RS**, PlayStation **R3** (keyboard **F7**) in the menus or an online lobby to change voice mode and volume and to mute players without leaving the lobby. The lobby's button bar shows the shortcut for your controller.
+- **Steam profiles:** in that panel, select a player and press Xbox **X** (PlayStation **Square**, keyboard **Z**) to open their Steam profile.
 - The mouse cursor hides when you're not using the mouse.
 - **Fix:** with FXAA or sharpening on, the picture could be cut off at large render scales.
 
