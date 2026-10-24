@@ -13,6 +13,7 @@
 #include "ps_pads.h"
 #include "button_prompts.h"
 #include "steam_net.h"
+#include "display_settings.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -719,9 +720,10 @@ struct PadSnapshot
 PadSnapshot g_pads[4];
 std::atomic<bool> g_padThreadStarted{false};
 
-// Keyboard controls augment player 0 even when a controller is connected. Physical
-// analog controls remain intact. Only accept keys while our game is foreground,
-// so typing in another application cannot operate the game.
+// Keyboard controls augment player 0 even when a controller is connected, unless Game Options
+// -> KEYBOARD PLAYER is SEPARATE: then the keyboard is a host pad of its own (kKeyboardPad),
+// claimed like the others on its first key. Physical analog controls remain intact. Only accept
+// keys while our game is foreground, so typing in another application cannot operate the game.
 // Every control has the key chosen in Controller Setup -> KEYBOARD (keyboard_keys.h; by default
 // arrows = D-pad, A/S/Z/X = A/B/X/Y, Q/W = shoulders, E/R = triggers, D/F = stick clicks,
 // Enter = START, Backspace = BACK); Space is an extra START while no control has it.
@@ -756,7 +758,7 @@ static KeyboardPad ReadKeyboardPad()
     return pad;
 }
 
-constexpr DWORD kXInputPads = 4, kHostPads = kXInputPads + ps_pads::Slots;
+constexpr DWORD kXInputPads = 4, kKeyboardPad = kXInputPads + ps_pads::Slots, kHostPads = kKeyboardPad + 1;
 
 struct PadPollState
 {
@@ -765,13 +767,14 @@ struct PadPollState
     XINPUT_CAPABILITIES caps[4]{};            // connected: capabilities, refreshed once a second
     uint64_t capsAtMs[4]{};
     bool keyboardEverPressed = false;
+    bool keyboardPadUsed = false;             // KEYBOARD PLAYER SEPARATE: a key has been pressed
     // Host pad -> guest user, -1 until the pad is first used. A pad claims the lowest user no
     // other claimed pad holds on its first button or trigger press (sticks drift, so they do
     // not count), and keeps it across disconnects. Whoever picks up a controller is player 1
     // whatever its XInput slot: with an idle device on slot 0 the real pad used to be user 1,
     // which TTT2 treats as signed out - no profile, no save, no title-storage unlock. Pads not
     // claimed yet fill the free users in host order, so a lone pad is user 0 before any press.
-    int guestOf[kHostPads]{ -1, -1, -1, -1, -1, -1, -1, -1 };
+    int guestOf[kHostPads]{ -1, -1, -1, -1, -1, -1, -1, -1, -1 };
     // Button prompts (button_prompts.h) follow the device player 1 last pressed something on.
     bool hostPs5[kHostPads]{};
     uint16_t prevPressed[kHostPads]{};        // buttons + triggers (0x0400 / 0x0800) last poll
@@ -943,7 +946,10 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
     // controller 0 even when a physical pad is present or the window is inactive.
     const bool startPulse = autoStart && elapsedMs > 45000 && (elapsedMs % 9000) < 300;
     // Scripted presses join the keyboard's (controller 0, foreground not required).
-    const KeyboardPad keyboard = ReadKeyboardPad();
+    // KEYBOARD PLAYER SEPARATE: the keys are host pad kKeyboardPad's, not player 1's.
+    const bool keyboardSeparate = display_settings::GetKeyboardPlayer();
+    const KeyboardPad keys = ReadKeyboardPad();
+    const KeyboardPad keyboard = keyboardSeparate ? KeyboardPad{} : keys;
     uint8_t stick1 = 0, stick2 = 0;
     const uint16_t keyboardButtons = keyboard.buttons | (script ? ScriptButtons(*script, elapsedMs, 0, &stick1) : 0);
     {
@@ -992,6 +998,15 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
         sampled[i].Gamepad = playStation[k].gamepad;
         if (playStation[k].connected) hostCaps[i] = PlayStationCaps();
     }
+    {
+        polling.keyboardPadUsed |= keys.buttons || keys.leftTrigger || keys.rightTrigger;
+        polling.physicalConnected[kKeyboardPad] = keyboardSeparate && polling.keyboardPadUsed;
+        XINPUT_GAMEPAD& g = sampled[kKeyboardPad].Gamepad;
+        g.wButtons = keys.buttons;
+        g.bLeftTrigger = keys.leftTrigger ? 255 : 0;
+        g.bRightTrigger = keys.rightTrigger ? 255 : 0;
+        if (polling.physicalConnected[kKeyboardPad]) hostCaps[kKeyboardPad] = PlayStationCaps();
+    }
 
     auto claimed = [&](int user) {
         for (DWORD j = 0; j < kHostPads; ++j)
@@ -1009,7 +1024,7 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
     }
     // Users 1-3 sign in as guests on their controller's first use (player 2's scripted presses count).
     uint32_t used = (script && script->player2 && player2Buttons) ? 2u : 0u;
-    for (DWORD i = 0; i < 4; ++i)
+    for (DWORD i = 0; i < kHostPads; ++i)   // PlayStation pads and the keyboard sign in guests too
         if (polling.guestOf[i] > 0) used |= 1u << polling.guestOf[i];
     if (const uint32_t added = used & ~g_usedUsers.fetch_or(used))
         for (uint32_t user = 1; user < 4; ++user)
@@ -1040,7 +1055,8 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
             const XINPUT_GAMEPAD& g = sampled[s].Gamepad;
             const uint16_t pressed = uint16_t(g.wButtons | (g.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD ? 0x0400 : 0) |
                                               (g.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD ? 0x0800 : 0));
-            const Device device = DWORD(s) < kXInputPads ? Device::Xbox : polling.hostPs5[s] ? Device::PlayStation5 : Device::PlayStation4;
+            const Device device = DWORD(s) == kKeyboardPad ? Device::Keyboard : DWORD(s) < kXInputPads ? Device::Xbox
+                                  : polling.hostPs5[s] ? Device::PlayStation5 : Device::PlayStation4;
             if ((pressed & ~polling.prevPressed[s]) || !polling.promptNoted) { button_prompts::NoteInput(device); polling.promptNoted = true; }
             polling.prevPressed[s] = pressed;
         }

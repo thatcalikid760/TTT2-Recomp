@@ -9,10 +9,11 @@
 //   Shadows=1|0           (cast shadows drawn / not)
 //   [Game]
 //   InputDelay=0|1        (the game's 2-frame offline input delay: removed / original)
+//   KeyboardPlayer=0|1    (the keyboard: part of player 1's controller / a player of its own)
 //   [Graphics]
 //   VSync=0|1  RenderScale=100|125|150|200  Upscaler=0|1  FsrMode=100|77|67|59|50
 //   AntiAliasing=0|1|2 (FXAA=0|1 before it)  Anisotropy=1|2|4|8|16  Sharpen=0..3
-//   Shadows=0|1  Brightness=0..10  FpsCounter=0|1
+//   Shadows=0|1  OnlineCrowds=0|1  Brightness=0..10  FpsCounter=0|1
 //   [Online]
 //   Netcode=0..3          (STANDARD, PRIORITIZE RESPONSE, PRIORITIZE GRAPHICS, CUSTOM)
 //   CustomDelay=1..6      (CUSTOM's input delay, frames)
@@ -45,6 +46,8 @@ int g_customRollback = kMaxRollback;
 // The image options as the renderer asks for them every frame and every draw (GetSharpness ..
 // GetShadows): lock-free copies of g_graphics, refreshed by MirrorLocked.
 std::atomic<int> g_sharpness{ 0 }, g_antiAliasing{ 0 }, g_textureFilter{ 0 }, g_vsync{ 1 }, g_shadows{ 1 };
+// KEYBOARD PLAYER, read by the input poll thread every millisecond: lock-free too.
+std::atomic<int> g_keyboardPlayer{ 0 };
 std::atomic<bool> g_loadedFlag{ false };
 
 void MirrorLocked()
@@ -107,6 +110,7 @@ void LoadLocked()
             if (list[i].width == w && list[i].height == h) g_resolution = int(i);
     }
     g_inputDelay = GetPrivateProfileIntA("Game", "InputDelay", 0, ini.c_str()) != 0;
+    g_keyboardPlayer = GetPrivateProfileIntA("Game", "KeyboardPlayer", 0, ini.c_str()) != 0 ? 1 : 0;
     const Graphics d;
     Graphics& g = g_graphics;
     g.vsync = GetPrivateProfileIntA("Graphics", "VSync", d.vsync, ini.c_str()) != 0;
@@ -118,6 +122,7 @@ void LoadLocked()
     g.anisotropy = IndexOf(Anisotropies(), GetPrivateProfileIntA("Graphics", "Anisotropy", 1, ini.c_str()));
     g.sharpen = GetPrivateProfileIntA("Graphics", "Sharpen", d.sharpen, ini.c_str());
     g.shadows = GetPrivateProfileIntA("Graphics", "Shadows", d.shadows, ini.c_str()) != 0;
+    g.onlineCrowds = GetPrivateProfileIntA("Graphics", "OnlineCrowds", d.onlineCrowds, ini.c_str()) != 0;
     g.brightness = GetPrivateProfileIntA("Graphics", "Brightness", d.brightness, ini.c_str());
     g.fpsCounter = GetPrivateProfileIntA("Graphics", "FpsCounter", d.fpsCounter, ini.c_str()) != 0;
     g = Clamped(g);
@@ -164,6 +169,7 @@ void SaveLocked()
     WritePrivateProfileStringA("Display", "VSync", g_vsync.load() ? "1" : "0", ini.c_str());
     WritePrivateProfileStringA("Display", "Shadows", g_shadows.load() ? "1" : "0", ini.c_str());
     WritePrivateProfileStringA("Game", "InputDelay", g_inputDelay ? "1" : "0", ini.c_str());
+    WritePrivateProfileStringA("Game", "KeyboardPlayer", g_keyboardPlayer.load() ? "1" : "0", ini.c_str());
     const Graphics& g = g_graphics;
     auto put = [&](const char* key, int v) {
         std::snprintf(value, sizeof(value), "%d", v);
@@ -179,6 +185,7 @@ void SaveLocked()
     put("Sharpen", g.sharpen);
     WritePrivateProfileStringA("Graphics", "MotionBlur", nullptr, ini.c_str());   // 0.2.0 only: Display Settings has the game's own
     put("Shadows", g.shadows);
+    put("OnlineCrowds", g.onlineCrowds);
     put("Brightness", g.brightness);
     put("FpsCounter", g.fpsCounter);
     auto putVoice = [&](const char* key, int v) {
@@ -342,15 +349,15 @@ void SetGraphics(const Graphics& wanted)
     const Graphics& o = g_graphics;
     if (g.vsync == o.vsync && g.renderScale == o.renderScale && g.upscaler == o.upscaler && g.fsrMode == o.fsrMode &&
         g.antiAliasing == o.antiAliasing && g.anisotropy == o.anisotropy && g.sharpen == o.sharpen &&
-        g.shadows == o.shadows && g.brightness == o.brightness && g.fpsCounter == o.fpsCounter)
+        g.shadows == o.shadows && g.onlineCrowds == o.onlineCrowds && g.brightness == o.brightness && g.fpsCounter == o.fpsCounter)
         return;
     g_graphics = g;
     MirrorLocked();
     SaveLocked();
     g_generation.fetch_add(1);
-    std::fprintf(stderr, "[display] graphics: vsync %d, render scale %d%%, upscaler %d (fsr %d%%), aa %d, anisotropy %dx, sharpen %d, shadows %d, brightness %d, fps %d\n",
+    std::fprintf(stderr, "[display] graphics: vsync %d, render scale %d%%, upscaler %d (fsr %d%%), aa %d, anisotropy %dx, sharpen %d, shadows %d, online crowds %d, brightness %d, fps %d\n",
                  g.vsync, RenderScales()[size_t(g.renderScale)], g.upscaler, FsrModes()[size_t(g.fsrMode)], g.antiAliasing,
-                 Anisotropies()[size_t(g.anisotropy)], g.sharpen, g.shadows,
+                 Anisotropies()[size_t(g.anisotropy)], g.sharpen, g.shadows, g.onlineCrowds,
                  g.brightness, g.fpsCounter);
 }
 
@@ -405,6 +412,8 @@ bool GetShadows() { return GetAtomic(g_shadows) != 0; }
 void SetSharpness(int level) { Graphics g = GetGraphics(); g.sharpen = std::clamp(level, 0, kMaxSharpness) * 3 / kMaxSharpness; SetGraphics(g); }
 void SetAntiAliasing(int mode) { Graphics g = GetGraphics(); g.antiAliasing = mode ? 1 : 0; SetGraphics(g); }
 void SetTextureFilter(int mode) { Graphics g = GetGraphics(); g.anisotropy = std::clamp(mode, 0, kMaxTextureFilter); SetGraphics(g); }
+bool GetKeyboardPlayer() { return GetAtomic(g_keyboardPlayer) != 0; }
+void SetKeyboardPlayer(bool separate) { SetAtomic(g_keyboardPlayer, separate ? 1 : 0, 0, 1, "keyboard player (1 = separate)"); }
 void SetVSync(bool on) { Graphics g = GetGraphics(); g.vsync = on; SetGraphics(g); }
 void SetShadows(bool on) { Graphics g = GetGraphics(); g.shadows = on; SetGraphics(g); }
 

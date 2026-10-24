@@ -55,6 +55,12 @@ void SetShadows(bool on);
 bool GetInputDelayOn();
 void SetInputDelayOn(bool on);
 
+// Options -> Game Options -> KEYBOARD PLAYER: PLAYER 1 (default) - the keyboard's keys join player 1's
+// controller; SEPARATE - the keyboard is a controller of its own, a player once a key is pressed (VS BATTLE
+// with a keyboard and one pad; kernel_xam.cpp). [Game] KeyboardPlayer=0|1.
+bool GetKeyboardPlayer();
+void SetKeyboardPlayer(bool separate);
+
 // Options -> GRAPHICS SETTINGS (menu_ext.cpp's system UI page; the presenter applies them each
 // frame). [Graphics] in settings.ini. The game itself always runs at 60 fps: its simulation steps
 // once per vblank (kernel_video.cpp), so there is no frame-rate choice beyond V-SYNC.
@@ -68,6 +74,7 @@ struct Graphics
     int anisotropy = 0;         // index into Anisotropies(): 0 = the game's own (bilinear / trilinear)
     int sharpen = 0;            // 0 OFF, 1 LOW, 2 MEDIUM, 3 HIGH (contrast-adaptive)
     bool shadows = true;        // OFF: the game's shadow map is not drawn (lighter on the GPU)
+    bool onlineCrowds = false;  // ON: online matches keep the stages' background characters (online_crowds.cpp)
     int brightness = 5;         // 0..10, 5 = unchanged
     bool fpsCounter = false;    // frames per second in the top-left corner
 };

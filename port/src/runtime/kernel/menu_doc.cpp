@@ -325,6 +325,7 @@ uint8_t AddHostPage(Doc& d, uint8_t lastSmall, int row, const char* label, const
 void AddKeyboardMode(Doc& d);
 void AddInputDelay(Doc& d);
 void AddOnlineNetcode(Doc& d);
+void AddKeyboardPlayer(Doc& d);
 void AddDisplayImage(Doc& d);
 void HideDisplay3D(Doc& d);
 
@@ -485,6 +486,10 @@ void Edit(Doc& d, const PcLists& lists, std::string* note)
     Doc netcode = d;
     try { AddOnlineNetcode(netcode); d = std::move(netcode); }
     catch (const Fail& e) { if (note) *note += std::string(note->empty() ? "" : "; ") + "Game Options ONLINE NETCODE left out: " + e.what(); }
+    // And KEYBOARD PLAYER (after CUSTOM ROLLBACK: only with it).
+    Doc keyboardPlayer = d;
+    try { AddKeyboardPlayer(keyboardPlayer); d = std::move(keyboardPlayer); }
+    catch (const Fail& e) { if (note) *note += std::string(note->empty() ? "" : "; ") + "Game Options KEYBOARD PLAYER left out: " + e.what(); }
 }
 
 // ---- Options -> Game Options: INPUT DELAY (OFF / ON) before DEFAULT - the game's 2-frame offline
@@ -594,6 +599,51 @@ void AddOnlineNetcode(Doc& d)
     }
     d.Set(list[at], "name", "StaticMode007-01-010");
     list.insert(list.begin() + std::ptrdiff_t(at), helps.begin(), helps.end());
+}
+
+// ---- Options -> Game Options: KEYBOARD PLAYER (PLAYER 1 / SEPARATE) after CUSTOM ROLLBACK (display_settings.h;
+// kernel_xam.cpp makes the keyboard a controller of its own). A copy of GUARD DAMAGE with a value list of its own,
+// read and stored like INPUT DELAY (menu_ext.cpp). The page's icon arrays grow to 11 rows; DEFAULT's help text
+// becomes "StaticMode007-01-011".
+void AddKeyboardPlayer(Doc& d)
+{
+    Node row = d.Find("MenuItemMode007-01-04");
+    d.Set(row, "name", "MenuItemMode007-01-11");
+    d.Set(row, "text", "KEYBOARD PLAYER");
+    d.Set(row, "textid", nullptr);
+    d.Set(row, "textid360", nullptr);
+    d.Set(row, "value", "SelectValueMenuItemMode007-01-11");
+    {
+        size_t at = 0;
+        std::vector<Node>& items = d.ListOf("MenuItemMode007-01-06", at);
+        items.insert(items.begin() + std::ptrdiff_t(at), std::move(row));
+    }
+    Node sv = d.Find("SelectValueMenuItemMode007-01-04");
+    d.Set(sv, "name", "SelectValueMenuItemMode007-01-11");
+    sv.children.clear();
+    const uint32_t itemIndex = d.E("selectvalueitem");
+    for (const char* value : { "PLAYER 1", "SEPARATE" })
+    {
+        Node item;
+        item.index = itemIndex;
+        item.text = std::string(value) + '\0';
+        if (sv.children.empty()) d.Set(item, "default", "true");
+        sv.children.push_back(std::move(item));
+    }
+    {
+        size_t at = 0;
+        std::vector<Node>& list = d.ListOf("SelectValueMenuItemMode007-01-10", at);
+        list.insert(list.begin() + std::ptrdiff_t(at) + 1, std::move(sv));
+    }
+    XtalExtendArrays(d.Event(d.Find("MenuMode007-01-01"), "OnLoad").text, { 1, 2 }, 11);
+    size_t at = 0;
+    std::vector<Node>& list = d.ListOf("StaticMode007-01-010", at);
+    Node help = list[at];
+    d.Set(help, "text", "SEPARATE: the keyboard is a player of its own (VS BATTLE).");
+    d.Set(help, "textid", nullptr);
+    d.Set(help, "textid360", nullptr);
+    d.Set(list[at], "name", "StaticMode007-01-011");
+    list.insert(list.begin() + std::ptrdiff_t(at), std::move(help));
 }
 
 // ---- Options -> Display Settings: 3D MODE / 3D DEPTH out of the page.

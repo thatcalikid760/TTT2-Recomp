@@ -14,7 +14,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -84,6 +86,31 @@ void WriteGuestText(uint8_t* base, uint32_t buffer, uint32_t capacity, const std
     const uint32_t n = (std::min)(uint32_t(text.size()), capacity - 1);
     for (uint32_t i = 0; i < n; ++i) GWrite16(base, buffer + i * 2, uint8_t(text[i]));
     GWrite16(base, buffer + n * 2, 0);
+}
+
+// GAME CHAT (the keyboard the game opens with no title for a 31-character buffer: 30 characters a message, the
+// size of its messages in the lobby and on the wire): up to kChatLength characters are typed, and a longer message
+// goes out as several of the game's own, split at spaces. The game reopens the keyboard after each message; the
+// rest answers those reopenings, without showing the keyboard.
+constexpr uint32_t kChatLength = 80;
+std::mutex g_chatMutex;
+std::deque<std::string> g_chatRest;               // the pieces still to send
+
+std::vector<std::string> SplitChat(const std::string& text, size_t width) {
+    std::vector<std::string> parts;
+    size_t at = 0;
+    while (at < text.size()) {
+        while (at < text.size() && text[at] == ' ') ++at;
+        if (at >= text.size()) break;
+        size_t end = (std::min)(text.size(), at + width);
+        if (end < text.size() && text[end] != ' ') {
+            const size_t space = text.rfind(' ', end);
+            if (space != std::string::npos && space > at) end = space;
+        }
+        parts.push_back(text.substr(at, end - at));
+        at = end;
+    }
+    return parts;
 }
 
 struct Completion { uint8_t* base; uint32_t result, overlapped; };
@@ -201,15 +228,30 @@ PPC_FUNC(__imp__XamShowKeyboardUI) {
         if (const uint32_t error = XamValidateOverlapped(base, overlapped)) {
             ctx.r3.u32 = error; return;
         }
+        const bool chat = title.empty() && capacity == 31;
+        std::string next;
+        if (chat) {
+            std::lock_guard l(g_chatMutex);
+            if (!g_chatRest.empty()) { next = std::move(g_chatRest.front()); g_chatRest.pop_front(); }
+        }
         SysUiKeyboard keyboard;
         keyboard.title = Utf8(title);
         keyboard.description = Utf8(description);
         keyboard.text = Utf8(defaultText);
-        keyboard.maxLength = capacity - 1;
-        keyboard.done = [base, buffer, capacity, overlapped](bool ok, const std::string& text) {
+        keyboard.maxLength = chat ? kChatLength : capacity - 1;
+        keyboard.done = [base, buffer, capacity, overlapped, chat](bool ok, const std::string& typed) {
             // A cancel empties the buffer: GAME CHAT reopens the keyboard after every message and
             // sends whatever the buffer holds when it is closed - the last message, again.
-            WriteGuestText(base, buffer, capacity, ok ? text : std::string());
+            std::string text = ok ? typed : std::string();
+            if (chat && (!ok || text.size() > capacity - 1)) {
+                // a cancel drops what was left of a long message; a long one is split
+                std::vector<std::string> parts = SplitChat(text, capacity - 1);
+                std::lock_guard l(g_chatMutex);
+                g_chatRest.clear();
+                if (parts.size() > 1) g_chatRest.assign(parts.begin() + 1, parts.end());
+                if (!parts.empty()) text = parts[0];
+            }
+            WriteGuestText(base, buffer, capacity, text);
             std::thread([base, overlapped, ok] {
                 XamCompleteOverlapped(base, overlapped, ok ? 0 : kCancelled, 0, ok ? 0 : 0x800704C7u);
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -222,6 +264,13 @@ PPC_FUNC(__imp__XamShowKeyboardUI) {
         GWrite32(base, overlapped + 24, 0);
         std::atomic_thread_fence(std::memory_order_release);
         GWrite32(base, overlapped, kPending);
+        if (!next.empty()) {
+            // the next piece of a long chat message: answered at once, the keyboard not shown
+            keyboard.done(true, next);
+            XamNotifyEnqueueEvent(9, 1);                      // XN_SYS_UI opened
+            ctx.r3.u32 = kPending;
+            return;
+        }
         if (!SysUiShowKeyboard(std::move(keyboard))) {
             GWrite32(base, overlapped, saved[0]);
             GWrite32(base, overlapped + 4, saved[1]);

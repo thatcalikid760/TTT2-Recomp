@@ -403,7 +403,7 @@ void HideDialog(PPCContext& ctx, uint8_t* base)
 // More rows than the frame's 9 scroll (Draw).
 enum GraphicsRow
 {
-    kPreset, kVsync, kRenderScale, kUpscaler, kFsrMode, kAntiAliasing, kFiltering, kSharpen, kShadows, kBrightness, kFps,
+    kPreset, kVsync, kRenderScale, kUpscaler, kFsrMode, kAntiAliasing, kFiltering, kSharpen, kShadows, kOnlineCrowds, kBrightness, kFps,
     kDefault, kGraphicsRows
 };
 void BuildGraphics(Ui& ui)
@@ -431,6 +431,8 @@ void BuildGraphics(Ui& ui)
           "Anisotropic filtering keeps floors and walls sharp at an angle." },
         { "SHARPENING", sharpen[g.sharpen], g.upscaler ? "Sharpen the final image (FSR 1's RCAS when it enlarges)." : "Sharpen the final image." },
         { "SHADOWS", g.shadows ? "ON" : "OFF", "OFF: fighters and stage objects cast no shadows. Lighter on the GPU." },
+        { "ONLINE CROWDS", g.onlineCrowds ? "ON" : "OFF",
+          "ON: stages keep their background characters online (the game removes them). Experimental." },
         { "BRIGHTNESS", std::to_string(g.brightness), "Adjust the brightness of the picture." },
         { "FPS COUNTER", g.fpsCounter ? "ON" : "OFF", "Show frames per second in the corner. The game runs at a fixed 60." },
         { "DEFAULT", "", "Reset to default settings." },
@@ -457,6 +459,7 @@ void ChangeGraphics(int row, int dir)
     case kFiltering: g.anisotropy = step(g.anisotropy, int(display_settings::Anisotropies().size())); break;
     case kSharpen: g.sharpen = step(g.sharpen, 4); break;
     case kShadows: g.shadows = !g.shadows; break;
+    case kOnlineCrowds: g.onlineCrowds = !g.onlineCrowds; break;
     case kBrightness: g.brightness = std::clamp(g.brightness + dir, 0, 10); break;
     case kFps: g.fpsCounter = !g.fpsCounter; break;
     case kDefault: if (dir > 0) g = {}; break;
@@ -1031,7 +1034,10 @@ std::string KeyboardMessage(const KeyboardState& k)
     std::string m;
     if (!k.kb.title.empty()) m += k.kb.title + "\n";
     if (!k.kb.description.empty()) m += k.kb.description + "\n";
-    m += "\n" + k.text + "_\n\n" + (k.note.empty() ? std::string("ENTER: send   ESC: cancel") : k.note);
+    // a long text (GAME CHAT takes 80 characters) on lines of 40, so it fits the window
+    std::string typed = k.text + "_";
+    for (size_t at = 40; at < typed.size(); at += 41) typed.insert(at, "\n");
+    m += "\n" + typed + "\n\n" + (k.note.empty() ? std::string("ENTER: send   ESC: cancel") : k.note);
     return m;
 }
 void UpdateKeyboard(PPCContext& ctx, uint8_t* base, const KeyboardState& k)
@@ -2407,6 +2413,10 @@ PPC_FUNC(sub_8256CD28)
                 GWrite32(base, w + 368, uint32_t(display_settings::GetCustomDelay() - 1));
             if (const uint32_t w = FindWidget(ctx, base, customRollbackName))
                 GWrite32(base, w + 368, uint32_t(display_settings::GetCustomRollback() - 1));
+            // KEYBOARD PLAYER (PLAYER 1 = 0, SEPARATE = 1)
+            static const uint32_t keyboardName = GuestCString(base, "SelectValueMenuItemMode007-01-11");
+            if (const uint32_t w = FindWidget(ctx, base, keyboardName))
+                GWrite32(base, w + 368, display_settings::GetKeyboardPlayer() ? 1u : 0u);
         }
     }
     ctx = saved;
@@ -2430,6 +2440,9 @@ PPC_FUNC(sub_82374700)
         if (const uint32_t w = FindWidget(ctx, base, customDelayName)) display_settings::SetCustomDelay(int(GRead32(base, w + 368)) + 1);
         if (const uint32_t w = FindWidget(ctx, base, customRollbackName))
             display_settings::SetCustomRollback(int(GRead32(base, w + 368)) + 1);
+        static const uint32_t keyboardName = GuestCString(base, "SelectValueMenuItemMode007-01-11");
+        if (const uint32_t w = FindWidget(ctx, base, keyboardName))
+            display_settings::SetKeyboardPlayer(GRead32(base, w + 368) == 1);
     }
     ctx = saved;
 }
@@ -2443,6 +2456,7 @@ PPC_FUNC(sub_823747C0)
     display_settings::SetNetcode(display_settings::NetStandard);
     display_settings::SetCustomDelay(1);
     display_settings::SetCustomRollback(display_settings::kMaxRollback);
+    display_settings::SetKeyboardPlayer(false);
 }
 
 // TitleMode::Impl::state_title_main: the logo waiting for START (sub_82622B70); impl+40 counts the
