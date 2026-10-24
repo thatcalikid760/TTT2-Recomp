@@ -55,8 +55,10 @@ const char* const kOnlineMenu = "FrameOnlineMenu";
 // TEKKEN CHANNEL stays open on Steam for its REPLAY THEATER (the replays saved on this PC - the user, 2026-10-23:
 // watching them needs no server); its SEARCH REPLAYS needs a server (kReplay* below).
 const char* const kOnlineMenuItems = "MenuOnlineMenu";
-const char* const kServerOnlyRows[] = { "MenuItemOnline01-ranked-match", "MenuItemOnline04-team", "MenuItemOnline07-leaderboard" };
-const int kServerOnlyPlaces[] = { 0, 3, 5 };
+// RANKED MATCH stays open on Steam (this fork, 0.2.0: ranked over Steam lobbies, as before the community servers;
+// its results are recorded on a server only).
+const char* const kServerOnlyRows[] = { "MenuItemOnline04-team", "MenuItemOnline07-leaderboard" };
+const int kServerOnlyPlaces[] = { 3, 5 };
 // TEKKEN CHANNEL's page: 0 SEARCH REPLAYS (the server's replays), 1 REPLAY THEATER.
 const char* const kReplayFrame = "FrameOnline0501-arcade_replay";
 const char* const kReplayMenu = "MenuOnline0501-arcade_replay";
@@ -1126,7 +1128,7 @@ void Frame(PPCContext& ctx, uint8_t* base)
         g.rowsSet = true;
         g.rowsNetwork = g.address;
         g.nextStep = 0;
-        std::fprintf(stderr, "[srv-ui] online modes for %s: ranked, team, leaderboards, tekken channel's search %s\n",
+        std::fprintf(stderr, "[srv-ui] online modes for %s: team, leaderboards, tekken channel's search %s\n",
                      onServer ? g.address.c_str() : "Steam", onServer ? "on" : "grayed");
     }
     // TEKKEN CHANNEL's page: SEARCH REPLAYS on a server only; on Steam the cursor steps down to REPLAY THEATER as on
