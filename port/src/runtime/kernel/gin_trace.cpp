@@ -13,6 +13,7 @@
 // Research switches: TTT2_GIN_FORCE_WINNER=<side> (the ghost step's winner), TTT2_GIN_FORCE_DAN=1 (the two rank checks
 // see 1st dan).
 #include "kernel_shared.h"
+#include "lounge.h"
 #include <windows.h>
 #include <cstdio>
 #include <cstdlib>
@@ -238,6 +239,12 @@ PPC_FUNC(sub_823069E0)
 
 PPC_FUNC(sub_825590F8)
 {
+    {
+        // the FIGHTING LOUNGE's cabinets: who won (+666, below)
+        PPCContext c = ctx;
+        __imp__sub_825B7370(c, base);
+        if (c.r3.u32) lounge::MatchWinner(base[c.r3.u32 + 666]);
+    }
     if (On())
     {
         // the match-info object the step reads (sub_825B7370): per side +528/+532 (non-zero: skip that side, if

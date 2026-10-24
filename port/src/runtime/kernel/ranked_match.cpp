@@ -2,6 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "ranked_match.h"
+#include "lounge.h"
 #include "community_net.h"
 #include "net_transport.h"
 #include "sys_ui.h"
@@ -50,6 +51,7 @@ struct State
     std::string why;                                     // why there is no rematch (Declined)
     // an agreed rematch: the next ranked match against this peer is it
     uint64_t rematchPeer = 0;
+    bool loungeNext = false, isLounge = false;           // that next match is a FIGHTING LOUNGE cabinet's (this one is)
     // the room this game hosts for the rematch
     uint64_t reservedFor = 0;
     clock::time_point reservedEnd{};
@@ -116,7 +118,7 @@ void DeclineLocked(const std::string& why)
 void Finish(uint64_t session, bool ended)
 {
     uint64_t peer = 0;
-    bool wasRematch = false;
+    bool wasRematch = false, wasLounge = false;
     {
         std::lock_guard l(g_m);
         if (g.session != session || !g.started || g.ended) return;
@@ -124,7 +126,9 @@ void Finish(uint64_t session, bool ended)
         peer = XSocketMatchPeer();
         wasRematch = g.isRematch && peer == g.rematchPeer;
         if (g.isRematch) g.rematchPeer = 0;
+        wasLounge = g.isLounge;
     }
+    if (wasLounge) lounge::MatchOver(ended);
     if (!peer) return;
     const int64_t silence = XSocketSilenceMs(peer);
     if (silence >= kLeftSilenceMs)
@@ -138,7 +142,7 @@ void Finish(uint64_t session, bool ended)
                                 server ? "The server counts it as their quit." : "" }, 6000);
         return;
     }
-    if (!ended) return;                                  // this game left (or gave up on) the match: nothing to ask
+    if (!ended || wasLounge) return;                     // left (or gave up on) the match, or the lounge's: nothing to ask
     if (wasRematch)
     {
         Note("REMATCH OVER", { "The next search finds a new opponent." }, 5000);
@@ -228,6 +232,8 @@ void SessionStarted(uint64_t session, uint32_t flags)
     g.started = true;
     g.ended = false;
     g.isRematch = g.rematchPeer != 0;
+    g.isLounge = g.isRematch && g.loungeNext;
+    g.loungeNext = false;
     g.reservedFor = 0;                                   // the guest came: the room is full anyway
 }
 
@@ -301,9 +307,20 @@ void JoinNotFound()
     {
         std::lock_guard l(g_m);
         g.rematchPeer = 0;
+        g.loungeNext = false;
     }
     std::fprintf(stderr, "[ranked] the rematch room never showed up\n");
     Note("NO REMATCH", { "Your opponent's room was not found.", "Searching for a new opponent." }, 5000);
+}
+
+void PlanLoungeMatch(uint64_t peer)
+{
+    std::lock_guard l(g_m);
+    g.ask = Ask::Agreed;
+    g.rematchPeer = peer;
+    g.askEnd = clock::now() + std::chrono::minutes(2);  // the menus are walked to the search by then
+    g.loungeNext = true;
+    std::fprintf(stderr, "[ranked] lounge match with %016llX planned\n", (unsigned long long)peer);
 }
 
 void AddReservation(std::vector<mm::Context>& contexts)

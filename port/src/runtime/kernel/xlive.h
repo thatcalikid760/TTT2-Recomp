@@ -48,6 +48,7 @@ uint64_t XSocketMatchPeer();
 void XSocketForgetMatchPeer();                 // a session ended (XSessionDelete)
 int64_t XSocketSilenceMs(uint64_t peer);        // ms since that peer's last packet (-1: none heard lately)
 bool XSocketSendRematch(uint64_t peer, const void* data, size_t size);   // ranked_match.cpp's messages
+bool XSocketSendLounge(uint64_t peer, const void* data, size_t size);    // lounge.cpp's messages
 
 // Polled from XNotifyGetNext: a Steam "Join Game" or a Discord Join becomes XN_LIVE_INVITE_ACCEPTED, answered by
 // XInviteGetAcceptedInfo with that session.

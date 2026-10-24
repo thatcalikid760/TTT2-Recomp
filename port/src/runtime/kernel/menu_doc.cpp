@@ -1012,32 +1012,131 @@ void AddServerRow(Doc& d)
     d.Set(d.Find("StaticOnlineModeValue007"), "fontalign", "right");
 }
 
+// The ONLINE MODE menu's OnLoad: per patch version (three branches), OnlineMenu_icon_S_array and
+// OnlineMenu_icon_L_array of 7 entries each (MEASURED 2026-10-24: `42 01 02` makes an array, each entry `02 00 k
+// 43 01 02` after a `02`, `4a 00 00 05|06 00 00 01` stores it in the S / L global). Every array gets one more entry,
+// a copy of its last (7 bytes, right before the store). The branches' jumps (`1d 00 00 06 hi lo`, `1b hi lo`: offset
+// from the jump itself) grow by 7 for each entry added inside their span; the debug tail's last pc follows.
+void XtalGrowOnlineIconArrays(std::string& blob)
+{
+    const auto* b = reinterpret_cast<const uint8_t*>(blob.data());
+    const uint32_t codeSize = Be32(b, blob.size(), 8);
+    if (12 + size_t(codeSize) > blob.size()) throw Fail("bad script");
+    const std::string code = blob.substr(12, codeSize), tail = blob.substr(12 + codeSize);
+    constexpr size_t kUnit = 7;
+    std::vector<size_t> stores;
+    for (const char which : { '\x05', '\x06' })
+    {
+        const std::string store{ '\x4a', '\x00', '\x00', which, '\x00', '\x00', '\x01' };
+        for (size_t at = code.find(store); at != std::string::npos; at = code.find(store, at + 1)) stores.push_back(at);
+    }
+    std::sort(stores.begin(), stores.end());
+    if (stores.size() != 6) throw Fail("unexpected online menu icon arrays");
+    for (size_t at : stores)
+        if (at < kUnit || code[at - kUnit] != '\x02' || code[at - kUnit + 4] != '\x43') throw Fail("unexpected icon array entry");
+    // the jumps, and how far each one reaches
+    struct Jump { size_t at, operand; uint32_t offset; };
+    std::vector<Jump> jumps;
+    const std::string cond{ '\x1d', '\x00', '\x00', '\x06' };
+    for (size_t at = code.find(cond); at != std::string::npos; at = code.find(cond, at + 1))
+        jumps.push_back({ at, at + 4, uint32_t(uint8_t(code[at + 4])) << 8 | uint8_t(code[at + 5]) });
+    for (size_t k = 0; k + 1 < stores.size(); ++k)            // `1b hi lo` right after each L store but the last
+    {
+        const size_t at = stores[k] + 7;
+        if (at + 3 <= code.size() && code[at] == '\x1b')
+            jumps.push_back({ at, at + 1, uint32_t(uint8_t(code[at + 1])) << 8 | uint8_t(code[at + 2]) });
+    }
+    if (jumps.size() != 4) throw Fail("unexpected online menu branches");
+    std::string out = code;
+    for (const Jump& j : jumps)
+    {
+        uint32_t grown = j.offset;
+        for (size_t at : stores)
+            if (at > j.at && at < j.at + j.offset) grown += kUnit;
+        if (grown > 0xFFFF) throw Fail("jump too far");
+        out[j.operand] = char(grown >> 8);
+        out[j.operand + 1] = char(grown & 0xFF);
+    }
+    for (size_t k = stores.size(); k-- > 0;)                  // from the end: earlier positions stay valid
+        out.insert(stores[k], out.substr(stores[k] - kUnit, kUnit));
+    std::string oldLast, newLast;
+    PutBe32(oldLast, codeSize - 1);
+    PutBe32(newLast, uint32_t(out.size()) - 1);
+    std::string newTail = tail;
+    const size_t at = newTail.find(oldLast);
+    if (at == std::string::npos || newTail.find(oldLast, at + 1) != std::string::npos) throw Fail("script tail pc not unique");
+    newTail.replace(at, 4, newLast);
+    std::string head = blob.substr(0, 8);
+    PutBe32(head, uint32_t(out.size()));
+    blob = head + out + newTail;
+}
+
+// ---- ONLINE MODE menu: FIGHTING LOUNGE, an 8th row after SERVER (lounge.cpp): another copy of LEADERBOARDS, whose
+// OnEnter opens the lounge's page. Help and value texts by position, as SERVER's.
+void AddLoungeRow(Doc& d)
+{
+    Node row = d.Find("MenuItemOnline07-leaderboard");
+    d.Set(row, "name", "MenuItemOnline09-lounge");
+    d.Set(row, "text", "FIGHTING LOUNGE");
+    d.Set(row, "textid", nullptr);
+    d.Set(row, "textid360", nullptr);
+    XtalRename(d.Event(row, "OnEnter").text, "FrameOnline07", "FrameOnlineLounge");
+    {
+        size_t at = 0;
+        std::vector<Node>& items = d.ListOf("MenuItemOnline08-server", at);
+        items.insert(items.begin() + std::ptrdiff_t(at) + 1, std::move(row));
+    }
+    const struct { const char* from; const char* to; const char* text; } statics[] = {
+        { "StaticOnlineMode007", "StaticOnlineMode008", "BETA 0.0.1: cabinets, queues and chat." },
+        { "StaticOnlineModeValue007", "StaticOnlineModeValue008", " " },
+    };
+    for (const auto& s : statics)
+    {
+        size_t at = 0;
+        std::vector<Node>& list = d.ListOf(s.from, at);
+        Node copy = list[at];
+        d.Set(copy, "name", s.to);
+        d.Set(copy, "text", s.text);
+        d.Set(copy, "textid", nullptr);
+        d.Set(copy, "textid360", nullptr);
+        list.insert(list.begin() + std::ptrdiff_t(at) + 1, std::move(copy));
+    }
+    // The menu's icon arrays hold one entry per row, and its cursor stops at the last row they hold (MEASURED
+    // 2026-10-24: the cursor stayed on SERVER).
+    XtalGrowOnlineIconArrays(d.Event(d.Find("MenuOnlineMenu"), "OnLoad").text);
+}
+
 // ---- The server list in the online menus' own style (the user's pick, phase 0 mock-up B): a copy of
 // Search Session's criteria page (IFOnlineMenuM: label + value column, the focused row's help under its
 // label, scroll arrows) with kServerRows rows whose texts server_ui.cpp sets (and scrolls); B returns to
 // the ONLINE MODE menu. Every name the copied scripts use is renamed to the copy's; the page hides its
-// VOICE CHAT row in its OnLoad, which here hides a spare row.
-constexpr int kServerRows = 8;                                   // server_ui.cpp kRows
-void AddServerListFrame(Doc& d)
+// VOICE CHAT row in its OnLoad, which here hides a spare row. The FIGHTING LOUNGE page (lounge.cpp) is another
+// copy: `tag` names the copy's widgets ("Srv": MenuItemOnlineSrv01, StaticOnlineSrv001...; "Lng" the lounge's).
+constexpr int kServerRows = 8;                                   // server_ui.cpp kRows, lounge.cpp kRows
+struct ListPage { const char* tag; const char* frame; const char* menu; const char* backRow; const char* keyInfo; };
+const ListPage kServerPage = { "Srv", "FrameOnlineServerList", "MenuOnlineServerList", "MenuItemOnline08-server", "ServerListKeyInfo" };
+const ListPage kLoungePage = { "Lng", "FrameOnlineLounge", "MenuOnlineLounge", "MenuItemOnline09-lounge", "LoungeKeyInfo" };
+void AddListFrame(Doc& d, const ListPage& page)
 {
     size_t at = 0;
     std::vector<Node>& top = d.ListOf("FrameOnline020201-start_search", at);
     const Node& source = top[at];
+    const std::string tag = page.tag;
     const std::pair<std::string, std::string> renames[] = {
-        { "MenuOnline020201-start_search", "MenuOnlineServerList" },
-        { "StaticTelopOnline0202", "StaticTelopOnlineSrv" },
-        { "StaticIconOnline0202", "StaticIconOnlineSrv" },
-        { "StaticOnline020200", "StaticOnlineSrv00" },
-        { "MenuOnline0202_icon_L_array", "MenuOnlineSrv_icon_L_array" },
-        { "MenuOnline020201_VoiceChat", "MenuOnlineSrv_VoiceChat" },
-        { "MenuItemOnline020206-voice_chat", "MenuItemOnlineSrvSpare" },
-        { "SelectValueMenuItemOnline020206-voice_chat", "SelectValueOnlineSrvSpare" },
-        { "StaticOnline0202005", "StaticOnlineSrvSpare" },
-        { "MenuItemOnline020201-start_search", "MenuItemOnlineSrv01" },
-        { "MenuItemOnline0202-custom_match", "MenuItemOnline08-server" },
+        { "MenuOnline020201-start_search", page.menu },
+        { "StaticTelopOnline0202", "StaticTelopOnline" + tag },
+        { "StaticIconOnline0202", "StaticIconOnline" + tag },
+        { "StaticOnline020200", "StaticOnline" + tag + "00" },
+        { "MenuOnline0202_icon_L_array", "MenuOnline" + tag + "_icon_L_array" },
+        { "MenuOnline020201_VoiceChat", "MenuOnline" + tag + "_VoiceChat" },
+        { "MenuItemOnline020206-voice_chat", "MenuItemOnline" + tag + "Spare" },
+        { "SelectValueMenuItemOnline020206-voice_chat", "SelectValueOnline" + tag + "Spare" },
+        { "StaticOnline0202005", "StaticOnline" + tag + "Spare" },
+        { "MenuItemOnline020201-start_search", "MenuItemOnline" + tag + "01" },
+        { "MenuItemOnline0202-custom_match", page.backRow },
         { "FrameOnline0201-quick_match", "FrameOnlineMenu" },
-        // the OnTick's key help: the host native adds SERVER INFO / REMOVE in front (menu_ext.cpp)
-        { "WindowPrintKeyInfo", "ServerListKeyInfo" } };
+        // the OnTick's key help: the host native adds the page's own hints in front (menu_ext.cpp)
+        { "WindowPrintKeyInfo", page.keyInfo } };
     auto has = [](const std::string& blob, const std::string& name) {     // an identifier / string entry
         for (const char tag : { '\x0e', '\x0b' })
         {
@@ -1062,7 +1161,7 @@ void AddServerListFrame(Doc& d)
     frame.index = source.index;
     frame.text = source.text;
     frame.attrs = source.attrs;
-    d.Set(frame, "name", "FrameOnlineServerList");
+    d.Set(frame, "name", page.frame);
     for (const Node& c : source.children)
         if (d.Get(c, "name").empty())                            // the frame's own events
         {
@@ -1075,7 +1174,7 @@ void AddServerListFrame(Doc& d)
     menu.index = menuSource.index;
     menu.text = menuSource.text;
     menu.attrs = menuSource.attrs;
-    d.Set(menu, "name", "MenuOnlineServerList");
+    d.Set(menu, "name", page.menu);
     const Node* rowTemplate = nullptr;
     for (const Node& c : menuSource.children)
         if (d.Get(c, "name") == "MenuItemOnline020201-start_search") rowTemplate = &c;
@@ -1086,7 +1185,7 @@ void AddServerListFrame(Doc& d)
         row.index = rowTemplate->index;
         row.text = rowTemplate->text;
         row.attrs = rowTemplate->attrs;
-        d.Set(row, "name", i <= kServerRows ? ("MenuItemOnlineSrv" + two(i)).c_str() : "MenuItemOnlineSrvSpare");
+        d.Set(row, "name", ("MenuItemOnline" + tag + (i <= kServerRows ? two(i) : "Spare")).c_str());
         d.Set(row, "text", "-");
         d.Set(row, "textid", nullptr);
         menu.children.push_back(std::move(row));
@@ -1106,17 +1205,17 @@ void AddServerListFrame(Doc& d)
     for (int i = 1; i <= kServerRows; ++i)
     {
         Node v = valueTemplate;
-        d.Set(v, "name", ("SelectValueOnlineSrv" + two(i)).c_str());
+        d.Set(v, "name", ("SelectValueOnline" + tag + two(i)).c_str());
         frame.children.push_back(std::move(v));
     }
     Node spare = child("SelectValueMenuItemOnline020206-voice_chat");
-    d.Set(spare, "name", "SelectValueOnlineSrvSpare");
+    d.Set(spare, "name", ("SelectValueOnline" + tag + "Spare").c_str());
     frame.children.push_back(std::move(spare));
     const Node& descTemplate = child("StaticOnline0202002");
     for (int i = 1; i <= kServerRows + 1; ++i)
     {
         Node h = descTemplate;
-        d.Set(h, "name", i <= kServerRows ? ("StaticOnlineSrv00" + std::to_string(i)).c_str() : "StaticOnlineSrvSpare");
+        d.Set(h, "name", ("StaticOnline" + tag + (i <= kServerRows ? "00" + std::to_string(i) : std::string("Spare"))).c_str());
         d.Set(h, "text", "-");
         frame.children.push_back(std::move(h));
     }
@@ -1124,7 +1223,7 @@ void AddServerListFrame(Doc& d)
     {
         Node s = child(name);
         std::string n = name;
-        n.replace(n.find("0202"), 4, "Srv");
+        n.replace(n.find("0202"), 4, tag);
         d.Set(s, "name", n.c_str());
         frame.children.push_back(std::move(s));
     }
@@ -1151,7 +1250,16 @@ std::string ApplyPcEdits(const uint8_t* b, size_t size, const PcLists& lists, st
         size_t p = 16;
         d.roots = ReadList(b, size, p, 0);
         if (p != elemOff) throw Fail("body does not end at the name tables");
-        if (online) { AddServerRow(d); AddServerListFrame(d); AddFriendInvite(d); }
+        if (online)
+        {
+            AddServerRow(d);
+            AddListFrame(d, kServerPage);
+            AddFriendInvite(d);
+            // FIGHTING LOUNGE edits a copy: if the online menu is not as measured, only the lounge is left out
+            Doc withLounge = d;
+            try { AddLoungeRow(withLounge); AddListFrame(withLounge, kLoungePage); d = std::move(withLounge); }
+            catch (const Fail& e) { if (note) *note = std::string("ONLINE MODE FIGHTING LOUNGE left out: ") + e.what(); }
+        }
         else Edit(d, lists, note);
         std::string body;
         WriteList(d.roots, body);

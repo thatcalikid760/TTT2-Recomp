@@ -94,3 +94,4 @@ bool HostTriggerHeld();
 void HostPulseStart();
 void HostPulseDown();
 void HostPulseA();
+void HostPulseButtons(uint16_t buttons);   // any buttons, 100 ms

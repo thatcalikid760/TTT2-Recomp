@@ -14,6 +14,7 @@
 #include "community_net.h"
 #include "net_transport.h"
 #include "ranked_match.h"
+#include "lounge.h"
 #include <chrono>
 #include <memory>
 #include <random>
@@ -334,7 +335,9 @@ uint32_t Search(uint8_t* base, uint32_t b)
         for (mm::SessionRecord& r : mm::List(64, filters, true))
         {
             if (found.size() >= numResults) break;
-            if (r.maxPublic <= r.filledPublic || ranked::ReservedForOther(r) || (onlyHost && r.hostPeer != onlyHost)) continue;
+            if (r.maxPublic <= r.filledPublic || ranked::ReservedForOther(r) || lounge::IsLoungeRecord(r) ||
+                (onlyHost && r.hostPeer != onlyHost))
+                continue;
             bool match = true;
             for (const auto& [id, value] : wanted)
                 for (const mm::Context& c : r.contexts)

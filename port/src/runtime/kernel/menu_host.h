@@ -27,6 +27,10 @@ bool WindowShowing(PPCContext& ctx, uint8_t* base);
 // lib::WindowPrintKeyInfoText(key, text): one more hint in the bottom bar's key help, this frame
 void KeyHint(PPCContext& ctx, uint8_t* base, uint32_t key, const std::string& text);
 
+// The menus switch to `frame` (lib::MenuChangeFrame, as the ui.trigger diagnostics do): the page's own back
+// navigation does not know how it was reached, so a page shown this way answers B itself.
+void ShowFrame(PPCContext& ctx, uint8_t* base, const std::string& frame);
+
 // Frames since the start (the UI hook's count; a native called from a page's OnTick tells its first call per
 // frame by it).
 uint32_t FrameCount();

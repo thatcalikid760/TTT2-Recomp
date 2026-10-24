@@ -1141,6 +1141,8 @@ void EnsurePadThread()
 std::atomic<int64_t> g_startPulseUntilMs{ 0 };
 std::atomic<int64_t> g_downPulseUntilMs{ 0 };
 std::atomic<int64_t> g_aPulseUntilMs{ 0 };
+std::atomic<int64_t> g_pulseUntilMs{ 0 };
+std::atomic<uint16_t> g_pulseButtons{ 0 };
 int64_t NowMs()
 {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1190,6 +1192,13 @@ void HostPulseDown() { g_downPulseUntilMs = NowMs() + 80; }
 
 // Player 1 presses A for 100 ms (CLASSIC OFFLINE enters OFFLINE MODE as its A would, classic_offline.cpp).
 void HostPulseA() { g_aPulseUntilMs = NowMs() + 100; }
+
+// Player 1 presses `buttons` for 100 ms (the FIGHTING LOUNGE walks the online menus to a cabinet's match, lounge.cpp).
+void HostPulseButtons(uint16_t buttons)
+{
+    g_pulseButtons = buttons;
+    g_pulseUntilMs = NowMs() + 100;
+}
 
 PPC_FUNC(__imp__XamInputGetCapabilities)
 {
@@ -1265,6 +1274,11 @@ PPC_FUNC(__imp__XamInputGetState)
     {
         st.Gamepad.wButtons |= 0x1000;          // A
         st.dwPacketNumber += 0x40000;
+    }
+    else if (user == 0 && NowMs() < g_pulseUntilMs.load())
+    {
+        st.Gamepad.wButtons |= g_pulseButtons.load();
+        st.dwPacketNumber += 0x80000;
     }
     if (user == 0)
     {

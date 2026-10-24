@@ -25,6 +25,7 @@
 #include "keyboard_keys.h"
 #include "menu_host.h"
 #include "server_ui.h"
+#include "lounge.h"
 #include "gin_service.h"
 #include <atomic>
 #include <cstdio>
@@ -2048,6 +2049,7 @@ void KeyHint(PPCContext& ctx, uint8_t* base, uint32_t key, const std::string& te
     sub_8241FAB8(ctx, base);                              // lib::WindowPrintKeyInfoText(key, text)
 }
 uint32_t FrameCount() { return g_frameCount.load(); }
+void ShowFrame(PPCContext& ctx, uint8_t* base, const std::string& frame) { SwitchFrame(ctx, base, frame.c_str()); }
 } // namespace menu_host
 
 namespace {
@@ -2063,6 +2065,7 @@ void UiFrame(PPCContext& ctx, uint8_t* base)
     sysui::Frame(ctx, base);
     keyui::Frame(ctx, base);
     server_ui::Frame(ctx, base);
+    lounge::Frame(ctx, base);
     static uint32_t tick = 0;
     if (++tick % 30) return;
     FILE* f = std::fopen("C:/ttt2/port/ui.trigger", "rb");
@@ -2126,7 +2129,7 @@ bool SysUiOwnsInput()
 }
 bool SysUiKeyCaptureActive() { return keyui::g_capture.load() || sysui::g_voiceCapture.load(); }
 uint16_t SysUiGameButtonMask() { return keyui::g_gameMask.load() & server_ui::GameButtonMask() & ranked::GameButtonMask() &
-                                     classic_offline::GameButtonMask(); }
+                                     classic_offline::GameButtonMask() & lounge::GameButtonMask(); }
 void SysUiOnKey(int vk)
 {
     if (sysui::g_voiceCapture.load()) { sysui::g_voiceKey = vk; return; }
@@ -2270,6 +2273,21 @@ PPC_FUNC(NativeServerListKeyInfo)
     __imp__sub_8241F988(ctx, base);
 }
 
+// lib::LoungeKeyInfo - the FIGHTING LOUNGE page's lib::WindowPrintKeyInfo (menu_doc.cpp AddLoungeFrame): the page's own
+// hints, with the lounge's in front of the first of each frame.
+PPC_FUNC(NativeLoungeKeyInfo)
+{
+    static uint32_t lastFrame = 0;
+    if (menu_host::FrameCount() != lastFrame)
+    {
+        lastFrame = menu_host::FrameCount();
+        const PPCContext saved = ctx;
+        lounge::KeyHints(ctx, base);
+        ctx = saved;
+    }
+    __imp__sub_8241F988(ctx, base);
+}
+
 struct HostNative { const char* name; uint32_t signature; PPCFunc* fn; };
 const HostNative kNatives[] = {
     // main menu: the 9th item (STORE in the game, EXIT here) is shown when this is true
@@ -2304,6 +2322,7 @@ const HostNative kNatives[] = {
     { "SwitchProfileWindow", kGetterInt, NativeSwitchProfileWindow },
     // the server list's key hints (its OnTick's lib::WindowPrintKeyInfo, same signature)
     { "ServerListKeyInfo", 0x8209FB64, NativeServerListKeyInfo },
+    { "LoungeKeyInfo", 0x8209FB64, NativeLoungeKeyInfo },
 };
 // Guest code addresses routed to the host natives: the interior of the development menu loader
 // sub_823450B0 (never called in retail; nothing indirect-calls into a function's middle).

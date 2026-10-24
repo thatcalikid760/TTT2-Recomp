@@ -19,6 +19,7 @@
 #include "xlive.h"
 #include "xsocket_service.h"
 #include "title_server.h"
+#include "lounge.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -77,9 +78,10 @@ bool Trace() { static const bool on = std::getenv("TTT2_NET_TRACE") != nullptr; 
 // ---- wire format ----
 // TimeSync: rollback sessions' frame-advantage reports (rollback_session.cpp), never a socket's.
 // FileAsk / FileData: a player's license asked of the games connected to this one (title_server.cpp), never a socket's.
-// Rematch: the rematch question after a match (ranked_match.cpp), never a socket's.
+// Rematch: the rematch question after a match (ranked_match.cpp), never a socket's. Lounge: the FIGHTING LOUNGE's
+// messages (lounge.cpp).
 enum class Op : uint8_t { Datagram = 1, Syn = 2, SynAck = 3, Reset = 4, Data = 5, Fin = 6, TimeSync = 7, FileAsk = 8, FileData = 9,
-                          Rematch = 10 };
+                          Rematch = 10, Lounge = 11 };
 #pragma pack(push, 1)
 struct Header { Op op; uint8_t proto; uint8_t toConnector; uint8_t pad; uint16_t srcPort, dstPort; uint32_t connId; };
 #pragma pack(pop)
@@ -244,6 +246,11 @@ void Receive(uint64_t from, net::Channel, const uint8_t* data, size_t size)
         ranked::PeerMessage(from, payload, payloadSize);
         return;
     }
+    if (h.op == Op::Lounge)
+    {
+        lounge::PeerMessage(from, payload, payloadSize);
+        return;
+    }
     if (h.op == Op::Datagram) g_timeSyncPeer.store(from);   // the match's peer (NACE's datagrams)
     std::lock_guard l(g_m);
     const uint32_t fromAddr = xlive::AddrOfPeer(from);
@@ -372,6 +379,13 @@ bool XSocketSendRematch(uint64_t peer, const void* data, size_t size)
 {
     return peer && EnsureTransport() &&
            SendPacket(peer, net::Channel::Reliable, Op::Rematch, 0, false, 0, 0, 0, static_cast<const uint8_t*>(data), size);
+}
+
+// lounge.cpp: a FIGHTING LOUNGE message.
+bool XSocketSendLounge(uint64_t peer, const void* data, size_t size)
+{
+    return peer && EnsureTransport() &&
+           SendPacket(peer, net::Channel::Reliable, Op::Lounge, 0, false, 0, 0, 0, static_cast<const uint8_t*>(data), size);
 }
 
 // rollback_session.cpp: a frame-advantage report to the match's peer (the last one whose datagrams
