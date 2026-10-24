@@ -28,6 +28,9 @@ int Create(const std::string& name);
 // A new name for a profile that is not signed in (the game keeps a signed-in profile's gamertag; the
 // save folder goes by the XUID, which stays): 0 done, 1 not valid / signed in, 2 another profile's name.
 int Rename(int index, const std::string& name);
+// Removes a profile that is not signed in; its save folder goes to the Recycle Bin (can be restored
+// from there). False when the index is out of range or signed in.
+bool Delete(int index);
 bool ValidName(const std::string& name);
 std::string Normalize(const std::string& name);   // trims, collapses spaces
 

@@ -1,4 +1,7 @@
 // Local player profiles - see profiles.h.
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shellapi.h>
 #include "profiles.h"
 #include <algorithm>
 #include <atomic>
@@ -181,6 +184,43 @@ int Rename(int index, const std::string& rawName)
     g_list[index].name = name;
     SaveLocked();
     return 0;
+}
+
+bool Delete(int index)
+{
+    Profile gone;
+    std::filesystem::path folder;
+    {
+        std::lock_guard l(g_mutex);
+        LoadLocked();
+        if (index < 0 || index >= int(g_list.size()) || index == g_active) return false;
+        gone = g_list[size_t(index)];
+        g_list.erase(g_list.begin() + index);
+        if (g_active > index) --g_active;
+        if (g_last > index) --g_last;
+        g_last = std::clamp(g_last, 0, (std::max)(int(g_list.size()) - 1, 0));
+        SaveLocked();
+        wchar_t hex[17];
+        swprintf(hex, 17, L"%016llX", static_cast<unsigned long long>(gone.xuid));
+        if (const std::filesystem::path file = File(); !file.empty()) folder = file.parent_path() / hex;
+    }
+    // The save folder to the Recycle Bin, no questions (the game asked already).
+    bool recycled = false;
+    std::error_code ec;
+    if (!folder.empty() && std::filesystem::exists(folder, ec))
+    {
+        std::wstring from = folder.wstring();
+        from.push_back(L'\0');                                  // a double-null-terminated list of one
+        SHFILEOPSTRUCTW op{};
+        op.wFunc = FO_DELETE;
+        op.pFrom = from.c_str();
+        op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
+        recycled = SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted;
+    }
+    std::fprintf(stderr, "[profiles] deleted '%s' (%016llX)%s\n", gone.name.c_str(), static_cast<unsigned long long>(gone.xuid),
+                 folder.empty() || !std::filesystem::exists(folder, ec) ? (recycled ? ", saves in the Recycle Bin" : ", no saves")
+                                                                        : ", its saves could not be moved");
+    return true;
 }
 
 } // namespace profiles

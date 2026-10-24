@@ -325,7 +325,7 @@ void BuildProfiles(Ui& ui)
 {
     ui.rows.clear();
     for (const profiles::Profile& p : profiles::List())
-        ui.rows.push_back({ p.name, "", "Play as " + p.name + ". Y: rename." });
+        ui.rows.push_back({ p.name, "", "Play as " + p.name + ". Y: rename. X: delete." });
     if (ui.rows.size() < profiles::kMaxProfiles)
         ui.rows.push_back({ "CREATE NEW PROFILE", "", "Make a new profile with its own save data." });
 }
@@ -1613,6 +1613,26 @@ void Frame(PPCContext& ctx, uint8_t* base)
                 }
             };
             if (SysUiShowTextBox(std::move(box))) MenuSound(ctx, base, kSoundDecide);
+            return;
+        }
+        if ((pressed & 0x4000) && ui.cursor < int(profiles::List().size()))       // X: delete, after an "are you sure"
+        {
+            const int index = ui.cursor;
+            const profiles::Profile victim = profiles::List()[size_t(index)];
+            SysUiMessageBox box;
+            box.text = "Delete the profile " + victim.name + "?\n\nIts save data goes too (to the Recycle Bin).\nAre you sure?";
+            box.buttons = { "DELETE", "CANCEL" };
+            box.cancel = 1;
+            box.done = [index, xuid = victim.xuid](int choice) {
+                if (choice != 0) return;
+                const std::vector<profiles::Profile> list = profiles::List();
+                if (index >= int(list.size()) || list[size_t(index)].xuid != xuid) return;   // the list changed meanwhile
+                if (!profiles::Delete(index)) return;
+                BuildProfiles(g_ui);
+                g_ui.cursor = (std::min)(g_ui.cursor, int(g_ui.rows.size()) - 1);
+                g_ui.shown.clear();                      // the rows are written again
+            };
+            if (SysUiShowMessageBox(std::move(box))) MenuSound(ctx, base, kSoundDecide);
             return;
         }
         Draw(ctx, base, ui);
