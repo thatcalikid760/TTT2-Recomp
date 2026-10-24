@@ -1,8 +1,8 @@
 // ONLINE MODE -> FIGHTING LOUNGE (TTT2 Fighting Lounge beta 0.0.1, a work in progress toward a 3D lounge - see
 // FIGHTING_LOUNGE.md): a room the players of the network share, with
 // 20 cabinets (A1..D5) and a text chat for everyone in it. A cabinet seats two players and keeps a queue; when both
-// seated players are ready, their games play a ranked match against each other (ranked::PlanLoungeMatch: the next
-// ranked search pins them together, the online menus are walked there by button pulses), then go back to the lounge.
+// seated players are ready, their games play an unranked PLAYER MATCH against each other (ranked::PlanLoungeMatch: the next
+// QUICK MATCH search pins them together, the online menus are walked there by button pulses), then go back to the lounge.
 // The winner stays seated and the next queued player takes the loser's seat (the loser joins the back of the queue).
 //
 // One game hosts the lounge: it publishes a session record marked as a lounge (never one the game's own searches
@@ -31,7 +31,7 @@ uint16_t GameButtonMask();
 void KeyHints(PPCContext& ctx, uint8_t* base);
 // A session record that is a lounge's (xsession.cpp keeps it out of the game's searches).
 bool IsLoungeRecord(const mm::SessionRecord& record);
-// A lounge cabinet's ranked match is over (ranked_match.cpp; `ended`: XSessionEnd, else deleted before its end).
+// A lounge cabinet's match is over (ranked_match.cpp; `ended`: XSessionEnd, else deleted before its end).
 void MatchOver(bool ended);
 // The match's end (gin_trace.cpp, the ghost step): the side that won.
 void MatchWinner(int side);

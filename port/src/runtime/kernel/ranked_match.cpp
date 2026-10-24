@@ -25,6 +25,7 @@ namespace {
 
 using clock = std::chrono::steady_clock;
 constexpr uint32_t kArbitration = 0x10;                  // XSESSION_CREATE: a ranked match
+constexpr uint32_t kMatchmaking = 0x08;                  // XSESSION_CREATE: a match's session (a PLAYER MATCH room too)
 // The opponent left when its packets had stopped this long by the time the game ended or deleted the match's session
 // (a match that ends normally ends at both games together; a game whose opponent vanished first waits out its own
 // disconnect timeout).
@@ -226,8 +227,9 @@ std::vector<std::string> Wrap(const std::string& text, size_t width)
 
 void SessionStarted(uint64_t session, uint32_t flags)
 {
-    if (!(flags & kArbitration)) return;
     std::lock_guard l(g_m);
+    // a FIGHTING LOUNGE match is a PLAYER MATCH room's (unranked): followed like a ranked one
+    if (!(flags & kArbitration) && !(g.loungeNext && (flags & kMatchmaking))) return;
     g.session = session;
     g.started = true;
     g.ended = false;
@@ -237,14 +239,26 @@ void SessionStarted(uint64_t session, uint32_t flags)
     g.reservedFor = 0;                                   // the guest came: the room is full anyway
 }
 
+bool LoungeSessionLocked(uint64_t session) { return g.isLounge && g.session == session; }
+
 void SessionEnded(uint64_t session, uint32_t flags, uint32_t)
 {
-    if (flags & kArbitration) Finish(session, true);
+    bool lounge;
+    {
+        std::lock_guard l(g_m);
+        lounge = LoungeSessionLocked(session);
+    }
+    if ((flags & kArbitration) || lounge) Finish(session, true);
 }
 
 void SessionDeleted(uint64_t session, uint32_t flags, uint32_t)
 {
-    if (!(flags & kArbitration)) return;
+    bool lounge;
+    {
+        std::lock_guard l(g_m);
+        lounge = LoungeSessionLocked(session);
+    }
+    if (!(flags & kArbitration) && !lounge) return;
     Finish(session, false);
     std::lock_guard l(g_m);
     if (g.session == session) { g.session = 0; g.started = false; }
@@ -321,6 +335,12 @@ void PlanLoungeMatch(uint64_t peer)
     g.askEnd = clock::now() + std::chrono::minutes(2);  // the menus are walked to the search by then
     g.loungeNext = true;
     std::fprintf(stderr, "[ranked] lounge match with %016llX planned\n", (unsigned long long)peer);
+}
+
+bool LoungePlanned()
+{
+    std::lock_guard l(g_m);
+    return g.loungeNext && g.ask == Ask::Agreed;
 }
 
 void AddReservation(std::vector<mm::Context>& contexts)

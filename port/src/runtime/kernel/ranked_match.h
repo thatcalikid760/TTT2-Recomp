@@ -33,9 +33,11 @@ struct SearchPlan
 };
 SearchPlan BeforeSearch(bool canWait);
 void JoinNotFound();                                    // the rematch room never showed up: back to normal searches
-// The FIGHTING LOUNGE (lounge.h): the next ranked search plays `peer` alone, as an agreed rematch (the lower peer id
-// hosts a room reserved for the other), and no rematch question follows it.
+// The FIGHTING LOUNGE (lounge.h): the next search - PLAYER MATCH's QUICK MATCH, unranked - plays `peer` alone, as an
+// agreed rematch does (the lower peer id hosts a room reserved for the other), and no rematch question follows it.
+// LoungePlanned: such a search is due (xsession.cpp then plans any search, not only ranked ones).
 void PlanLoungeMatch(uint64_t peer);
+bool LoungePlanned();
 
 // Session records: a rematch host's room carries the peer it waits for (two contexts); other searchers skip it.
 void AddReservation(std::vector<mm::Context>& contexts);

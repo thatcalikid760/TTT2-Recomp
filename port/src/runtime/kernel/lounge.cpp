@@ -38,9 +38,9 @@ const char* const kFrame = "FrameOnlineLounge";
 const char* const kMenu = "MenuOnlineLounge";
 const char* const kOnlineMenu = "FrameOnlineMenu";
 const char* const kOnlineMenuItems = "MenuOnlineMenu";
-const char* const kSearchFrame = "FrameOnline0101-start_match";   // RANKED MATCH's BEGIN SEARCH page
-const char* const kSearchMenu = "MenuOnline0101-start_match";     // (a guessed name reads -1: taken as row 0)
-constexpr int kRankedPlace = 0;                            // RANKED MATCH's row of MenuOnlineMenu
+const char* const kPlayerMatchFrame = "FrameOnline0201-quick_match";   // PLAYER MATCH's page: QUICK MATCH first
+const char* const kPlayerMatchMenu = "MenuOnline0201-quick_match";     // (a guessed name reads -1: taken as row 0)
+constexpr int kPlayerMatchPlace = 1;                       // PLAYER MATCH's row of MenuOnlineMenu
 
 enum Msg : uint8_t { Hello = 1, Snapshot = 2, Chat = 3, ChatOut = 4, Act = 5, Bye = 6, Start = 7, Result = 8, Closed = 9, Ping = 10 };
 enum Action : uint8_t { Sit = 1, Leave = 2, Ready = 3 };
@@ -114,7 +114,7 @@ struct Member { uint64_t peer = 0; std::string name; int64_t heardMs = 0; };
 struct ChatLine { std::string name, text; };
 enum class Phase { Off, Searching, Joining, In };
 // The walk from the lounge to a cabinet's match and back (main thread).
-enum class Walk { None, LeavePage, ToRanked, ToSearch, InMatch, Back, ToLounge };
+enum class Walk { None, LeavePage, ToPlayerMatch, ToQuickMatch, Searching, InMatch, Back, ToLounge };
 
 struct State
 {
@@ -714,9 +714,9 @@ void PageFrame(PPCContext& ctx, uint8_t* base)
     ui.mask = ui.walk != Walk::None ? uint16_t(0xFFFF) : uint16_t(0xFFFF & ~kA & ~kB & ~kX & ~(c == kRows - 1 ? kDown : 0) & ~(c == 0 ? kUp : 0));
 }
 
-// The walk to a cabinet's match: off the page (B), RANKED MATCH on the ONLINE MODE menu (UP until there, A); then
-// the game's own ranked search finds the opponent (ranked::PlanLoungeMatch). After the match: back to the ONLINE
-// MODE menu (B) and into the lounge (DOWN to FIGHTING LOUNGE, A).
+// The walk to a cabinet's match (unranked): off the page, PLAYER MATCH on the ONLINE MODE menu (UP / DOWN until
+// there, A), then QUICK MATCH (A); its search finds the cabinet opponent alone (ranked::PlanLoungeMatch). After the
+// match: back to the ONLINE MODE menu (B, a question's first answer A) and into the lounge.
 void WalkFrame(PPCContext& ctx, uint8_t* base, const std::string& frame)
 {
     const int64_t t = NowMs();
@@ -730,38 +730,48 @@ void WalkFrame(PPCContext& ctx, uint8_t* base, const std::string& frame)
     {
     case Walk::LeavePage:
         if (frame == kFrame) { menu_host::ShowFrame(ctx, base, kOnlineMenu); ui.nextPulseMs = t + 1500; }
-        else if (frame == kOnlineMenu) { ui.walk = Walk::ToRanked; ui.nextPulseMs = t + 400; }
+        else if (frame == kOnlineMenu) { ui.walk = Walk::ToPlayerMatch; ui.nextPulseMs = t + 400; }
         break;
-    case Walk::ToRanked:
+    case Walk::ToPlayerMatch:
+    {
         // a menu just shown ignores presses for a moment (MEASURED 2026-10-24: an A 0.4 s after the switch was lost)
         if (frame != kOnlineMenu || t - ui.frameSinceMs < 1500) break;
-        if (menu_host::Cursor(ctx, base, kOnlineMenuItems) != kRankedPlace) { HostPulseButtons(kUp); ui.nextPulseMs = t + 250; }
+        const int at = menu_host::Cursor(ctx, base, kOnlineMenuItems);
+        if (at >= 0 && at != kPlayerMatchPlace) { HostPulseButtons(at > kPlayerMatchPlace ? kUp : kDown); ui.nextPulseMs = t + 250; }
         else
         {
             HostPulseButtons(kA);
-            ui.walk = Walk::ToSearch;
+            ui.walk = Walk::ToQuickMatch;
             ui.nextPulseMs = t + 1500;
-            std::fprintf(stderr, "[lounge] RANKED MATCH chosen\n");
+            std::fprintf(stderr, "[lounge] PLAYER MATCH chosen\n");
         }
         break;
-    case Walk::ToSearch:
-        // RANKED MATCH's tip window (A), then BEGIN SEARCH (A); character select is the players' own
+    }
+    case Walk::ToQuickMatch:
+        // a tip window on the way (A), then QUICK MATCH (A)
         if (menu_host::WindowShowing(ctx, base)) { HostPulseButtons(kA); ui.nextPulseMs = t + 1200; }
-        else if (frame == kSearchFrame && t - ui.frameSinceMs >= 1200)
+        else if (frame == kPlayerMatchFrame && t - ui.frameSinceMs >= 1200)
         {
-            if (menu_host::Cursor(ctx, base, kSearchMenu) > 0) { HostPulseButtons(kUp); ui.nextPulseMs = t + 250; }
+            if (menu_host::Cursor(ctx, base, kPlayerMatchMenu) > 0) { HostPulseButtons(kUp); ui.nextPulseMs = t + 250; }
             else
             {
                 HostPulseButtons(kA);
-                ui.walk = Walk::InMatch;
-                std::fprintf(stderr, "[lounge] BEGIN SEARCH chosen: the players pick their characters\n");
+                ui.walk = Walk::Searching;
+                ui.walkUntilMs = t + 20000;
+                ui.nextPulseMs = t + 1500;
+                std::fprintf(stderr, "[lounge] QUICK MATCH chosen\n");
                 toast::Note n;
                 n.title = "FIGHTING LOUNGE";
-                n.lines = { "Pick your characters.", "Your cabinet opponent is found next." };
+                n.lines = { "Finding your cabinet opponent...", "Unranked: your rank does not change." };
                 toast::Show(n, 6000);
             }
         }
-        else if (frame == kOnlineMenu && t - ui.frameSinceMs >= 3000) ui.walk = Walk::ToRanked;   // the A was lost
+        else if (frame == kOnlineMenu && t - ui.frameSinceMs >= 3000) ui.walk = Walk::ToPlayerMatch;   // the A was lost
+        break;
+    case Walk::Searching:
+        // QUICK MATCH's questions while it searches (the host's "create a session?") take their first answer
+        if (frame == kPlayerMatchFrame && menu_host::WindowShowing(ctx, base)) { HostPulseButtons(kA); ui.nextPulseMs = t + 1200; }
+        else if (frame != kPlayerMatchFrame && t - ui.frameSinceMs >= 1500) ui.walk = Walk::InMatch;   // in the room
         break;
     case Walk::Back:
         if (frame == kOnlineMenu) { ui.walk = Walk::ToLounge; ui.nextPulseMs = t + 400; }
@@ -981,7 +991,7 @@ void Frame(PPCContext& ctx, uint8_t* base)
             ui.walk = Walk::LeavePage;
             ui.walkUntilMs = NowMs() + 30000;
             ui.nextPulseMs = NowMs() + 300;
-            std::fprintf(stderr, "[lounge] match against %016llX: walking to RANKED MATCH\n", (unsigned long long)opponent);
+            std::fprintf(stderr, "[lounge] match against %016llX: walking to PLAYER MATCH\n", (unsigned long long)opponent);
             toast::Note n;
             n.title = "FIGHTING LOUNGE";
             n.lines = { "Both players are ready.", "Starting the match..." };

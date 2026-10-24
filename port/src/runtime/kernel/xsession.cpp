@@ -323,7 +323,8 @@ uint32_t Search(uint8_t* base, uint32_t b)
     const bool rankedSearch = gameType != wanted.end() && gameType->second == 0;
     // after a ranked match both players agreed to a rematch (ranked_match.h): one hosts (finds nothing), the other
     // looks for that room only
-    const ranked::SearchPlan plan = rankedSearch ? ranked::BeforeSearch(t_asyncSearch) : ranked::SearchPlan{};
+    // and a FIGHTING LOUNGE cabinet's match (unranked, PLAYER MATCH): the same, with the cabinet opponent
+    const ranked::SearchPlan plan = rankedSearch || ranked::LoungePlanned() ? ranked::BeforeSearch(t_asyncSearch) : ranked::SearchPlan{};
     if (plan.kind == ranked::SearchPlan::Host)
     {
         Log("searchrematchhost", "XSessionSearch: rematch - hosting for %016llX", (unsigned long long)plan.peer);

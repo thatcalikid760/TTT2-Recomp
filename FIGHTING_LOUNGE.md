@@ -19,14 +19,13 @@ Code: `port/src/runtime/kernel/lounge.h`, `lounge.cpp`; the menu row and page in
 - A lounge per network: the first game in hosts it, the others join; up to 32 players.
 - LOUNGE CHAT: a text chat for everyone in the lounge (80 characters a message).
 - 20 cabinets A1-D5 as rows of a menu page: sit, ready, leave, a queue per cabinet.
-- Both seated players ready: their games walk the online menus to RANKED MATCH, and the ranked search is pinned to
+- Both seated players ready: their games walk the online menus to PLAYER MATCH -> QUICK MATCH (unranked), and the search is pinned to
   the cabinet opponent (`ranked::PlanLoungeMatch`). Winner stays, the next in line takes the loser's seat.
 
 Known limits and open items:
 
 - The cabinet match itself (the pinned ranked search, the winner report, rotation) is not tested yet: it needs two
   PCs on Steam.
-- Cabinet matches go through RANKED MATCH, so they count toward rank. Unranked Player Match rooms may fit better.
 - The lounge closes when its host leaves.
 
 ## Plan
