@@ -790,15 +790,8 @@ public:
         if (st.writeMask && depth) depthWithColor_[st.colorBase] = st.depthBase;
         if (st.writeMask) Grow(color, st.colorBase, needW, needH, sc);
         if (depth) Grow(*depth, st.depthBase, needW, needH, sc);
-        // MOTION BLUR OFF: the velocity pass (16_16_FLOAT colour, format 6) is skipped and its
-        // target held at zero velocity, so the game's blur samples every pixel in place.
-        if (!gfx_.motionBlur && st.writeMask && ((st.colorBase >> 12) & 0xF) == 6)
-        {
-            const float zero[4] = {};
-            context_->ClearRenderTargetView(color.rtv.Get(), zero);
-            ++stats_.skippedDraws;
-            return true;
-        }
+        // Draws by colour-target format (the stats line lists those other than 8_8_8_8).
+        if (st.writeMask) ++stats_.byFormat[(st.colorBase >> 12) & 0xF];
         ID3D11RenderTargetView* rtv = st.writeMask ? color.rtv.Get() : nullptr;
         ID3D11DepthStencilView* dsv = depth ? depth->dsv.Get() : nullptr;
         context_->OMSetRenderTargets(rtv ? 1 : 0, rtv ? &rtv : nullptr, dsv);
@@ -2251,7 +2244,9 @@ private:
     struct Bound { ID3D11ShaderResourceView* srv; uint32_t swizzle, mode, width, height; float scaleX, scaleY; uint32_t slices = 1, levels = 1; };
     struct Stats { uint64_t draws = 0, triangles = 0, skippedDraws = 0, emptyDraws = 0, resolves = 0, presents = 0,
                    compiles = 0, diskHits = 0, uploads = 0, uploadBytes = 0, resolvedHits = 0, writebacks = 0,
-                   depthResolves = 0, depthHits = 0, gpuVsDraws = 0, vertexDataBytes = 0, warmHits = 0, pendingSkips = 0, stagedReadbacks = 0, ringWaits = 0, resolveCreates = 0, resolvePoolHits = 0, shadowSkips = 0; double ringWaitMs = 0; };
+                   depthResolves = 0, depthHits = 0, gpuVsDraws = 0, vertexDataBytes = 0, warmHits = 0, pendingSkips = 0, stagedReadbacks = 0, ringWaits = 0, resolveCreates = 0, resolvePoolHits = 0, shadowSkips = 0; double ringWaitMs = 0;
+                   uint64_t byFormat[16] = {};   // draws by colour-target format (last: Stats d{...} is positional)
+    };
     // ---- SHADOWS OFF (display_settings::GetShadows): the game's cast shadows come from square depth maps - about
     // 50 depth-only draws per frame (colour writes off, depth written, compare GEQUAL; cleared by draws with compare
     // ALWAYS) into an EDRAM depth surface, resolved as a 512 / 1024 / 2048 square depth texture, turned into an
@@ -4640,13 +4635,17 @@ private:
         const uint64_t resolveCreates = stats_.resolveCreates - reported_.resolveCreates;
         const uint64_t resolvePoolHits = stats_.resolvePoolHits - reported_.resolvePoolHits;
         const uint64_t shadowSkips = stats_.shadowSkips - reported_.shadowSkips;
+        std::string formats;
+        for (int f = 1; f < 16; ++f)
+            if (const uint64_t n = stats_.byFormat[f] - reported_.byFormat[f])
+                formats += (formats.empty() ? "" : " ") + std::to_string(f) + ":" + std::to_string(n);
         reported_ = stats_;
         if (shadowSkips) std::fprintf(stderr, "[gpu-hw]   shadows off: %llu shadow-map draws skipped\n", (unsigned long long)shadowSkips);
         std::fprintf(stderr,
-            "[gpu-hw] %.1fs: draws=%llu tris=%llu skipped=%llu empty=%llu resolves=%llu presents=%llu (%.1f/s) "
+            "[gpu-hw] %.1fs: draws=%llu tris=%llu formats=[%s] skipped=%llu empty=%llu resolves=%llu presents=%llu (%.1f/s) "
             "ps_compiles=%llu ps_disk=%llu shader_warm=%llu shader_pending_skips=%llu tex_uploads=%llu (%.1f MB) resolved_hits=%llu writebacks=%llu (staged %llu) "
             "depth_resolves=%llu depth_hits=%llu shaders=%zu textures=%zu gpu_vs_draws=%llu (%.1f MB vertex data, %zu vs) ring_waits=%llu (%.1f ms) resolve_textures=%llu new %llu reused\n",
-            s, (unsigned long long)d.draws, (unsigned long long)d.triangles, (unsigned long long)d.skippedDraws,
+            s, (unsigned long long)d.draws, (unsigned long long)d.triangles, formats.c_str(), (unsigned long long)d.skippedDraws,
             (unsigned long long)d.emptyDraws, (unsigned long long)d.resolves, (unsigned long long)d.presents,
             double(d.presents) / s, (unsigned long long)d.compiles, (unsigned long long)d.diskHits, (unsigned long long)warmHits, (unsigned long long)pendingSkips,
             (unsigned long long)d.uploads, double(d.uploadBytes) / 1048576.0, (unsigned long long)d.resolvedHits,

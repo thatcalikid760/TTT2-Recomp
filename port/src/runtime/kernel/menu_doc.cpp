@@ -326,6 +326,7 @@ void AddKeyboardMode(Doc& d);
 void AddInputDelay(Doc& d);
 void AddOnlineNetcode(Doc& d);
 void AddDisplayImage(Doc& d);
+void HideDisplay3D(Doc& d);
 
 void Edit(Doc& d, const PcLists& lists, std::string* note)
 {
@@ -437,7 +438,11 @@ void Edit(Doc& d, const PcLists& lists, std::string* note)
     }
 
     // (Upstream's VSYNC / SHARPNESS / ANTI-ALIASING / TEXTURE FILTERING / SHADOWS rows in Display
-    // Settings, AddDisplayImage, are not added: GRAPHICS SETTINGS holds all of them.)
+    // Settings, AddDisplayImage, are not added: GRAPHICS SETTINGS holds all of them. Its removal of
+    // 3D MODE / 3D DEPTH is.)
+    Doc no3d = d;
+    try { HideDisplay3D(no3d); d = std::move(no3d); }
+    catch (const Fail& e) { if (note) *note = std::string("Display Settings 3D rows left in: ") + e.what(); }
     const uint8_t switchIcon = AddSwitchProfile(d);
     // GRAPHICS SETTINGS edits a copy: if the Options page is not as measured, only it is left out.
     Doc graphics = d;
@@ -591,6 +596,24 @@ void AddOnlineNetcode(Doc& d)
     list.insert(list.begin() + std::ptrdiff_t(at), helps.begin(), helps.end());
 }
 
+// ---- Options -> Display Settings: 3D MODE / 3D DEPTH out of the page.
+void HideDisplay3D(Doc& d)
+{
+    // 3D MODE / 3D DEPTH (stereoscopic 3D: never on a PC, the rows stayed greyed out) leave the page so 10 rows fit
+    // above the info bar (12 overlapped it). The page's scripts look them up by name, so they stay in the document,
+    // out of the automatic layout and hidden (row, value, help text); the cursor already skipped them. MEASURED: only
+    // hiding them left their help texts and frames in place.
+    for (const char* name : { "MenuItemMode007-04-03", "MenuItemMode007-04-04", "SelectValueMenuItemMode007-04-03",
+                              "SelectValueMenuItemMode007-04-04", "StaticMode007-04-03", "StaticMode007-04-04" })
+    {
+        Node& n = d.Find(name);
+        d.Set(n, "postype", "abs");
+        d.Set(n, "posx", "-4000");
+        d.Set(n, "posy", "-4000");
+        d.Set(n, "visible", "false");
+    }
+}
+
 // ---- Options -> Display Settings: VSYNC, SHARPNESS, ANTI-ALIASING, TEXTURE FILTERING, SHADOWS after RESOLUTION
 // (display_settings.h; the presenter, the texture samplers and the renderer apply them as the cursor moves).
 // Clones of 3D DEPTH like DISPLAY MODE / RESOLUTION, natives renamed to PC ones of the same lengths
@@ -659,19 +682,7 @@ void AddDisplayImage(Doc& d)
         list.insert(list.begin() + std::ptrdiff_t(at) + 1, lists.begin(), lists.end());
     }
     XtalExtendArrays(d.Event(d.Find("MenuMode007-04-01"), "OnLoad").text, { 1, 2 }, 12);
-    // 3D MODE / 3D DEPTH (stereoscopic 3D: never on a PC, the rows stayed greyed out) leave the page so 10 rows fit
-    // above the info bar (12 overlapped it). The page's scripts look them up by name, so they stay in the document,
-    // out of the automatic layout and hidden (row, value, help text); the cursor already skipped them. MEASURED: only
-    // hiding them left their help texts and frames in place.
-    for (const char* name : { "MenuItemMode007-04-03", "MenuItemMode007-04-04", "SelectValueMenuItemMode007-04-03",
-                              "SelectValueMenuItemMode007-04-04", "StaticMode007-04-03", "StaticMode007-04-04" })
-    {
-        Node& n = d.Find(name);
-        d.Set(n, "postype", "abs");
-        d.Set(n, "posx", "-4000");
-        d.Set(n, "posy", "-4000");
-        d.Set(n, "visible", "false");
-    }
+    HideDisplay3D(d);
     size_t at = 0;
     std::vector<Node>& list = d.ListOf("StaticMode007-04-07", at);
     std::vector<Node> helps;

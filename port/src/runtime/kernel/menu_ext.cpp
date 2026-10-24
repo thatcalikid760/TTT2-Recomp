@@ -398,7 +398,7 @@ void HideDialog(PPCContext& ctx, uint8_t* base)
 // More rows than the frame's 9 scroll (Draw).
 enum GraphicsRow
 {
-    kPreset, kVsync, kRenderScale, kUpscaler, kFsrMode, kAntiAliasing, kFiltering, kSharpen, kMotionBlur, kShadows, kBrightness, kFps,
+    kPreset, kVsync, kRenderScale, kUpscaler, kFsrMode, kAntiAliasing, kFiltering, kSharpen, kShadows, kBrightness, kFps,
     kDefault, kGraphicsRows
 };
 void BuildGraphics(Ui& ui)
@@ -425,7 +425,6 @@ void BuildGraphics(Ui& ui)
         { "TEXTURE FILTERING", aniso > 1 ? std::to_string(aniso) + "X ANISOTROPIC" : "STANDARD",
           "Anisotropic filtering keeps floors and walls sharp at an angle." },
         { "SHARPENING", sharpen[g.sharpen], g.upscaler ? "Sharpen the final image (FSR 1's RCAS when it enlarges)." : "Sharpen the final image." },
-        { "MOTION BLUR", g.motionBlur ? "ON" : "OFF", "The game's blur on fast moves. OFF keeps every frame crisp." },
         { "SHADOWS", g.shadows ? "ON" : "OFF", "OFF: fighters and stage objects cast no shadows. Lighter on the GPU." },
         { "BRIGHTNESS", std::to_string(g.brightness), "Adjust the brightness of the picture." },
         { "FPS COUNTER", g.fpsCounter ? "ON" : "OFF", "Show frames per second in the corner. The game runs at a fixed 60." },
@@ -452,7 +451,6 @@ void ChangeGraphics(int row, int dir)
     case kAntiAliasing: g.antiAliasing = step(g.antiAliasing, 3); break;
     case kFiltering: g.anisotropy = step(g.anisotropy, int(display_settings::Anisotropies().size())); break;
     case kSharpen: g.sharpen = step(g.sharpen, 4); break;
-    case kMotionBlur: g.motionBlur = !g.motionBlur; break;
     case kShadows: g.shadows = !g.shadows; break;
     case kBrightness: g.brightness = std::clamp(g.brightness + dir, 0, 10); break;
     case kFps: g.fpsCounter = !g.fpsCounter; break;
@@ -2675,6 +2673,8 @@ PPC_FUNC(sub_8241B588)
             std::fprintf(stderr, "[keyhint] key %u side %u '%s' lr %08X\n", ctx.r4.u32, ctx.r7.u32, text.c_str(), uint32_t(ctx.lr));
     }
     const uint32_t window = ctx.r3.u32, key = ctx.r4.u32 & 0xFFFF, r6 = ctx.r6.u32, r7 = ctx.r7.u32;
+    // ONLINE MODE's X "SEARCH FOR Xbox LIVE PARTY": no Xbox LIVE parties on a PC, the button does nothing - no hint.
+    if (key == 0xE027 && ctx.r5.u32 && GuestString(base, ctx.r5.u32, 48).find("LIVE PARTY") != std::string::npos) return;
     __imp__sub_8241B588(ctx, base);
     if (key != 0xE026) return;
     const uint32_t manager = GRead32(base, 0x82F30B94);
