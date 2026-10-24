@@ -191,7 +191,7 @@ target_compile_definitions(community_net_test PRIVATE _CRT_SECURE_NO_WARNINGS)
 
 # --- Version, icon -------------------------------------------------------------------------
 # One version for the game executable's VERSIONINFO, the installer and Add or remove programs.
-set(TTT2_VERSION "0.2.2")
+set(TTT2_VERSION "0.2.3")
 string(REPLACE "." "," TTT2_VERSION_COMMAS "${TTT2_VERSION},0")
 # In-game updates (updater.cpp): the GitHub repository whose latest release is offered. A release's
 # version is read from its tag or its name and must be higher than TTT2_VERSION to be offered.
