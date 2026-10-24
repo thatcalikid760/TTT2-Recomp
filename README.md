@@ -62,7 +62,18 @@
 > [!IMPORTANT]
 > **You need your own copy of the game.** This project contains no game files; the installer builds them on your PC from your disc image.
 
-## What's new in 0.2.3
+## What's new in 0.2.4
+
+- **Fighting Lounge (beta, work in progress):** ONLINE MODE > **FIGHTING LOUNGE**. A shared lounge with **LOUNGE CHAT** for everyone in it and 20 cabinets (01-20). Xbox **A** (PlayStation **Cross**, keyboard **A**) sits down, joins a full cabinet's queue, or readies up; Xbox **X** (PlayStation **Square**, keyboard **Z**) leaves. When both seated players are ready, the game takes them to an unranked Player Match against each other; the winner stays and the next in line takes the other seat. The cabinet match itself is still being tested: please report what happens. Everyone needs 0.2.4. The 3D lounge with your fighters as avatars is in the works (see `FIGHTING_LOUNGE.md`).
+- **VS BATTLE with an Xbox and a PlayStation controller:** a PlayStation pad that becomes player 2 now counts, so VS BATTLE is no longer grayed out.
+- **Keyboard as its own player:** Options > Game Options > **KEYBOARD PLAYER**. PLAYER 1 (default) adds the keys to player 1's controller as before; SEPARATE makes the keyboard a player of its own, so a keyboard and one controller can play VS BATTLE.
+- **Online crowds:** Options > Graphics Settings > **ONLINE CROWDS** keeps the stages' background characters in online matches (experimental).
+- **GAME CHAT** takes up to 80 characters; longer messages go out as several.
+
+## All patch notes
+
+<details>
+<summary><b>0.2.3</b></summary>
 
 - **Ranked rematch:** after a ranked match both players are asked **REMATCH?**: yes with Xbox **Y** (PlayStation **Triangle**, keyboard **X**) or a left-click on the note, no with Xbox **X** (PlayStation **Square**, keyboard **Z**) or a right-click. If both say yes you play the same opponent once more, as in TEKKEN 8.
 - **Rage-quit penalties** (community servers): leaving a ranked match early counts as a loss, earns a strike and locks you out of ranked matchmaking for 5 minutes (15 for the second strike, an hour from the third; a strike is forgiven every 24 hours). The opponent's quit rate shows when a ranked match is found.
@@ -73,7 +84,7 @@
 - Keyboard keys are the defaults; with your own in Controller Setup, use the keys you set for Y and X.
 - Rematch and quit reports need 0.2.3 on both sides; server owners need the new `ttt2-server` for the penalties.
 
-## All patch notes
+</details>
 
 <details>
 <summary><b>0.2.2</b></summary>
