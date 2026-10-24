@@ -11,12 +11,13 @@ This project is built on **[shihabal3amri/tekken-tag-tournament-2-pc](https://gi
 ## Patch notes
 
 ### 0.2.3
-- **Ranked rematch:** after a ranked match both players are asked **REMATCH?** (Y / X, or click the note). If both say yes you play the same opponent once more, as in TEKKEN 8.
+- **Ranked rematch:** after a ranked match both players are asked **REMATCH?**: yes with Xbox **Y** (PlayStation **Triangle**, keyboard **X**) or a left-click on the note, no with Xbox **X** (PlayStation **Square**, keyboard **Z**) or a right-click. If both say yes you play the same opponent once more, as in TEKKEN 8.
 - **Rage-quit penalties** (community servers): leaving a ranked match early counts as a loss, earns a strike and locks you out of ranked matchmaking for 5 minutes (15 for the second strike, an hour from the third; a strike is forgiven every 24 hours). The opponent's quit rate shows when a ranked match is found.
-- **Classic Offline:** on the main menu, put the cursor on OFFLINE MODE and press **X**. You start with 22 fighters; every ARCADE clear unlocks the next one. Progress is kept per profile, and the option disappears once all 37 are unlocked. The normal Offline Mode keeps the full roster.
+- **Classic Offline:** on the main menu, put the cursor on OFFLINE MODE and press Xbox **X** (PlayStation **Square**, keyboard **Z**). You start with 22 fighters; every ARCADE clear unlocks the next one. Progress is kept per profile, and the option disappears once all 37 are unlocked. The normal Offline Mode keeps the full roster.
 - The player card shows your **Steam avatar** (it was see-through).
 - The ONLINE MODE menu notes that Steam must be running for online play.
-- Select Profile shows **RENAME** and **DELETE** in the bottom bar, with your controller's buttons.
+- Select Profile shows **RENAME** (Xbox **Y**, PlayStation **Triangle**, keyboard **X**) and **DELETE** (Xbox **X**, PlayStation **Square**, keyboard **Z**) in the bottom bar; the icons follow the controller you use.
+- Keyboard keys are the defaults; with your own in Controller Setup, use the keys you set for Y and X.
 - Rematch and quit reports need 0.2.3 on both sides; server owners need the new `ttt2-server` for the penalties.
 
 ### 0.2.2
