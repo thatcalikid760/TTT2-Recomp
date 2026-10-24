@@ -10,7 +10,7 @@ This project is built on **[shihabal3amri/tekken-tag-tournament-2-pc](https://gi
 
 ## Patch notes
 
-### Next (unreleased)
+### 0.2.0
 - **From upstream 0.1.7:** rollback netcode (Options > Game Options > ONLINE NETCODE), community servers with Ranked Match, leaderboards, teams, Tekken Channel replays and ghosts, Steam Friend Invite (Y in a Player Match room), pair play online, rooms no longer vanishing after a few matches, shaders prepared by the installer (no first-time stutter), texture mipmaps, laptops on the dedicated GPU, and 640x360 / 960x540 resolutions.
 - **Graphics Settings:** presets (LOW to ULTRA), FSR 1 upscaling with FSR modes, SMAA anti-aliasing, motion blur and shadows on/off. The page scrolls.
 - **Fix:** the voice chat panel's player list no longer reshuffles, so mute hits the player you picked.
