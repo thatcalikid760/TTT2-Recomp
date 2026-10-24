@@ -93,3 +93,4 @@ uint16_t HostControllerButtons();
 bool HostTriggerHeld();
 void HostPulseStart();
 void HostPulseDown();
+void HostPulseA();

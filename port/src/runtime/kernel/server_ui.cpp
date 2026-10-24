@@ -1016,6 +1016,9 @@ std::string StatusLine()
     return g_status;
 }
 
+std::atomic<bool> g_onlineMenu{ false };
+bool OnlineMenuShowing() { return g_onlineMenu.load(); }
+
 void Frame(PPCContext& ctx, uint8_t* base)
 {
     if (!Enabled()) return;
@@ -1032,6 +1035,8 @@ void Frame(PPCContext& ctx, uint8_t* base)
     const std::string frame = g.frame;
     // ONLINE MODE: from the game's first GIN request (WaitForNetwork) or its first frame, to the main menu
     if (frame.rfind("Frame", 0) == 0) g.lastNamed = frame;
+    // the menu reports its frame a moment, then "(none)" while it stays (MEASURED 2026-10-24): the last named one counts
+    g_onlineMenu = g.online && g.lastNamed == kOnlineMenu;
     const bool ginAsks = g_wanted.exchange(false);
     if (!g.online && (ginAsks || frame.rfind("FrameOnline", 0) == 0))
     {

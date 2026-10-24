@@ -45,9 +45,9 @@ namespace steamnet {
 namespace {
 
 enum : uint8_t { kSend = 1, kPublish = 2, kRemove = 3, kList = 4, kTicket = 5, kCancelTicket = 6, kFriends = 7, kInvite = 8,
-                 kVoiceRecord = 9, kVoicePeers = 10,
+                 kVoiceRecord = 9, kVoicePeers = 10, kAvatar = 11,
                  kReady = 101, kRecv = 102, kListResult = 103, kJoin = 104, kTicketResult = 105, kFriendsResult = 106,
-                 kInviteResult = 107, kVoicePcm = 108, kVoiceTalk = 109, kVoiceName = 110 };
+                 kInviteResult = 107, kVoicePcm = 108, kVoiceTalk = 109, kVoiceName = 110, kAvatarResult = 111 };
 constexpr uint32_t kMaxFrame = 16u << 20;
 
 void Put32(uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); }
@@ -136,6 +136,7 @@ std::map<uint32_t, std::vector<std::vector<uint8_t>>> g_lists;
 std::map<uint32_t, std::pair<uint32_t, std::string>> g_tickets;   // request -> handle, ticket hex
 std::deque<std::vector<uint8_t>> g_joins;
 std::map<uint32_t, std::vector<FriendInfo>> g_friendLists;       // request -> friends
+std::map<uint32_t, std::pair<uint32_t, std::vector<uint8_t>>> g_avatars;   // request -> side (0: none), RGBA
 std::map<uint32_t, bool> g_invites;                              // request -> sent
 std::chrono::steady_clock::time_point g_launched;
 
@@ -237,6 +238,16 @@ void Reader(HANDLE in, uint32_t generation)
         else if (type == kVoiceName && p.size() >= 8)
         {
             if (g_voice.name) g_voice.name(Get64(p.data()), std::string(p.begin() + 8, p.end()));
+        }
+        else if (type == kAvatarResult && p.size() >= 8)
+        {
+            // u32 request, u32 side (0: none), side x side x 4 bytes RGBA
+            const uint32_t side = Get32(p.data() + 4);
+            std::pair<uint32_t, std::vector<uint8_t>> a{ 0, {} };
+            if (side && side <= 256 && p.size() == 8 + size_t(side) * side * 4) a = { side, std::vector<uint8_t>(p.begin() + 8, p.end()) };
+            std::lock_guard l(g_mutex);
+            g_avatars[Get32(p.data())] = std::move(a);
+            g_cv.notify_all();
         }
         else if (type == kFriendsResult && p.size() >= 8)
         {
@@ -633,6 +644,29 @@ std::vector<FriendInfo> Friends(int timeoutMs)
     return out;
 }
 
+bool Avatar(uint64_t steamId, std::vector<uint8_t>& rgba, uint32_t& side, int timeoutMs)
+{
+    if (g_inproc) return direct::Avatar(steamId, rgba, side, timeoutMs);
+    if (!g_running) return false;
+    uint32_t request;
+    {
+        std::lock_guard l(g_mutex);
+        request = g_nextRequest++;
+    }
+    uint8_t body[12];
+    Put32(body, request);
+    Put64(body + 4, steamId);
+    if (!g_out.Frame(kAvatar, body, 12)) return false;
+    std::unique_lock l(g_mutex);
+    g_cv.wait_for(l, std::chrono::milliseconds(timeoutMs + 1000), [&] { return g_avatars.count(request) || !g_running; });
+    const auto it = g_avatars.find(request);
+    if (it == g_avatars.end()) return false;
+    side = it->second.first;
+    rgba = std::move(it->second.second);
+    g_avatars.erase(it);
+    return side != 0;
+}
+
 bool InviteToSession(uint64_t sessionId, uint64_t friendId, int timeoutMs)
 {
     if (g_inproc) return direct::InviteToSession(sessionId, friendId);
@@ -892,6 +926,21 @@ int RunBridge(int argc, char** argv)
                 if (len) std::memcpy(body.data() + at + 11, f.name.data(), len);
             }
             g_out.Frame(kFriendsResult, body.data(), body.size());
+        }
+        else if (type == kAvatar && p.size() >= 12)
+        {
+            const uint32_t request = Get32(p.data());
+            const uint64_t id = Get64(p.data() + 4);
+            std::thread([request, id] {
+                std::vector<uint8_t> rgba;
+                uint32_t side = 0;
+                if (!direct::Avatar(id, rgba, side, 5000)) side = 0, rgba.clear();
+                std::vector<uint8_t> body(8 + rgba.size());
+                Put32(body.data(), request);
+                Put32(body.data() + 4, side);
+                if (!rgba.empty()) std::memcpy(body.data() + 8, rgba.data(), rgba.size());
+                g_out.Frame(kAvatarResult, body.data(), body.size());
+            }).detach();
         }
         else if (type == kInvite && p.size() >= 20)
         {

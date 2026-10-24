@@ -10,37 +10,40 @@ import (
 
 // Control frame types (PROTOCOL.md).
 const (
-	Hello        = 1
-	Auth         = 2
-	Ping         = 3
-	SessionPut   = 4
-	SessionDel   = 5
-	SessionList  = 6
-	SessionGet   = 7
-	InviteSend   = 8
-	GinRequest   = 9
-	StatsWrite   = 10
-	StatsBoard   = 11
-	StatsPlayers = 12
-	ArbRegister  = 13
-	PeerCheck    = 14
-	XuidNames    = 15
-	MatchEvent   = 16 // only to a server whose WELCOME has flag bit 3 (matches are recorded)
-	FilePut      = 17 // FilePut, FileGet: only to a server whose WELCOME has flag bit 4 (player files are kept)
-	FileGet      = 18
-	Welcome      = 101
-	Error        = 102
-	Pong         = 103
-	ListResult   = 104
-	GetResult    = 105
-	Invite       = 106
-	Notice       = 109
-	GinResponse  = 110
-	StatsResult  = 111
-	PeerResult   = 112
-	NamesResult  = 113
-	FileResult   = 114
-	MaxFrameSize = 1 << 20
+	Hello         = 1
+	Auth          = 2
+	Ping          = 3
+	SessionPut    = 4
+	SessionDel    = 5
+	SessionList   = 6
+	SessionGet    = 7
+	InviteSend    = 8
+	GinRequest    = 9
+	StatsWrite    = 10
+	StatsBoard    = 11
+	StatsPlayers  = 12
+	ArbRegister   = 13
+	PeerCheck     = 14
+	XuidNames     = 15
+	MatchEvent    = 16 // only to a server whose WELCOME has flag bit 3 (matches are recorded)
+	FilePut       = 17 // FilePut, FileGet: only to a server whose WELCOME has flag bit 4 (player files are kept)
+	FileGet       = 18
+	RankedLeft    = 19 // RankedLeft, ConductGet: only to a server whose WELCOME has flag bit 5 (ranked conduct is kept)
+	ConductGet    = 20
+	Welcome       = 101
+	Error         = 102
+	Pong          = 103
+	ListResult    = 104
+	GetResult     = 105
+	Invite        = 106
+	Notice        = 109
+	GinResponse   = 110
+	StatsResult   = 111
+	PeerResult    = 112
+	NamesResult   = 113
+	FileResult    = 114
+	ConductResult = 115
+	MaxFrameSize  = 1 << 20
 )
 
 // UDP datagram kinds (only the server list's status request and reply).

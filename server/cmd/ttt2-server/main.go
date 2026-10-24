@@ -88,6 +88,7 @@ func main() {
 	h.SetStats(db)   // the leaderboards
 	h.SetMatches(db) // the match history
 	h.SetFiles(db)   // the players' licenses
+	h.SetConduct(db) // ranked quits and cooldowns
 	db.SetUploadQuota(int64(cfg.MaxUploadStorageMB) << 20)
 	// the game's GIN web requests: its message of the day and news from the configuration (reload applies them)
 	h.SetGIN(gin.New(db, func() gin.Settings {
@@ -243,6 +244,7 @@ type commands struct {
 
 const helpText = "status | players [all [name part or steam id]] | sessions | seen <name or steam id> |\n" +
 	"kick <name or steam id> [minutes] [reason] | ban <name or steam id> [days] [reason] | unban <steam id> | bans |\n" +
+	"pardon <steam id> (ends a ranked cooldown, forgives its strikes) |\n" +
 	"matches [count | name | steam id] | say <text> | reload | board [view] [rows] | wipe <steam id> |\n" +
 	"team [create|add|remove|delete ...] | backup <file> | fingerprint |\n" +
 	"panel-setup [force] | panel-password | panel-logout-all | panel-status | quit"
@@ -309,6 +311,17 @@ func (c *commands) run(line string, out io.Writer) (quit bool) {
 		}
 	case "bans":
 		c.bans(out)
+	case "pardon":
+		id, err := strconv.ParseUint(arg, 10, 64)
+		if err == nil {
+			err = c.db.ClearCooldown(id)
+		}
+		if err != nil {
+			fmt.Fprintln(out, err)
+		} else {
+			c.h.Pardon(id)
+			c.note(out, "admin: ranked cooldown of %d ended", id)
+		}
 	case "matches":
 		c.matches(out, arg)
 	case "say":

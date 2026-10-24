@@ -13,6 +13,7 @@
 #include "live_stats.h"
 #include "community_net.h"
 #include "net_transport.h"
+#include "ranked_match.h"
 #include <chrono>
 #include <memory>
 #include <random>
@@ -105,6 +106,7 @@ void Publish(const Session& s)
     for (const Member& m : s.members) (m.isPrivate ? r.filledPrivate : r.filledPublic)++;
     std::memcpy(r.info, s.info.data(), sizeof(r.info));
     for (const auto& [id, value] : g_contexts) r.contexts.push_back({ id, value });
+    ranked::AddReservation(r.contexts);                    // a rematch host's room waits for its opponent alone
     for (const auto& [id, value] : g_properties) r.properties.push_back({ id, value });
     if (SessionEnabled())
         r.netcode = mm::kNetcodeKnown | uint32_t(display_settings::GetNetcode()) | uint32_t(display_settings::GetCustomDelay()) << 8 |
@@ -178,13 +180,30 @@ uint32_t JoinLeave(uint8_t* base, uint32_t b, bool join)
     return S_OK_;
 }
 
+// X_CONTEXT_GAME_TYPE as the game set it (0 ranked, 1 standard; ~0 not set), under g_mutex.
+uint32_t GameTypeLocked()
+{
+    const auto it = g_contexts.find(0x800A);
+    return it == g_contexts.end() ? ~0u : it->second;
+}
+
 uint32_t SetState(uint8_t* base, uint32_t b, State state, const char* name)
 {
-    std::lock_guard l(g_mutex);
-    Session* s = Lookup(base, GRead32(base, b));
-    if (!s) return STATUS_INVALID_HANDLE_;
-    s->state = state;
-    Log(name, "XSession%s(%016llX)", name, (unsigned long long)s->id);
+    uint64_t id = 0;
+    uint32_t flags = 0, gameType = 0;
+    {
+        std::lock_guard l(g_mutex);
+        Session* s = Lookup(base, GRead32(base, b));
+        if (!s) return STATUS_INVALID_HANDLE_;
+        s->state = state;
+        id = s->id;
+        flags = s->flags;
+        gameType = GameTypeLocked();
+        Log(name, "XSession%s(%016llX)", name, (unsigned long long)s->id);
+    }
+    // a ranked match starts / ends (ranked_match.h: the rematch question, an opponent who left)
+    if (state == State::InGame) ranked::SessionStarted(id, flags);
+    if (state == State::Reporting) ranked::SessionEnded(id, flags, gameType);
     return S_OK_;
 }
 
@@ -299,12 +318,23 @@ uint32_t Search(uint8_t* base, uint32_t b)
     }
     std::vector<mm::SessionRecord> found;
     const std::vector<std::pair<uint32_t, uint32_t>> filters(wanted.begin(), wanted.end());
+    const auto gameType = wanted.find(0x800A);              // X_CONTEXT_GAME_TYPE: 0 ranked
+    const bool rankedSearch = gameType != wanted.end() && gameType->second == 0;
+    // after a ranked match both players agreed to a rematch (ranked_match.h): one hosts (finds nothing), the other
+    // looks for that room only
+    const ranked::SearchPlan plan = rankedSearch ? ranked::BeforeSearch(t_asyncSearch) : ranked::SearchPlan{};
+    if (plan.kind == ranked::SearchPlan::Host)
+    {
+        Log("searchrematchhost", "XSessionSearch: rematch - hosting for %016llX", (unsigned long long)plan.peer);
+        return WriteResults(base, {}, results, size);
+    }
+    uint64_t onlyHost = plan.kind == ranked::SearchPlan::Join ? plan.peer : 0;
     auto list = [&] {
         found.clear();
         for (mm::SessionRecord& r : mm::List(64, filters, true))
         {
             if (found.size() >= numResults) break;
-            if (r.maxPublic <= r.filledPublic) continue;
+            if (r.maxPublic <= r.filledPublic || ranked::ReservedForOther(r) || (onlyHost && r.hostPeer != onlyHost)) continue;
             bool match = true;
             for (const auto& [id, value] : wanted)
                 for (const mm::Context& c : r.contexts)
@@ -313,8 +343,24 @@ uint32_t Search(uint8_t* base, uint32_t b)
         }
     };
     list();
-    const auto gameType = wanted.find(0x800A);              // X_CONTEXT_GAME_TYPE: 0 ranked
-    if (found.empty() && t_asyncSearch && gameType != wanted.end() && gameType->second == 0)
+    if (onlyHost)
+    {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (found.empty() && t_asyncSearch && std::chrono::steady_clock::now() < until)
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            list();
+        }
+        Log("searchrematchjoin", "XSessionSearch: rematch - %s %016llX's room", found.empty() ? "did not find" : "found",
+            (unsigned long long)onlyHost);
+        if (found.empty())
+        {
+            ranked::JoinNotFound();
+            onlyHost = 0;
+            list();
+        }
+    }
+    if (found.empty() && t_asyncSearch && rankedSearch)
     {
         thread_local std::mt19937 rng{ std::random_device{}() };
         const int waitMs = std::uniform_int_distribution<int>(1500, 4500)(rng);
@@ -385,6 +431,7 @@ uint32_t ArbitrationRegister(uint8_t* base, uint32_t b)
     const std::shared_ptr<community::Client> server = net::Community();
     const uint64_t opponent = XSocketMatchPeer();
     if (server && server->Connected()) server->RegisterRanked(s->id, xlive::OnlineXuid(), opponent);
+    ranked::OpponentKnown(opponent);                        // their quit rate, on a server that keeps it
     Log("arbitration", "XSessionArbitrationRegister -> 1 registrant%s (opponent %016llX)", server ? " (registered with the server)" : "",
         (unsigned long long)opponent);
     return S_OK_;
@@ -463,6 +510,14 @@ uint32_t XSessionHostNetcode()
     return joined && mm::Find(joined, r) ? r.netcode : 0;
 }
 
+// The hosted sessions' records published again (ranked_match.cpp: a rematch room's reservation ran out).
+void XSessionRepublish()
+{
+    std::lock_guard l(g_mutex);
+    for (const auto& [handle, s] : g_sessions)
+        if (s.created) Publish(s);
+}
+
 // ---- session handles ------------------------------------------------------------------------------
 PPC_FUNC(__imp__XamSessionCreateHandle)
 {
@@ -517,6 +572,17 @@ uint32_t XgiDispatch(uint8_t* base, uint32_t msg, uint32_t b, uint32_t length, b
     case 0x000B0010: return Create(base, b);
     case 0x000B0011:                                         // XSessionDelete
     {
+        uint64_t id = 0;
+        uint32_t flags = 0, gameType = 0;
+        {
+            std::lock_guard l(g_mutex);
+            const Session* s = Lookup(base, GRead32(base, b));
+            if (!s) return STATUS_INVALID_HANDLE_;
+            id = s->id;
+            flags = s->flags;
+            gameType = GameTypeLocked();
+        }
+        ranked::SessionDeleted(id, flags, gameType);         // a ranked match deleted before its end: did the opponent leave?
         std::lock_guard l(g_mutex);
         Session* s = Lookup(base, GRead32(base, b));
         if (!s) return STATUS_INVALID_HANDLE_;

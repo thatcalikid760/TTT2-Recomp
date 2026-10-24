@@ -27,10 +27,10 @@ namespace {
 // server/PROTOCOL.md
 enum : uint8_t { kHello = 1, kAuth = 2, kPing = 3, kSessionPut = 4, kSessionDel = 5, kSessionList = 6, kSessionGet = 7, kInviteSend = 8,
                  kGinRequest = 9, kStatsWrite = 10, kStatsBoard = 11, kStatsPlayers = 12, kArbRegister = 13, kPeerCheck = 14, kXuidNames = 15,
-                 kMatchEvent = 16, kFilePut = 17, kFileGet = 18,
+                 kMatchEvent = 16, kFilePut = 17, kFileGet = 18, kRankedLeft = 19, kConductGet = 20,
                  kWelcome = 101, kError = 102, kPong = 103, kListResult = 104, kGetResult = 105, kInvite = 106,
                  kNotice = 109, kGinResponse = 110, kStatsResult = 111, kPeerResult = 112, kNamesResult = 113,
-                 kFileResult = 114 };
+                 kFileResult = 114, kConductResult = 115 };
 enum : uint8_t { kInfoReq = 1, kInfo = 2 };
 constexpr uint32_t kInfoMagic = 0x49535454;     // "TTSI" little-endian
 constexpr size_t kInfoReqMinSize = 128;
@@ -210,10 +210,13 @@ struct Client::Impl
     std::map<uint32_t, uint8_t> peerAnswers;   // PEER_RESULT by request
     std::map<uint32_t, std::map<uint64_t, std::string>> nameAnswers;   // XUID_NAMES_RESULT by request
     std::map<uint32_t, std::pair<uint8_t, std::vector<uint8_t>>> fileAnswers;   // FILE_RESULT by request
+    std::map<uint32_t, std::pair<uint8_t, Conduct>> conductAnswers;   // CONDUCT_RESULT by request
     bool gin = false;                          // the server answers GIN (WELCOME flag bit 1)
     bool stats = false;                        // ... keeps statistics (bit 2)
     bool matches = false;                      // ... records matches (bit 3)
     bool files = false;                        // ... keeps the players' license files (bit 4)
+    bool conduct = false;                      // ... keeps ranked conduct (bit 5)
+    std::deque<std::string> notices;           // NOTICE texts not taken yet (TakeNotice)
     std::atomic<uint64_t> banUntil{ ~0ull };   // ERROR 6's until (~0: not said)
     std::set<uint32_t> outstanding;            // requests still waited for (answers to others are dropped)
     std::deque<std::pair<uint64_t, std::vector<uint8_t>>> invites;
@@ -377,9 +380,29 @@ struct Client::Impl
             if (r.ok()) std::fprintf(stderr, "[community] invite from %016llX ignored (no in-game prompt yet)\n", (unsigned long long)from);
             break;
         }
-        case kNotice:
-            std::fprintf(stderr, "[community] server notice: %s\n", Clean(r.Str(400), 200).c_str());
+        case kConductResult:
+        {
+            const uint32_t request = r.U32();
+            const uint8_t found = r.U8();
+            Conduct c;
+            c.matches = r.U32();
+            c.quits = r.U32();
+            c.cooldownUntil = r.U64();
+            if (!r.ok()) { Close("malformed answer from the server"); return; }
+            std::lock_guard l(reqMutex);
+            if (!outstanding.count(request)) break;
+            conductAnswers[request] = { found, c };
+            reqCv.notify_all();
             break;
+        }
+        case kNotice:
+        {
+            std::string text = Clean(r.Str(400), 200);
+            std::fprintf(stderr, "[community] server notice: %s\n", text.c_str());
+            std::lock_guard l(reqMutex);
+            if (notices.size() < 8) notices.push_back(std::move(text));
+            break;
+        }
         case kError:
         {
             const uint32_t code = r.U32();
@@ -596,10 +619,12 @@ bool Client::Connect(const Options& opts, Welcome& welcome, std::string& error)
     welcome.stats = (flags & 4) != 0;
     welcome.matches = (flags & 8) != 0;
     welcome.files = (flags & 16) != 0;
+    welcome.conduct = (flags & 32) != 0;
     m.gin = welcome.gin;
     m.stats = welcome.stats;
     m.matches = welcome.matches;
     m.files = welcome.files;
+    m.conduct = welcome.conduct;
     welcome.name = Clean(r.Str(256), 64);
     welcome.region = Clean(r.Str(64), 32);
     welcome.motd = Clean(r.Str(4096), 1000);
@@ -873,6 +898,50 @@ void Client::RegisterRanked(uint64_t sessionId, uint64_t ownXuid, uint64_t oppon
     w.U64(ownXuid);
     w.U64(opponent);
     impl_->Queue(kArbRegister, w.b);
+}
+
+void Client::ReportLeft(uint64_t sessionId)
+{
+    if (!KeepsConduct() || !sessionId) return;
+    Writer w;
+    w.U64(sessionId);
+    impl_->Queue(kRankedLeft, w.b);
+}
+
+int Client::GetConduct(uint64_t steamId, Conduct& out, int timeoutMs)
+{
+    if (!KeepsConduct()) return -1;
+    Impl& m = *impl_;
+    uint32_t id;
+    {
+        std::lock_guard l(m.reqMutex);
+        id = m.nextRequest++;
+        m.outstanding.insert(id);
+    }
+    Writer w;
+    w.U32(id);
+    w.U64(steamId);
+    m.Queue(kConductGet, w.b);
+    std::unique_lock l(m.reqMutex);
+    m.reqCv.wait_for(l, std::chrono::milliseconds(timeoutMs), [&] { return m.conductAnswers.count(id) || !m.connected; });
+    m.outstanding.erase(id);
+    const auto it = m.conductAnswers.find(id);
+    if (it == m.conductAnswers.end()) return -1;
+    const bool found = it->second.first == 1;
+    if (found) out = it->second.second;
+    m.conductAnswers.erase(it);
+    return found ? 1 : -1;
+}
+
+bool Client::KeepsConduct() const { return Connected() && impl_->conduct && impl_->stats; }
+
+bool Client::TakeNotice(std::string& text)
+{
+    std::lock_guard l(impl_->reqMutex);
+    if (impl_->notices.empty()) return false;
+    text = std::move(impl_->notices.front());
+    impl_->notices.pop_front();
+    return true;
 }
 
 void Client::ReportMatch(uint64_t sessionId, bool started, uint8_t localPlayers, const std::vector<uint64_t>& peers)

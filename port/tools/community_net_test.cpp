@@ -185,6 +185,20 @@ int main(int argc, char** argv)
         Check(!a.ReadBoard(4242, 1, 10, 0, {}, none, 3000), "an unknown board answers no");
     }
 
+    std::printf("ranked conduct\n");
+    if (!wa.conduct) Check(false, "the server keeps ranked conduct");
+    else
+    {
+        Conduct own, other;
+        Check(a.KeepsConduct() && a.GetConduct(0, own, 3000) == 1 && own.matches == 0 && own.quits == 0 && own.cooldownUntil == 0,
+              "a player's own record, no cooldown");
+        Check(a.GetConduct(b.LocalPeer(), other, 3000) == 1 && other.cooldownUntil == 0, "another player's record");
+        a.ReportLeft(0x8000000000FFF001ull);                // no such ranked match: logged, the connection stays
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        std::string notice;
+        Check(a.Connected() && !a.TakeNotice(notice), "a quit report about an unknown match changes nothing");
+    }
+
     std::printf("server list (servers.ini, INFO)\n");
     {
         const std::string ini = TempFile("ttt2_servers_test.ini");

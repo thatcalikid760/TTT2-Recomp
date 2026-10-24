@@ -46,18 +46,21 @@ connections that send nothing for 30 s (the client pings every 5 s) and handshak
 | 16 | MATCH_EVENT | C->S | u64 session id, u8 event (1 started, 2 ended), u8 players at the sender's PC (1..4; 2 for pair play), u8 peer count (0..7) + u64 peers (the Steam IDs of the match's other PCs); only to a server whose WELCOME has flag bit 3 ("Match history") |
 | 17 | FILE_PUT | C->S | u64 own XUID, str item (`licence.dat`), blob the file (1..16384 bytes): this player's copy for the others ("Player files"); only to a server whose WELCOME has flag bit 4 |
 | 18 | FILE_GET | C->S | u32 request id, u64 owner XUID, str item: another player's file, by the online XUID their game uses; only to a server whose WELCOME has flag bit 4 |
-| 101 | WELCOME | S->C | u64 peer id (= Steam ID), u8 flags (bit 0: the Steam ID was checked with Steam; bit 1: GIN_REQUEST is answered; bit 2: statistics are kept - frames 10..13; bit 3: matches are recorded - frame 16; bit 4: player files are kept - frames 17, 18), str server name, str region, str message of the day |
+| 19 | RANKED_LEFT | C->S | u64 session id: the sender's opponent in that ranked match left before its end ("Ranked conduct"); only to a server whose WELCOME has flag bit 5 |
+| 20 | CONDUCT_GET | C->S | u32 request id, u64 Steam ID (0: the sender's own): that player's ranked record ("Ranked conduct"); only to a server whose WELCOME has flag bit 5 |
+| 101 | WELCOME | S->C | u64 peer id (= Steam ID), u8 flags (bit 0: the Steam ID was checked with Steam; bit 1: GIN_REQUEST is answered; bit 2: statistics are kept - frames 10..13; bit 3: matches are recorded - frame 16; bit 4: player files are kept - frames 17, 18; bit 5: ranked conduct is kept - frames 19, 20), str server name, str region, str message of the day |
 | 102 | ERROR | S->C | u32 code, str text for the player; the server closes the connection after it |
 | 103 | PONG | S->C | u64 nonce |
 | 104 | SESSION_LIST_RESULT | S->C | u32 request id, u32 count, count x blob record |
 | 105 | SESSION_GET_RESULT | S->C | u32 request id, u8 found, blob record (empty when not found) |
 | 106 | INVITE | S->C | u64 from peer, blob record |
-| 109 | NOTICE | S->C | str text (admin `say`) |
+| 109 | NOTICE | S->C | str text (admin `say`; a quitter's ranked cooldown) |
 | 110 | GIN_RESPONSE | S->C | u32 request id, blob: the whole HTTP response (answers come in request order) |
 | 111 | STATS_RESULT | S->C | u32 request id, u8 ok (0: no such view, or the server could not answer), u32 players on the board, u16 row count + rows: u64 XUID, u32 place, i64 rating, str name, u8 column count + columns: u16 id, u8 type (0xFF: nothing written), u64 value |
 | 112 | PEER_RESULT | S->C | u32 request id, u8 answer: 1 the peer is a player of this server (same game version, not the asker), 0 not, 2 ask again later |
 | 113 | XUID_NAMES_RESULT | S->C | u32 request id, u8 count + (u64 XUID, str name: printable ASCII, at most 15 characters) for the players the server has seen with those XUIDs (none on a server that keeps no statistics) |
 | 114 | FILE_RESULT | S->C | u32 request id, u8 found (1 yes, 0 no such player or file, 2 ask again later), blob the file (empty unless found) |
+| 115 | CONDUCT_RESULT | S->C | u32 request id, u8 found (1 yes - all zero for a player never in a ranked match -, 2 ask again later), u32 ranked matches, u32 of them left before the end, u64 the end of the sender's own ranked cooldown (unix seconds; 0 none, and always 0 for another player) |
 
 A game on a server plays only that server's players: its match transport holds every packet from a peer until
 PEER_CHECK says yes (then delivers them in order), drops them on a no (and asks again after 10 s), so neither a
@@ -170,7 +173,7 @@ whose Steam ID was checked already uses is not given to anyone else. Boards show
   of a ranked match each game writes both players' results (its own and the opponent's). A player's results count
   when both games of the pair sent the same - and only then: different reports are discarded and logged, and a
   report the other game has not confirmed 2 minutes after the match's first report is discarded too (a player who
-  leaves early loses nothing on the boards here; the game counts disconnects in its own profile). A modified game
+  leaves early is the match's quitter - "Ranked conduct" - and the other game's lone report counts; the game also counts disconnects in its own profile). A modified game
   can veto its own match's results, never write any. Resends after a result was settled change nothing (a settled
   match is remembered 10 minutes; a pair that never reports is given back after 30). A disagreement is logged with
   the first view / property the two reports differ in.
@@ -200,6 +203,27 @@ property count (<= 64) + count x (u32 id, u32 size <= 4096, bytes), optional u32
 XNADDR in the info names the host (bytes 0x20..0x28 of the info = host peer, big-endian), then passes the record
 through unchanged. Sessions of other game protocols are never listed.
 
+## Ranked conduct
+
+A server whose WELCOME has flag bit 5 (it keeps statistics too) counts each player's ranked matches and the ones they
+left before the end (its database: `ranked_conduct`, by Steam ID). A game says when its opponent left a ranked match
+before the end (RANKED_LEFT: the opponent's packets stopped while the match was on). Two minutes after a match's first
+report or RANKED_LEFT the server judges it: the quitter is the player whose opponent's game said it left while its own
+game did not say the same of the opponent (both said it: the connection broke, nobody's fault); without RANKED_LEFT
+from either game, the player whose game reported no results while the opponent's did. Then:
+
+- the opponent's results count for both players (a subject only the opponent's game reported is kept instead of
+  discarded; the match history's result is `forfeit`);
+- the quit counts on the quitter's record and earns a strike (one strike is forgiven every 24 hours without a quit);
+  the strikes lock the quitter out of ranked matchmaking - 5 minutes for the first, 15 for the second, an hour from
+  the third: while locked, the server lists no ranked sessions to them, does not list the ranked sessions they host
+  and refuses their ARB_REGISTER; an online quitter gets a NOTICE saying so;
+- every paired ranked match counts as a match for both players once settled.
+
+CONDUCT_GET gives a player's matches and quits (the game shows an opponent's quit rate) and the sender's own cooldown.
+The admin's `pardon <steam id>` ends a cooldown and forgives the strikes. Limits: RANKED_LEFT 1 a second (burst 4),
+beyond that ignored; CONDUCT_GET 5 a second (burst 20), beyond that answered "ask again later".
+
 ## Match history
 
 A server whose WELCOME has flag bit 3 keeps every match its players play (its database: `matches`, one row per
@@ -221,7 +245,7 @@ starts and ends (MATCH_EVENT); a row is what they said. The game sends the frame
   a minute (a reconnect keeps it), is closed `unfinished`. At start-up and at a clean stop the server closes the
   matches still open (`unfinished`, an hour after they started at most).
 - Ranked: when its ranked results settle ("Statistics"), the newest row of that session with both players and no
-  ranked result yet becomes kind `ranked` with result `agreed` (both games reported the same), `disagreed`,
+  ranked result yet becomes kind `ranked` with result `agreed` (both games reported the same), `forfeit` (a player left: "Ranked conduct"), `disagreed`,
   `unconfirmed` (a report the other game never confirmed) or `unreported` (paired, nothing reported in 30 minutes);
   without such a row (games that send no MATCH_EVENT) one is added from the pair, from its registration to its
   settling. `won` stays NULL: the reports cannot tell the winner - every property the game writes is a running total

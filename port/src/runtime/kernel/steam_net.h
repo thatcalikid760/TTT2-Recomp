@@ -35,6 +35,9 @@ bool TakeJoinRequest(std::vector<uint8_t>& record);
 // Game) - false when Steam does not run or the lobby is not known.
 std::vector<FriendInfo> Friends(int timeoutMs);
 bool InviteToSession(uint64_t sessionId, uint64_t friendId, int timeoutMs);
+// A player's Steam avatar (0: this player's own), 64 x 64 RGBA (`side` x `side` x 4 bytes) - the game's gamer
+// picture (kernel_xam.cpp XamReadTileToTexture). False when Steam does not run, there is none, or it did not load.
+bool Avatar(uint64_t steamId, std::vector<uint8_t>& rgba, uint32_t& side, int timeoutMs);
 
 // A Steam Web API ticket (ISteamUser::GetAuthTicketForWebApi) for `identity`, as hex - a community server checks
 // it with Steam (COMMUNITY_SERVER_PLAN.md 7b). `handle` cancels it once the server has checked it.
@@ -80,6 +83,7 @@ bool WebApiTicket(const std::string& identity, std::string& hex, uint32_t& handl
 void CancelTicket(uint32_t handle);
 std::vector<FriendInfo> Friends();
 bool InviteToSession(uint64_t sessionId, uint64_t friendId);
+bool Avatar(uint64_t steamId, std::vector<uint8_t>& rgba, uint32_t& side, int timeoutMs);
 } // namespace direct
 
 } // namespace steamnet

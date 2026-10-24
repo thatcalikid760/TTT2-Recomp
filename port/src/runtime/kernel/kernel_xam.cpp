@@ -12,6 +12,7 @@
 #include "xlive.h"
 #include "ps_pads.h"
 #include "button_prompts.h"
+#include "steam_net.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -302,6 +303,98 @@ void ReadProfileSettings(PPCContext& ctx, uint8_t* base)
             }
         }
     ctx.r3.u32 = XamCompleteOverlapped(base, overlapped, 0, 0, 0);
+}
+
+// ---- the gamer picture (the player card's picture: Main Menu, ONLINE MODE, licenses) -------------------------------
+// The XDK's XUserReadGamerPicture(ByKey) (sub_82BEED48) parses the profile's picture key, then calls
+// XamReadTileToTexture(type 9, title, tile, user 254, buffer r7, pitch r8, height r9, overlapped r10) for a linear
+// 32-bit ARGB picture (big-endian: bytes A, R, G, B) of pitch / 4 x height pixels. The stubs wrote nothing: the card
+// showed its background through an all-zero (transparent) picture. Now the picture is this player's Steam avatar,
+// or a plain one when Steam has none (no profile here has a key, so every card shows this player's picture).
+namespace {
+std::mutex g_avatarMutex;
+std::vector<uint8_t> g_avatar;                 // RGBA, g_avatarSide squared; empty: none (yet)
+uint32_t g_avatarSide = 0;
+bool g_avatarAsked = false;
+
+// The Steam avatar, once (blocking up to a few seconds the first time); false: none - the plain picture then.
+bool SteamAvatar(std::vector<uint8_t>& rgba, uint32_t& side)
+{
+    std::lock_guard l(g_avatarMutex);
+    if (!g_avatarAsked)
+    {
+        g_avatarAsked = true;
+        if (!steamnet::Avatar(0, g_avatar, g_avatarSide, 4000)) g_avatar.clear();
+        std::fprintf(stderr, "[xam] gamer picture: %s\n", g_avatar.empty() ? "no Steam avatar, the plain one" : "the Steam avatar");
+    }
+    if (g_avatar.empty()) return false;
+    rgba = g_avatar;
+    side = g_avatarSide;
+    return true;
+}
+
+// pitch / 4 x height ARGB pixels at `buffer`: the avatar scaled to fit, else a plain silhouette on dark blue.
+void WriteGamerPicture(uint8_t* base, uint32_t buffer, uint32_t pitch, uint32_t height)
+{
+    const uint32_t width = pitch / 4;
+    std::vector<uint8_t> rgba;
+    uint32_t side = 0;
+    const bool avatar = SteamAvatar(rgba, side);
+    for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t x = 0; x < width; ++x)
+        {
+            uint8_t r, g, b;
+            if (avatar)
+            {
+                const uint8_t* p = rgba.data() + (size_t(y * side / height) * side + x * side / width) * 4;
+                r = p[0], g = p[1], b = p[2];
+            }
+            else
+            {
+                const float u = (x + 0.5f) / width - 0.5f, v = (y + 0.5f) / height;
+                const bool head = u * u + (v - 0.38f) * (v - 0.38f) < 0.035f;
+                const bool body = v > 0.66f && u * u * 1.6f + (v - 1.05f) * (v - 1.05f) < 0.16f;
+                const uint8_t shade = uint8_t(40 + 50 * (1 - v));
+                r = head || body ? 150 : uint8_t(shade / 3), g = head || body ? 170 : uint8_t(shade / 2), b = head || body ? 190 : shade;
+            }
+            uint8_t* out = base + buffer + y * pitch + x * 4;
+            out[0] = 0xFF, out[1] = r, out[2] = g, out[3] = b;
+        }
+}
+} // namespace
+
+// (key, &titleId, &largeTile, &smallTile): no profile keeps a picture key here - any key reads this player's picture.
+PPC_FUNC(__imp__XamParseGamerTileKey)
+{
+    KTrace("XamParseGamerTileKey");
+    for (const uint32_t out : { ctx.r4.u32, ctx.r5.u32, ctx.r6.u32 })
+        if (XamGuestRange(out, 4)) GWrite32(base, out, 0);
+    ctx.r3.u32 = 0;
+}
+
+PPC_FUNC(__imp__XamReadTileToTexture)
+{
+    KTrace("XamReadTileToTexture");
+    const uint32_t buffer = ctx.r7.u32, pitch = ctx.r8.u32, height = ctx.r9.u32, overlapped = ctx.r10.u32;
+    if (!pitch || pitch > 4096 || !height || height > 1024 || !XamGuestRange(buffer, uint64_t(pitch) * height))
+    {
+        ctx.r3.u32 = 0x57;                                   // ERROR_INVALID_PARAMETER
+        return;
+    }
+    if (const uint32_t error = XamValidateOverlapped(base, overlapped)) { ctx.r3.u32 = error; return; }
+    if (!overlapped)
+    {
+        WriteGamerPicture(base, buffer, pitch, height);
+        ctx.r3.u32 = 0;
+        return;
+    }
+    // overlapped: the first read waits for Steam - not on the game's thread
+    GWrite32(base, overlapped, 997);                         // ERROR_IO_PENDING until done
+    std::thread([base, buffer, pitch, height, overlapped] {
+        WriteGamerPicture(base, buffer, pitch, height);
+        XamCompleteOverlapped(base, overlapped, 0, 0, 0);
+    }).detach();
+    ctx.r3.u32 = 997;                                        // ERROR_IO_PENDING
 }
 
 PPC_FUNC(__imp__XamUserReadProfileSettings)
@@ -1031,6 +1124,7 @@ void EnsurePadThread()
 
 std::atomic<int64_t> g_startPulseUntilMs{ 0 };
 std::atomic<int64_t> g_downPulseUntilMs{ 0 };
+std::atomic<int64_t> g_aPulseUntilMs{ 0 };
 int64_t NowMs()
 {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1077,6 +1171,9 @@ void HostPulseStart() { g_startPulseUntilMs = NowMs() + 150; }
 // Player 1 presses DOWN for 80 ms: one step of a menu's cursor, drawn by the menu itself (the server UI moves the
 // ONLINE MODE cursor off a row that needs a server).
 void HostPulseDown() { g_downPulseUntilMs = NowMs() + 80; }
+
+// Player 1 presses A for 100 ms (CLASSIC OFFLINE enters OFFLINE MODE as its A would, classic_offline.cpp).
+void HostPulseA() { g_aPulseUntilMs = NowMs() + 100; }
 
 PPC_FUNC(__imp__XamInputGetCapabilities)
 {
@@ -1147,6 +1244,11 @@ PPC_FUNC(__imp__XamInputGetState)
     {
         st.Gamepad.wButtons |= 0x0002;          // DPAD_DOWN
         st.dwPacketNumber += 0x20000;
+    }
+    else if (user == 0 && NowMs() < g_aPulseUntilMs.load())
+    {
+        st.Gamepad.wButtons |= 0x1000;          // A
+        st.dwPacketNumber += 0x40000;
     }
     if (user == 0)
     {

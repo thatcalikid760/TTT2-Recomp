@@ -230,6 +230,8 @@ func (m matchRow) ResultText() string {
 		return "both reported the same"
 	case "disagreed":
 		return "reports disagree"
+	case "forfeit":
+		return "a player left"
 	case "unconfirmed":
 		return "one report only"
 	case "unreported":
@@ -245,7 +247,7 @@ func (m matchRow) ResultClass() string {
 		return "ok"
 	case "disagreed":
 		return "danger"
-	case "unconfirmed", "unreported", "unfinished":
+	case "unconfirmed", "unreported", "unfinished", "forfeit":
 		return "warn"
 	}
 	return "accent"

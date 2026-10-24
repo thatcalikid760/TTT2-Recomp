@@ -136,6 +136,16 @@ var migrations = []string{
 		updated  INTEGER NOT NULL,
 		PRIMARY KEY (steam_id, item)
 	) STRICT;`,
+	// 9: ranked conduct (conduct.go): each player's ranked matches and the ones they left, their strikes (recent quits)
+	// and the end of their ranked cooldown (unix seconds; 0 = none)
+	`CREATE TABLE ranked_conduct (
+		steam_id       INTEGER PRIMARY KEY,
+		matches        INTEGER NOT NULL DEFAULT 0,
+		quits          INTEGER NOT NULL DEFAULT 0,
+		strikes        INTEGER NOT NULL DEFAULT 0,
+		last_quit      INTEGER NOT NULL DEFAULT 0,
+		cooldown_until INTEGER NOT NULL DEFAULT 0
+	) STRICT;`,
 }
 
 // Store is the open database.

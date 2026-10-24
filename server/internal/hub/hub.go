@@ -81,8 +81,9 @@ type Player struct {
 
 	// rates, used by the player's reader goroutine only
 	frames, puts, lists, invites, gins, statWrites, statReadRate, arbs, logs, peerChecks, names bucket
-	matchEvents, matchOpens, filePuts, fileGets                                                 bucket
-	ownXUID                                                                                     uint64 // the online XUID the player's game reported (statistics), reader goroutine only
+	matchEvents, matchOpens, filePuts, fileGets, rankedLefts, conductReads                      bucket
+	ownXUID                                                                                     uint64       // the online XUID the player's game reported (statistics), reader goroutine only
+	rankedUntil                                                                                 atomic.Int64 // the end of the player's ranked cooldown (unix seconds; conduct.go)
 }
 
 type session struct {
@@ -139,7 +140,8 @@ type Hub struct {
 	ranked    rankedState
 	matchDB   MatchStore // nil: matches are not recorded
 	matches   matchState
-	files     FileStore // nil: the player files (licenses) are not kept
+	files     FileStore    // nil: the player files (licenses) are not kept
+	conduct   ConductStore // nil: ranked quits are not counted (conduct.go)
 
 	// mu, then matches.mu, is the only order the two are ever held in
 	mu         sync.Mutex
@@ -555,6 +557,7 @@ func (h *Hub) login(c *tls.Conn, raw net.Conn, ip, prefix string) (*Player, erro
 		h.log.Printf("player %q reconnected: closing the old connection", old.Name)
 		old.close()
 	}
+	h.loadConduct(p)
 	go p.writer()
 	var w wire.Writer
 	w.U64(peer)
@@ -573,6 +576,9 @@ func (h *Hub) login(c *tls.Conn, raw net.Conn, ip, prefix string) (*Player, erro
 	}
 	if h.keepsFiles() {
 		flags |= 16 // player files are kept: FILE_PUT, FILE_GET
+	}
+	if h.conduct != nil {
+		flags |= 32 // ranked conduct is kept: RANKED_LEFT, CONDUCT_GET
 	}
 	w.U8(flags)
 	w.Str(cfg.Name)
@@ -773,7 +779,9 @@ func (h *Hub) frame(p *Player, typ uint8, payload []byte) error {
 				return nil
 			}
 			err := errors.New("not the XUID this connection uses")
-			if h.claimXUID(p, own) {
+			if p.rankedBlocked(now) {
+				err = errors.New("in a ranked cooldown")
+			} else if h.claimXUID(p, own) {
 				err = h.rankedRegister(p, session, opponent, now)
 			}
 			if err != nil {
@@ -850,6 +858,23 @@ func (h *Hub) frame(p *Player, typ uint8, payload []byte) error {
 			return h.filePut(p, &r, now)
 		}
 		return h.fileGet(p, &r, now)
+	case wire.RankedLeft, wire.ConductGet:
+		if h.conduct == nil || h.stats == nil {
+			return errors.New("ranked conduct is not kept here")
+		}
+		if typ == wire.ConductGet {
+			return h.conductGet(p, &r, now)
+		}
+		session := r.U64()
+		if r.Err() != nil || len(r.B) != 0 {
+			return errors.New("bad RANKED_LEFT")
+		}
+		if !p.rankedLefts.take(1, 4, now) {
+			return nil
+		}
+		if err := h.rankedLeft(p, session, now); err != nil {
+			h.logPlayer(p, "ranked match %016X: %q's report of a quit dropped: %v", session, p.Name, err)
+		}
 	case wire.InviteSend:
 		to, id := r.U64(), r.U64()
 		if r.Err() != nil {
@@ -887,6 +912,11 @@ func (h *Hub) putSession(p *Player, rec []byte) error {
 	if err != nil {
 		return err
 	}
+	ranked := info.Flags&record.Arbitrated != 0
+	if ranked && p.rankedBlocked(time.Now()) {
+		h.logPlayer(p, "ranked session %016X of %q not listed: ranked cooldown", info.ID, p.Name)
+		return nil
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if s := h.sessions[info.ID]; s != nil && s.host != p {
@@ -909,7 +939,7 @@ func (h *Hub) putSession(p *Player, rec []byte) error {
 		created = old.created // republishing (a slot filled) does not move a room to the top of the lists
 	}
 	h.sessions[info.ID] = &session{id: info.ID, host: p, record: append([]byte(nil), rec...), filled: info.Filled, max: info.Max,
-		open: info.OpenPublic, contexts: info.Contexts, ranked: info.Flags&record.Arbitrated != 0, created: created, updated: time.Now()}
+		open: info.OpenPublic, contexts: info.Contexts, ranked: ranked, created: created, updated: time.Now()}
 	return nil
 }
 
@@ -927,12 +957,13 @@ func (h *Hub) listSessions(p *Player, max int, f listFilter) [][]byte {
 	var picks []*session
 	hosts := map[*Player]bool{}
 	bytes := 0
+	blocked := p.rankedBlocked(now)
 	for _, s := range snapshot {
 		if len(picks) >= max {
 			break
 		}
-		if s.host == p || hosts[s.host] || bytes+len(s.record) > maxListBytes || !f.match(s) {
-			continue // its own, that host's already picked, too much, or not asked for
+		if s.host == p || hosts[s.host] || bytes+len(s.record) > maxListBytes || !f.match(s) || (blocked && s.ranked) {
+			continue // its own, that host's already picked, too much, not asked for, or ranked during a cooldown
 		}
 		hosts[s.host] = true
 		bytes += len(s.record)

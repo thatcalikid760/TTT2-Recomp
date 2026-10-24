@@ -23,6 +23,8 @@ bool WaitForNetwork(int timeoutMs);
 // Any thread: the community server's players right now for the information bar ("TTT2 Test Server: 12 players
 // online, 4 playing."), "" on Steam or before the server answered.
 std::string StatusLine();
+// Any thread: the ONLINE MODE menu itself is on screen (its information bar says Steam must run, menu_ext.cpp).
+bool OnlineMenuShowing();
 // The Player Match room's Friend Invite (game's main thread): a picker of the player's online Steam friends in the
 // game's dialog window; the chosen one is invited into the room's Steam lobby (on a community server: a note instead).
 void FriendInvite();

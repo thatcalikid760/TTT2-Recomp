@@ -28,7 +28,8 @@ type Match struct {
 	Ended   time.Time // zero: still open
 	// Result: "ended" (a Player Match whose game said so), "unfinished" (nobody said it ended: closed after an hour, when
 	// its players left, or when a new match began in the room); a ranked match's comes from its ranked results -
-	// "agreed", "disagreed", "unconfirmed" (one game reported), "unreported" (none did) - and is "" until they settle
+	// "agreed", "forfeit" (a player left: the opponent's game's results counted), "disagreed", "unconfirmed" (one game
+	// reported), "unreported" (none did) - and is "" until they settle
 	Result  string
 	Players []MatchPlayer
 }
@@ -48,7 +49,7 @@ type RankedResult struct {
 	Players             [2]uint64
 	Names               [2]string
 	Registered, Settled time.Time
-	Result              string // agreed, disagreed, unconfirmed, unreported
+	Result              string // agreed, forfeit, disagreed, unconfirmed, unreported
 }
 
 // matchLongest: no match is open longer (the hub closes every match an hour after it opened) - so a ranked match's
@@ -110,7 +111,7 @@ func (s *Store) SettleRanked(r RankedResult) error {
 	err = tx.QueryRowContext(ctx, `SELECT m.id FROM match_players a
 		JOIN match_players b ON b.match_id = a.match_id AND b.steam_id = ?
 		JOIN matches m ON m.id = a.match_id
-		WHERE a.steam_id = ? AND m.session_id = ? AND m.started >= ? AND m.result NOT IN ('agreed', 'disagreed', 'unconfirmed', 'unreported')
+		WHERE a.steam_id = ? AND m.session_id = ? AND m.started >= ? AND m.result NOT IN ('agreed', 'forfeit', 'disagreed', 'unconfirmed', 'unreported')
 		ORDER BY a.match_id DESC LIMIT 1`,
 		int64(r.Players[1]), int64(r.Players[0]), int64(r.Session), r.Registered.Add(-matchLongest).Unix()).Scan(&id)
 	switch {

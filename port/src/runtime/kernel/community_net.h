@@ -46,6 +46,7 @@ struct Welcome
     bool stats = false;                       // the server keeps the game's statistics (the leaderboards)
     bool matches = false;                     // the server records the matches played on it (ReportMatch)
     bool files = false;                       // the server keeps the players' license files (PutFile / GetFile)
+    bool conduct = false;                     // the server keeps ranked conduct (ReportLeft / GetConduct)
     std::string name, region, motd;
     std::string fingerprint;                  // the server key, 8 groups of 4 hex digits
     std::string tls;                          // negotiated protocol
@@ -60,6 +61,9 @@ struct StatRow { uint64_t xuid = 0; uint32_t rank = 0; int64_t rating = 0; std::
 struct StatPage { uint32_t total = 0; std::vector<StatRow> rows; };
 constexpr size_t kMaxStatRows = 100, kMaxStatColumns = 64, kMaxStatViews = 16, kMaxStatProps = 32;
 constexpr size_t kMaxPlayerFile = 16u << 10;     // a player file (licence.dat is 3420 bytes)
+// A player's ranked record (server/PROTOCOL.md "Ranked conduct"): ranked matches, the ones they left before the end, and
+// (the asker's own only) the end of their ranked cooldown, unix seconds (0: none).
+struct Conduct { uint32_t matches = 0, quits = 0; uint64_t cooldownUntil = 0; };
 
 class Client
 {
@@ -113,6 +117,15 @@ public:
     // `localPlayers` players here (2: pair play): the server's match history. Only to a server whose WELCOME says it
     // records matches (bit 3); to any other it is not sent (an unknown frame ends the connection).
     void ReportMatch(uint64_t sessionId, bool started, uint8_t localPlayers, const std::vector<uint64_t>& peers);
+
+    // Ranked conduct (server/PROTOCOL.md "Ranked conduct"; only to a server whose WELCOME has bit 5, and statistics):
+    // ReportLeft - the opponent in ranked match `sessionId` left before its end; GetConduct - a player's record by
+    // Steam ID (0: this player's own, with its cooldown): 1 answered, -1 no answer.
+    void ReportLeft(uint64_t sessionId);
+    int GetConduct(uint64_t steamId, Conduct& out, int timeoutMs);
+    bool KeepsConduct() const;
+    // A NOTICE the server sent (an admin's message, a ranked cooldown), oldest first, once each.
+    bool TakeNotice(std::string& text);
 
     // The players' license files (server/PROTOCOL.md "Player files"; only to a server whose WELCOME has bit 4): the
     // game's own per-user title-storage item `item` (licence.dat: the license other players view) as it uploaded it,

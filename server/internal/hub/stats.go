@@ -59,18 +59,22 @@ type rankedMatch struct {
 	done    map[uint64]bool              // subjects settled
 	settled time.Time                    // both subjects settled
 	result  string                       // the match history's: the worst of its subjects' so far (verdict)
+	left    map[uint64]bool              // Steam ID -> its game said the opponent left before the end (RANKED_LEFT)
+	sent    map[uint64]bool              // Steam ID -> its game reported ranked results
+	judged  bool                         // the quitter (if any) is decided (judge)
+	quitter uint64                       // the player who left the match (0: nobody, or not known)
 }
 
 // rankedOutcome: a settled ranked match, for the match history (recordRanked).
 type rankedOutcome struct {
 	session, host, guest uint64
 	registered, settled  time.Time
-	result               string // agreed, disagreed, unconfirmed (a report the other game never confirmed), unreported
+	result               string // agreed, forfeit (the quitter's opponent's results counted), disagreed, unconfirmed, unreported
 }
 
 // rankedVerdicts orders a match's results: one subject's disagreement makes the match "disagreed", else an
-// unconfirmed report "unconfirmed", else "agreed".
-var rankedVerdicts = map[string]int{"agreed": 1, "unconfirmed": 2, "disagreed": 3}
+// unconfirmed report "unconfirmed", else results counted from the quitter's opponent alone "forfeit", else "agreed".
+var rankedVerdicts = map[string]int{"agreed": 1, "forfeit": 2, "unconfirmed": 3, "disagreed": 4}
 
 type rankedState struct {
 	mu      sync.Mutex
@@ -164,6 +168,7 @@ type statsAction struct {
 	writes        []stats.Write // nil: nothing to keep (`why` says why)
 	why           string
 	outcome       *rankedOutcome // set: not a player's results - the match is settled (its match history row)
+	quitter       uint64         // set: not a player's results - that player left the match (conduct.go)
 }
 
 // claimXUID fixes the online XUID a connection's game uses: the first one it reports. Another one (the player
@@ -248,7 +253,7 @@ func (h *Hub) rankedRegister(p *Player, session, opponent uint64, now time.Time)
 			return errors.New("too many ranked matches")
 		}
 		m = &rankedMatch{session: session, host: host, created: now, claims: map[uint64]claim{}, reports: map[uint64]map[uint64][]byte{},
-			done: map[uint64]bool{}}
+			done: map[uint64]bool{}, left: map[uint64]bool{}, sent: map[uint64]bool{}}
 		h.ranked.matches[session] = m
 	}
 	m.claims[p.Peer] = c
@@ -322,6 +327,7 @@ func (h *Hub) rankedReport(p *Player, session, subject uint64, writes []stats.Wr
 		m.reports[subject] = map[uint64][]byte{}
 	}
 	m.reports[subject][p.Peer] = canonical(writes)
+	m.sent[p.Peer] = true
 	return m.settle(h, subject, now), nil
 }
 
@@ -333,6 +339,40 @@ func (m *rankedMatch) ownerOf(xuid uint64) uint64 {
 		}
 	}
 	return 0
+}
+
+// opponentOf is the paired player facing `steam` (0: not a player of the match).
+func (m *rankedMatch) opponentOf(steam uint64) uint64 {
+	switch steam {
+	case 0:
+		return 0
+	case m.host:
+		return m.paired
+	case m.paired:
+		return m.host
+	}
+	return 0
+}
+
+// judge decides who left the match (conduct.go), rankedSettle after the first report or RANKED_LEFT: the player whose
+// opponent's game said it left while its own game did not say the same of the opponent (both: the connection broke,
+// nobody's fault); without RANKED_LEFT from either, the player whose game reported nothing while the opponent's
+// reported. Under the ranked lock.
+func (m *rankedMatch) judge() uint64 {
+	m.judged = true
+	h, g := m.host, m.paired
+	switch {
+	case m.left[h] && !m.left[g]:
+		m.quitter = g
+	case m.left[g] && !m.left[h]:
+		m.quitter = h
+	case !m.left[h] && !m.left[g] && m.sent[h] != m.sent[g]:
+		m.quitter = g
+		if m.sent[g] {
+			m.quitter = h
+		}
+	}
+	return m.quitter
 }
 
 // settle decides a subject once both games reported it: the same -> counted, else discarded. Under the ranked lock.
@@ -390,17 +430,40 @@ func (h *Hub) sweepRanked(now time.Time) []statsAction {
 	defer h.ranked.mu.Unlock()
 	var out []statsAction
 	for id, m := range h.ranked.matches {
+		if h.conduct != nil && m.paired != 0 && !m.judged && !m.first.IsZero() && now.Sub(m.first) >= rankedSettle {
+			if q := m.judge(); q != 0 {
+				out = append(out, statsAction{quitter: q})
+			}
+		}
 		switch {
 		case !m.first.IsZero() && m.settled.IsZero() && now.Sub(m.first) >= rankedSettle:
+			stayer := m.opponentOf(m.quitter)
 			for subject, reps := range m.reports {
+				if rep, ok := reps[stayer]; ok && m.quitter != 0 && len(reps) == 1 {
+					m.verdict("forfeit")
+					out = append(out, statsAction{steamID: m.ownerOf(subject), xuid: subject, writes: decanonical(rep),
+						why: fmt.Sprintf("%d left the match: its opponent's results count", m.quitter)})
+					m.close(h, subject, now)
+					continue
+				}
 				for reporter := range reps {
 					out = append(out, statsAction{steamID: m.ownerOf(subject), xuid: subject,
 						why: fmt.Sprintf("only one game (%d) reported its ranked results: discarded", reporter)})
 				}
 				m.close(h, subject, now)
+				m.verdict("unconfirmed") // a report the other game never confirmed
 			}
-			m.verdict("unconfirmed") // a report the other game never confirmed, or a subject nobody reported
-			m.settled = now          // a subject nobody reported: the match is over all the same
+			for _, subject := range m.xuids {
+				if m.done[subject] {
+					continue
+				}
+				if m.quitter != 0 {
+					m.verdict("forfeit") // a subject nobody reported because a player left
+				} else {
+					m.verdict("unconfirmed") // a subject nobody reported
+				}
+			}
+			m.settled = now // a subject nobody reported: the match is over all the same
 			m.release(h)
 			out = append(out, m.outcome(now))
 		case m.paired == 0 && now.Sub(m.created) >= rankedUnpaired,
@@ -422,6 +485,15 @@ func (h *Hub) apply(actions []statsAction, now time.Time) {
 	for _, a := range actions {
 		if a.outcome != nil {
 			h.recordRanked(*a.outcome)
+			if h.conduct != nil {
+				h.rankedPlayed(*a.outcome)
+			}
+			continue
+		}
+		if a.quitter != 0 {
+			if h.conduct != nil {
+				h.rankedQuit(a.quitter, now)
+			}
 			continue
 		}
 		if a.writes == nil {

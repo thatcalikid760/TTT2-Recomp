@@ -34,6 +34,7 @@
 #include <vector>
 
 void RollbackTimeSyncReceive(const uint8_t* data, size_t size);   // rollback_session.cpp
+namespace ranked { void PeerMessage(uint64_t from, const uint8_t* data, size_t size); }   // ranked_match.cpp
 
 namespace {
 std::atomic<uint64_t> g_timeSyncPeer{ 0 };
@@ -76,7 +77,9 @@ bool Trace() { static const bool on = std::getenv("TTT2_NET_TRACE") != nullptr; 
 // ---- wire format ----
 // TimeSync: rollback sessions' frame-advantage reports (rollback_session.cpp), never a socket's.
 // FileAsk / FileData: a player's license asked of the games connected to this one (title_server.cpp), never a socket's.
-enum class Op : uint8_t { Datagram = 1, Syn = 2, SynAck = 3, Reset = 4, Data = 5, Fin = 6, TimeSync = 7, FileAsk = 8, FileData = 9 };
+// Rematch: the rematch question after a match (ranked_match.cpp), never a socket's.
+enum class Op : uint8_t { Datagram = 1, Syn = 2, SynAck = 3, Reset = 4, Data = 5, Fin = 6, TimeSync = 7, FileAsk = 8, FileData = 9,
+                          Rematch = 10 };
 #pragma pack(push, 1)
 struct Header { Op op; uint8_t proto; uint8_t toConnector; uint8_t pad; uint16_t srcPort, dstPort; uint32_t connId; };
 #pragma pack(pop)
@@ -236,6 +239,11 @@ void Receive(uint64_t from, net::Channel, const uint8_t* data, size_t size)
         FileReceive(from, h.op, payload, payloadSize);
         return;
     }
+    if (h.op == Op::Rematch)
+    {
+        ranked::PeerMessage(from, payload, payloadSize);
+        return;
+    }
     if (h.op == Op::Datagram) g_timeSyncPeer.store(from);   // the match's peer (NACE's datagrams)
     std::lock_guard l(g_m);
     const uint32_t fromAddr = xlive::AddrOfPeer(from);
@@ -349,6 +357,22 @@ void Finish(uint64_t peer, uint32_t conn)
 
 uint64_t XSocketMatchPeer() { return g_timeSyncPeer.load(); }
 void XSocketForgetMatchPeer() { g_timeSyncPeer.store(0); }
+
+// How long since `peer`'s last packet, in milliseconds (-1: nothing from it in the last minutes).
+int64_t XSocketSilenceMs(uint64_t peer)
+{
+    std::lock_guard l(g_fileMutex);
+    const auto it = g_heardFrom.find(peer);
+    if (it == g_heardFrom.end()) return -1;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - it->second).count();
+}
+
+// ranked_match.cpp: a rematch message to the last match's opponent.
+bool XSocketSendRematch(uint64_t peer, const void* data, size_t size)
+{
+    return peer && EnsureTransport() &&
+           SendPacket(peer, net::Channel::Reliable, Op::Rematch, 0, false, 0, 0, 0, static_cast<const uint8_t*>(data), size);
+}
 
 // rollback_session.cpp: a frame-advantage report to the match's peer (the last one whose datagrams
 // arrived - a 1v1 match has one).

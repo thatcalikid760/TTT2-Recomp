@@ -632,6 +632,32 @@ std::vector<FriendInfo> Friends()
     return out;
 }
 
+bool Avatar(uint64_t steamId, std::vector<uint8_t>& rgba, uint32_t& side, int timeoutMs)
+{
+    if (!g_running) return false;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    for (;;)
+    {
+        {
+            std::lock_guard l(g_mutex);
+            const CSteamID id = steamId ? CSteamID(uint64(steamId)) : SteamUser()->GetSteamID();
+            const int image = SteamFriends()->GetMediumFriendAvatar(id);   // -1: still loading, 0: none
+            uint32 w = 0, h = 0;
+            if (image == 0) return false;
+            if (image > 0 && SteamUtils()->GetImageSize(image, &w, &h) && w == h && w > 0 && w <= 256)
+            {
+                rgba.resize(size_t(w) * h * 4);
+                if (!SteamUtils()->GetImageRGBA(image, rgba.data(), int(rgba.size()))) return false;
+                side = w;
+                return true;
+            }
+            if (image > 0) return false;
+        }
+        if (std::chrono::steady_clock::now() >= until) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
 bool InviteToSession(uint64_t sessionId, uint64_t friendId)
 {
     if (!g_running || !sessionId || !friendId) return false;
@@ -671,6 +697,7 @@ bool WebApiTicket(const std::string&, std::string&, uint32_t&, int) { return fal
 void CancelTicket(uint32_t) {}
 std::vector<FriendInfo> Friends() { return {}; }
 bool InviteToSession(uint64_t, uint64_t) { return false; }
+bool Avatar(uint64_t, std::vector<uint8_t>&, uint32_t&, int) { return false; }
 } // namespace steamnet::direct
 
 #endif

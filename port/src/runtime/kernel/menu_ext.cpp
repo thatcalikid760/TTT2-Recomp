@@ -42,6 +42,8 @@
 #include "updater.h"
 #include "toast.h"
 #include "button_prompts.h"
+#include "ranked_match.h"
+#include "classic_offline.h"
 
 extern "C" PPC_FUNC(__imp__sub_82346060);
 extern "C" PPC_FUNC(__imp__sub_826002C8);
@@ -96,6 +98,9 @@ uint32_t GuestCString(uint8_t* base, const char* text, uint32_t prefix = 0)
 
 // A string as the game's text lookup returns it: data 4 bytes into a table entry whose last
 // header byte is the length.
+// ONLINE MODE's notice (the main menu's description of it, and the online menu's information bar).
+constexpr const char* kSteamNeeded = "STEAM is required to run in the background for online play.";
+
 uint32_t TableText(uint8_t* base, const char* text)
 {
     const uint32_t addr = GuestCString(base, text, 4);
@@ -325,7 +330,7 @@ void BuildProfiles(Ui& ui)
 {
     ui.rows.clear();
     for (const profiles::Profile& p : profiles::List())
-        ui.rows.push_back({ p.name, "", "Play as " + p.name + ". Y: rename. X: delete." });
+        ui.rows.push_back({ p.name, "", "Play as " + p.name + "." });   // RENAME / DELETE: key hints
     if (ui.rows.size() < profiles::kMaxProfiles)
         ui.rows.push_back({ "CREATE NEW PROFILE", "", "Make a new profile with its own save data." });
 }
@@ -1325,6 +1330,33 @@ toast::Note UpdateNote(const updater::Status& st)
     return note;
 }
 
+// The ONLINE MODE menu: a note top right while it is on screen - matches run over Steam P2P (on a community server
+// too), so Steam must be running. Shown again when another note took its place; gone when the menu is left.
+void SteamNotice()
+{
+    static bool shown = false, was = false;
+    const bool here = server_ui::OnlineMenuShowing() && !ranked::PromptShowing();
+    if (here != was) std::fprintf(stderr, "[menu] Steam note: online menu %s (a note showing: %d)%c", here ? "on" : "off", int(toast::Showing()), 10);
+    was = here;
+    toast::Note current;
+    float opacity = 0;
+    uint32_t generation = 0;
+    const bool ours = toast::Current(current, opacity, generation) && current.title == "ONLINE PLAY";
+    if (here && !toast::Showing())
+    {
+        toast::Note note;
+        note.title = "ONLINE PLAY";
+        note.lines = { "STEAM is required to run in the", "background for online play." };   // narrow: beside the menu
+        toast::Show(note, 0);
+        shown = true;
+    }
+    else if (!here && shown)
+    {
+        if (ours) toast::Hide();
+        shown = false;
+    }
+}
+
 void SignInNotice()
 {
     using S = updater::State;
@@ -1360,7 +1392,7 @@ void SignInNotice()
         return;
     }
     if (!interactive) return;
-    if (!toast::Showing()) { interactive = false; return; }
+    if (!toast::Showing() || ranked::PromptShowing()) { interactive = false; return; }   // another note took its place
     const int click = toast::TakeClick();
     if (click == 2)
     {
@@ -1395,6 +1427,9 @@ void SignInNotice()
 void Frame(PPCContext& ctx, uint8_t* base)
 {
     SignInNotice();
+    SteamNotice();
+    classic_offline::Frame(ctx, base);                // the main menu's CLASSIC OFFLINE (classic_offline.h)
+    ranked::Frame();                                  // the rematch question, the server's notices (ranked_match.h)
     BoxFrame(ctx, base);
     KeyboardFrame(ctx, base);
     VoicePanelFrame(ctx, base);
@@ -1559,6 +1594,12 @@ void Frame(PPCContext& ctx, uint8_t* base)
     }
     if (ui.screen == Screen::Profiles)
     {
+        // a profile's RENAME (Y) / DELETE (X) in the bottom bar, its icons the controller's (button_prompts.h)
+        if (ui.cursor < int(profiles::List().size()))
+        {
+            menu_host::KeyHint(ctx, base, 57382, "RENAME");
+            menu_host::KeyHint(ctx, base, 57383, "DELETE");
+        }
         if (ui.settle > 0 && --ui.settle == 0) ui.shownCursor = -1;   // draw the cursor once more
         const int rows = int(ui.rows.size());
         if (pressed & (kUp | kDown))
@@ -2078,7 +2119,8 @@ bool SysUiOwnsInput()
            keyui::g_capture.load();
 }
 bool SysUiKeyCaptureActive() { return keyui::g_capture.load() || sysui::g_voiceCapture.load(); }
-uint16_t SysUiGameButtonMask() { return keyui::g_gameMask.load() & server_ui::GameButtonMask(); }
+uint16_t SysUiGameButtonMask() { return keyui::g_gameMask.load() & server_ui::GameButtonMask() & ranked::GameButtonMask() &
+                                     classic_offline::GameButtonMask(); }
 void SysUiOnKey(int vk)
 {
     if (sysui::g_voiceCapture.load()) { sysui::g_voiceKey = vk; return; }
@@ -2595,6 +2637,14 @@ PPC_FUNC(sub_8237F5D0)
         }
     }
     __imp__sub_8237F5D0(ctx, base);
+    if (id == 0x000D && ctx.r3.u32 && GuestString(base, ctx.r3.u32, 48).rfind("Contains all the online game features", 0) == 0)
+    {
+        // the main menu's ONLINE MODE description (MEASURED 2026-10-24: id 000D, looked up from 8233C328)
+        static const uint32_t steam = TableText(base, kSteamNeeded);
+        static int logged = 0;
+        if (logged++ < 2) std::fprintf(stderr, "[menu] ONLINE MODE description: the Steam notice (lr %08X)%c", uint32_t(ctx.lr), 10);
+        ctx.r3.u64 = steam;
+    }
     static const bool trace = std::getenv("TTT2_TEXT_TRACE") != nullptr;
     if (trace)
     {
