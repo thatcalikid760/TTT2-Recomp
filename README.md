@@ -36,10 +36,6 @@ This project is built on **[shihabal3amri/tekken-tag-tournament-2-pc](https://gi
 - **Installer update mode:** updates an existing install and keeps your progress.
 - **Fix:** custom character portraits no longer show as a black box.
 
-### Earlier
-- **Online lobby fix** ([upstream issue #30](https://github.com/shihabal3amri/tekken-tag-tournament-2-pc/issues/30)): after the first online match, the guest could no longer find the host's lobby until both players restarted. The Steam helper now recovers if it exits mid-game, and lobbies are republished so they can be found again.
-- Launcher and installer branded "TTT2 Recomp by ThatCaliKid760".
-
 Steam must be running in the background for online play.
 
 ## Install
