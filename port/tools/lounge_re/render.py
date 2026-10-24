@@ -7,7 +7,23 @@ import numpy as np
 from PIL import Image
 
 import ndxr
+import ntxr
 import ttt2fs
+
+_TEX = {}
+
+
+def texture(h):
+    """RGBA array of the texture with GIDX hash `h` (None when not found)."""
+    if h not in _TEX:
+        index = ttt2fs.ntxr_index()
+        if h not in index:
+            _TEX[h] = None
+        else:
+            i, at, k = index[h]
+            d = ttt2fs.read(i, at, at + ntxr.size_at(lambda a, b: ttt2fs.read(i, a, b), at))
+            _TEX[h] = ntxr.decode(ntxr.parse(d)[k], tiled=False)
+    return _TEX[h]
 
 
 def load(name):
@@ -18,7 +34,7 @@ def load(name):
 
 
 def render(models, out, yaw=20, W=600, H=900):
-    tris, cols = [], []
+    tris, cols, uvs, texs = [], [], [], []
     palette = [(200, 170, 150), (90, 120, 200), (200, 90, 90), (90, 180, 110), (190, 180, 80), (150, 100, 190)]
     k = 0
     for objs in models:
@@ -26,9 +42,13 @@ def render(models, out, yaw=20, W=600, H=900):
             for p in o['polys']:
                 t = p['pos'][p['tris']]
                 tris.append(t)
+                uvs.append(p['uv'][p['tris']])
+                tex = texture(p['textures'][0]) if p['textures'] else None
+                texs += [tex] * len(t)
                 cols += [palette[k % len(palette)]] * len(t)
                 k += 1
     T = np.concatenate(tris)
+    UV = np.concatenate(uvs)
     a = math.radians(yaw)
     rot = np.array([[math.cos(a), 0, math.sin(a)], [0, 1, 0], [-math.sin(a), 0, math.cos(a)]])
     T = T @ rot.T
@@ -38,7 +58,7 @@ def render(models, out, yaw=20, W=600, H=900):
     img = np.full((H, W, 3), 30, np.uint8)
     z = np.full((H, W), -1e30)
     light = np.array([0.3, 0.5, 0.8]); light /= np.linalg.norm(light)
-    for t, c in zip(T, cols):
+    for t, c, uv, tex in zip(T, cols, UV, texs):
         n = np.cross(t[1] - t[0], t[2] - t[0]); ln = np.linalg.norm(n)
         if ln == 0:
             continue
@@ -59,7 +79,16 @@ def render(models, out, yaw=20, W=600, H=900):
         sub = z[y0:y1 + 1, x0:x1 + 1]
         m = inside & (zz > sub)
         sub[m] = zz[m]
-        img[y0:y1 + 1, x0:x1 + 1][m] = (np.array(c) * shade).astype(np.uint8)
+        if tex is not None:
+            u = (w0 * uv[0, 0] + w1 * uv[1, 0] + w2 * uv[2, 0])[m]
+            v = (w0 * uv[0, 1] + w1 * uv[1, 1] + w2 * uv[2, 1])[m]
+            th, tw = tex.shape[:2]
+            tx = (np.floor(u * tw).astype(int)) % tw
+            ty = (np.floor(v * th).astype(int)) % th
+            rgb = tex[ty, tx, :3].astype(float) * (0.45 + 0.55 * shade)
+            img[y0:y1 + 1, x0:x1 + 1][m] = np.clip(rgb, 0, 255).astype(np.uint8)
+        else:
+            img[y0:y1 + 1, x0:x1 + 1][m] = (np.array(c) * shade).astype(np.uint8)
     Image.fromarray(img).save(out)
     print(out, 'tris', len(T), 'bounds', np.round(lo), np.round(hi))
 

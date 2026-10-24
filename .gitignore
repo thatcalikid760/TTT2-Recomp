@@ -120,3 +120,6 @@ server/server.toml
 server/dist/
 server/*.exe
 server/ttt2-server
+
+# lounge_re asset indexes (built from the game files)
+port/tools/lounge_re/*.json

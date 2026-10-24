@@ -67,3 +67,36 @@ def ndxr_index(path="ndxr_index.json"):
                 at = m.find(b"NDXR", at + 4)
     json.dump(index, open(path, "w"))
     return index
+
+
+def ntxr_index(path="ntxr_index.json"):
+    """Every texture in the archives by its GIDX hash: {hash: [archive, NTXR offset, texture number]}, cached in `path`."""
+    import json
+    import mmap
+    if os.path.exists(path):
+        return {int(k): v for k, v in json.load(open(path)).items()}
+    index = {}
+    for i in range(64):
+        p = archive_path(i)
+        if not os.path.exists(p):
+            continue
+        with open(p, "rb") as f:
+            m = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            at = m.find(b"NTXR")
+            while at != -1:
+                try:
+                    count = struct.unpack_from(">H", m, at + 6)[0]
+                    h = at + 0x10
+                    for k in range(count):
+                        total, _, _, headerSize = struct.unpack_from(">IIIH", m, h)
+                        g = m.find(b"GIDX", h, h + headerSize)
+                        if g >= 0:
+                            index.setdefault(struct.unpack_from(">I", m, g + 8)[0], [i, at, k])
+                        if total <= 0:
+                            break
+                        h += total
+                except struct.error:
+                    pass
+                at = m.find(b"NTXR", at + 4)
+    json.dump({str(k): v for k, v in index.items()}, open(path, "w"))
+    return index

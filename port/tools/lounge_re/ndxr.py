@@ -91,7 +91,15 @@ def parse(d, verbose=False):
     return objs
 
 
+def read_material(d, at):
+    """The texture hashes of the material at `at` (a 0x20-byte header, its texture count at +0x0A, then 0x18 bytes a
+    texture: the hash first). Slot 0 is the colour map (MEASURED on Alex: then a normal map, a mask, a fourth)."""
+    count = struct.unpack_from('>H', d, at + 0x0A)[0]
+    return [struct.unpack_from('>I', d, at + 0x20 + k * 0x18)[0] for k in range(min(count, 16))]
+
+
 def read_poly(d, o, p):
+    p['textures'] = read_material(d, p['tex'][0]) if p['tex'][0] > 0 else []
     normType = p['vsize'] & 0xF
     boneType = p['vsize'] & 0xF0
     colorType = p['uvsize'] & 0xF
