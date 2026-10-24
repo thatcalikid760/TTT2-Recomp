@@ -10,6 +10,12 @@ This project is built on **[shihabal3amri/tekken-tag-tournament-2-pc](https://gi
 
 ## Patch notes
 
+### 0.2.2
+- **Delete profiles:** on Select Profile, press **X** on a profile and confirm. Its save data goes to the Recycle Bin, so it can be restored.
+- Display Settings no longer shows 3D MODE / 3D DEPTH.
+- **Motion blur** has one switch again: the game's own in Display Settings (the copy in Graphics Settings is gone).
+- The online menu no longer shows "SEARCH FOR Xbox LIVE PARTY" (it did nothing).
+
 ### 0.2.1
 - **Ranked Match** works on Steam again (0.2.0 grayed it out unless a community server was picked). Team and Leaderboards still need a server.
 
