@@ -207,6 +207,8 @@ static LRESULT CALLBACK GameWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         if (lp & (1 << 30)) return 0;           // auto-repeat
         int vk = static_cast<int>(wp);
         const bool extended = (lp & (1 << 24)) != 0;
+        // an IME (Korean, Japanese, Chinese) reports its keys as VK_PROCESSKEY: the scan code names the real one
+        if (vk == VK_PROCESSKEY) vk = static_cast<int>(MapVirtualKeyA(((lp >> 16) & 0xFF) | (extended ? 0xE000 : 0), MAPVK_VSC_TO_VK_EX));
         if (vk == VK_SHIFT) vk = static_cast<int>(MapVirtualKeyA((lp >> 16) & 0xFF, MAPVK_VSC_TO_VK_EX));
         else if (vk == VK_CONTROL) vk = extended ? VK_RCONTROL : VK_LCONTROL;
         else if (vk == VK_MENU) vk = extended ? VK_RMENU : VK_LMENU;

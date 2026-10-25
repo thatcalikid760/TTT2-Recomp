@@ -50,7 +50,7 @@ void Load()
             GetPrivateProfileStringA("Keyboard", kInfo[c].ini, "", value, sizeof(value), ini.c_str());
             int vk = kInfo[c].defaultKey;
             if (*value) vk = int(std::strtol(value, nullptr, 0));
-            g_keys[c] = (vk >= 0 && vk < 256) ? vk : kInfo[c].defaultKey;
+            g_keys[c] = (vk == 0 || Assignable(vk)) ? vk : kInfo[c].defaultKey;   // 0.2.5 could save KEY E5
         }
         // Two controls on one key (an edited file): the later one loses the key.
         for (int c = 0; c < Count; ++c)
@@ -124,6 +124,7 @@ bool Assignable(int vk)
     case 0: case VK_ESCAPE: case VK_LWIN: case VK_RWIN: case VK_APPS: case VK_SNAPSHOT: case VK_SCROLL:
     case VK_PAUSE: case VK_NUMLOCK: case VK_CAPITAL: case VK_SHIFT: case VK_CONTROL: case VK_MENU:
     case VK_LBUTTON: case VK_RBUTTON: case VK_MBUTTON: case VK_XBUTTON1: case VK_XBUTTON2:
+    case VK_PROCESSKEY: case VK_PACKET:                   // an IME's / injected text's stand-ins, not keys
         return false;
     default:
         return vk > 0 && vk < 256;

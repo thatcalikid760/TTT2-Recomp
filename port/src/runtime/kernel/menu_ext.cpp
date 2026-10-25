@@ -1739,6 +1739,7 @@ struct State
     bool keyboard = false;                               // BUTTON SETTINGS shows KEYBOARD
     bool editing = false, capturing = false, releasing = false;
     int page = 0, slot = 0;
+    int releaseKey = 0;                                  // the key that ended the capture, waited up
     std::string value;                                   // the value text as last written
     std::string gameText[10];                            // the game's slot texts (icon + action)
     std::string shown[10];                               // the slots while keys are shown
@@ -1837,13 +1838,6 @@ bool Foreground()
     if (w) GetWindowThreadProcessId(w, &process);
     return w && process == GetCurrentProcessId();
 }
-bool AnyKeyDown()
-{
-    for (int vk = 8; vk < 256; ++vk)
-        if (GetAsyncKeyState(vk) & 0x8000) return true;
-    return false;
-}
-
 // The next slot from `slot` in a direction (page 2 skips its empty cells; rows and columns wrap).
 int Move(int page, int slot, uint16_t dir)
 {
@@ -1872,15 +1866,16 @@ void Edit(PPCContext& ctx, uint8_t* base, State& st, uint16_t pressed, bool esc)
         for (int vk : keys)
         {
             if (done) break;
-            if (vk == VK_ESCAPE) { done = true; break; }
+            if (vk == VK_ESCAPE) { st.releaseKey = vk; done = true; break; }
             if (!Assignable(vk)) continue;
             Assign(kPage[st.page][st.slot], vk);
             MenuSound(ctx, base, kSoundDecide);
+            st.releaseKey = vk;
             done = true;
         }
         if (!done) return;
         st.capturing = false;
-        st.releasing = true;                              // g_capture stays until the keys are up
+        st.releasing = true;                              // g_capture stays until that key is up
         return;
     }
     if (pressed & (kPadB) || esc)
@@ -1969,8 +1964,10 @@ void Frame(PPCContext& ctx, uint8_t* base)
 
     if (st.releasing)
     {
-        // The new key is still down: it acts as its button only once released.
-        if (!AnyKeyDown() && !(buttons & 0xF3FF)) { st.releasing = false; g_capture = false; st.prevButtons = 0; }
+        // The new key is still down: it acts as its button only once released. Only that key: any key of the
+        // keyboard reading as held (an IME's, a stuck one) kept the keyboard off for good (issue #6).
+        const bool keyDown = st.releaseKey && (GetAsyncKeyState(st.releaseKey) & 0x8000) != 0;
+        if (!keyDown && !(buttons & 0xF3FF)) { st.releasing = false; st.releaseKey = 0; g_capture = false; st.prevButtons = 0; }
     }
     else if (st.editing) Edit(ctx, base, st, pressed, escPressed);
     else if (MenuCursor(ctx, base, kMenu) == kButtonSettingsRow)
