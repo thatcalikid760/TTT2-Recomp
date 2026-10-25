@@ -1,1 +1,5 @@
 blank_issues_enabled: true
+contact_links:
+  - name: Suggest an idea
+    url: https://github.com/thatcalikid760/TTT2-Recomp/discussions/categories/ideas
+    about: Feature requests and ideas go in Discussions > Ideas, where everyone can upvote them.

@@ -15,9 +15,10 @@
 
 <p align="center">
   <a href="#install"><b>Install</b></a> &nbsp;•&nbsp;
-  <a href="#whats-new-in-023"><b>What's new</b></a> &nbsp;•&nbsp;
+  <a href="#whats-new-in-026"><b>What's new</b></a> &nbsp;•&nbsp;
   <a href="#all-patch-notes"><b>Patch notes</b></a> &nbsp;•&nbsp;
   <a href="https://github.com/thatcalikid760/TTT2-Recomp/issues/new?template=bug_report.yml"><b>Report a bug</b></a> &nbsp;•&nbsp;
+  <a href="https://github.com/thatcalikid760/TTT2-Recomp/discussions/categories/ideas"><b>Suggest an idea</b></a> &nbsp;•&nbsp;
   <a href="BUILDING.md"><b>Build from source</b></a>
 </p>
 
@@ -173,6 +174,12 @@ Please include:
 - your version (shown in the top right when you pick your profile),
 - what happened and how to make it happen again,
 - your log file: press Win+R, type `%LOCALAPPDATA%\TTT2Recomp` and attach `log.txt`. It's replaced every time the game starts, so grab it before launching again.
+
+## Suggestions
+
+Got an idea for a feature, a mode or something that could work better? Post it in **Ideas** on the Discussions tab. Everyone can upvote and comment, so the most wanted ideas rise to the top.
+
+<a href="https://github.com/thatcalikid760/TTT2-Recomp/discussions/categories/ideas"><img src="https://img.shields.io/badge/Suggest%20an%20idea-3b82f6?style=for-the-badge&logo=github&logoColor=white" alt="Suggest an idea"></a>
 
 ## Credits
 
