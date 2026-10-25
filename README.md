@@ -62,12 +62,12 @@
 > [!IMPORTANT]
 > **You need your own copy of the game.** This project contains no game files; the installer builds them on your PC from your disc image.
 
-## What's new in 0.2.4
+## What's new in 0.2.5
 
-- **Fighting Lounge (beta, work in progress):** ONLINE MODE > **FIGHTING LOUNGE**. A shared lounge with **LOUNGE CHAT** for everyone in it and 20 cabinets (01-20). Xbox **A** (PlayStation **Cross**, keyboard **A**) sits down, joins a full cabinet's queue, or readies up; Xbox **X** (PlayStation **Square**, keyboard **Z**) leaves. When both seated players are ready, the game takes them to an unranked Player Match against each other; the winner stays and the next in line takes the other seat. The cabinet match itself is still being tested: please report what happens. Everyone needs 0.2.4. The 3D lounge with your fighters as avatars is in the works (see `FIGHTING_LOUNGE.md`).
+- **Fighting Lounge (beta, work in progress):** ONLINE MODE > **FIGHTING LOUNGE**. A shared lounge with **LOUNGE CHAT** for everyone in it and 20 cabinets (01-20). Xbox **A** (PlayStation **Cross**, keyboard **A**) sits down, joins a full cabinet's queue, or readies up; Xbox **X** (PlayStation **Square**, keyboard **Z**) leaves. When both seated players are ready, the game takes them to an unranked Player Match against each other; the winner stays and the next in line takes the other seat. The cabinet match itself is still being tested: please report what happens. Everyone needs 0.2.5. The 3D lounge with your fighters as avatars is in the works (see `FIGHTING_LOUNGE.md`).
 - **VS BATTLE with an Xbox and a PlayStation controller:** a PlayStation pad that becomes player 2 now counts, so VS BATTLE is no longer grayed out.
 - **Keyboard as its own player:** Options > Game Options > **KEYBOARD PLAYER**. PLAYER 1 (default) adds the keys to player 1's controller as before; SEPARATE makes the keyboard a player of its own, so a keyboard and one controller can play VS BATTLE.
-- **Online crowds:** Options > Graphics Settings > **ONLINE CROWDS** keeps the stages' background characters in online matches (experimental).
+- **Fixed: online matches stuck on "syncing"** (0.2.4 was pulled for this). The ONLINE CROWDS option is gone: on most stages it crashed the game while the match loaded, leaving both players waiting.
 - **GAME CHAT** takes up to 80 characters; longer messages go out as several.
 
 ## All patch notes

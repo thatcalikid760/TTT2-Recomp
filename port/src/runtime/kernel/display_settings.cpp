@@ -13,7 +13,7 @@
 //   [Graphics]
 //   VSync=0|1  RenderScale=100|125|150|200  Upscaler=0|1  FsrMode=100|77|67|59|50
 //   AntiAliasing=0|1|2 (FXAA=0|1 before it)  Anisotropy=1|2|4|8|16  Sharpen=0..3
-//   Shadows=0|1  OnlineCrowds=0|1  Brightness=0..10  FpsCounter=0|1
+//   Shadows=0|1  Brightness=0..10  FpsCounter=0|1
 //   [Online]
 //   Netcode=0..3          (STANDARD, PRIORITIZE RESPONSE, PRIORITIZE GRAPHICS, CUSTOM)
 //   CustomDelay=1..6      (CUSTOM's input delay, frames)
@@ -122,7 +122,6 @@ void LoadLocked()
     g.anisotropy = IndexOf(Anisotropies(), GetPrivateProfileIntA("Graphics", "Anisotropy", 1, ini.c_str()));
     g.sharpen = GetPrivateProfileIntA("Graphics", "Sharpen", d.sharpen, ini.c_str());
     g.shadows = GetPrivateProfileIntA("Graphics", "Shadows", d.shadows, ini.c_str()) != 0;
-    g.onlineCrowds = GetPrivateProfileIntA("Graphics", "OnlineCrowds", d.onlineCrowds, ini.c_str()) != 0;
     g.brightness = GetPrivateProfileIntA("Graphics", "Brightness", d.brightness, ini.c_str());
     g.fpsCounter = GetPrivateProfileIntA("Graphics", "FpsCounter", d.fpsCounter, ini.c_str()) != 0;
     g = Clamped(g);
@@ -185,7 +184,7 @@ void SaveLocked()
     put("Sharpen", g.sharpen);
     WritePrivateProfileStringA("Graphics", "MotionBlur", nullptr, ini.c_str());   // 0.2.0 only: Display Settings has the game's own
     put("Shadows", g.shadows);
-    put("OnlineCrowds", g.onlineCrowds);
+    WritePrivateProfileStringA("Graphics", "OnlineCrowds", nullptr, ini.c_str()); // 0.2.4 only: crashed online stage loads
     put("Brightness", g.brightness);
     put("FpsCounter", g.fpsCounter);
     auto putVoice = [&](const char* key, int v) {
@@ -349,15 +348,15 @@ void SetGraphics(const Graphics& wanted)
     const Graphics& o = g_graphics;
     if (g.vsync == o.vsync && g.renderScale == o.renderScale && g.upscaler == o.upscaler && g.fsrMode == o.fsrMode &&
         g.antiAliasing == o.antiAliasing && g.anisotropy == o.anisotropy && g.sharpen == o.sharpen &&
-        g.shadows == o.shadows && g.onlineCrowds == o.onlineCrowds && g.brightness == o.brightness && g.fpsCounter == o.fpsCounter)
+        g.shadows == o.shadows && g.brightness == o.brightness && g.fpsCounter == o.fpsCounter)
         return;
     g_graphics = g;
     MirrorLocked();
     SaveLocked();
     g_generation.fetch_add(1);
-    std::fprintf(stderr, "[display] graphics: vsync %d, render scale %d%%, upscaler %d (fsr %d%%), aa %d, anisotropy %dx, sharpen %d, shadows %d, online crowds %d, brightness %d, fps %d\n",
+    std::fprintf(stderr, "[display] graphics: vsync %d, render scale %d%%, upscaler %d (fsr %d%%), aa %d, anisotropy %dx, sharpen %d, shadows %d, brightness %d, fps %d\n",
                  g.vsync, RenderScales()[size_t(g.renderScale)], g.upscaler, FsrModes()[size_t(g.fsrMode)], g.antiAliasing,
-                 Anisotropies()[size_t(g.anisotropy)], g.sharpen, g.shadows, g.onlineCrowds,
+                 Anisotropies()[size_t(g.anisotropy)], g.sharpen, g.shadows,
                  g.brightness, g.fpsCounter);
 }
 

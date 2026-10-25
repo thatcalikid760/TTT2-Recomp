@@ -404,7 +404,7 @@ void HideDialog(PPCContext& ctx, uint8_t* base)
 // More rows than the frame's 9 scroll (Draw).
 enum GraphicsRow
 {
-    kPreset, kVsync, kRenderScale, kUpscaler, kFsrMode, kAntiAliasing, kFiltering, kSharpen, kShadows, kOnlineCrowds, kBrightness, kFps,
+    kPreset, kVsync, kRenderScale, kUpscaler, kFsrMode, kAntiAliasing, kFiltering, kSharpen, kShadows, kBrightness, kFps,
     kDefault, kGraphicsRows
 };
 void BuildGraphics(Ui& ui)
@@ -432,8 +432,6 @@ void BuildGraphics(Ui& ui)
           "Anisotropic filtering keeps floors and walls sharp at an angle." },
         { "SHARPENING", sharpen[g.sharpen], g.upscaler ? "Sharpen the final image (FSR 1's RCAS when it enlarges)." : "Sharpen the final image." },
         { "SHADOWS", g.shadows ? "ON" : "OFF", "OFF: fighters and stage objects cast no shadows. Lighter on the GPU." },
-        { "ONLINE CROWDS", g.onlineCrowds ? "ON" : "OFF",
-          "ON: stages keep their background characters online (the game removes them). Experimental." },
         { "BRIGHTNESS", std::to_string(g.brightness), "Adjust the brightness of the picture." },
         { "FPS COUNTER", g.fpsCounter ? "ON" : "OFF", "Show frames per second in the corner. The game runs at a fixed 60." },
         { "DEFAULT", "", "Reset to default settings." },
@@ -460,7 +458,6 @@ void ChangeGraphics(int row, int dir)
     case kFiltering: g.anisotropy = step(g.anisotropy, int(display_settings::Anisotropies().size())); break;
     case kSharpen: g.sharpen = step(g.sharpen, 4); break;
     case kShadows: g.shadows = !g.shadows; break;
-    case kOnlineCrowds: g.onlineCrowds = !g.onlineCrowds; break;
     case kBrightness: g.brightness = std::clamp(g.brightness + dir, 0, 10); break;
     case kFps: g.fpsCounter = !g.fpsCounter; break;
     case kDefault: if (dir > 0) g = {}; break;

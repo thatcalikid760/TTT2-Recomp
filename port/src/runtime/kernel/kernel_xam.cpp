@@ -561,7 +561,7 @@ PPC_FUNC(__imp__XMsgInProcessCall)
     KTrace("XMsgInProcessCall");
     uint32_t app = ctx.r3.u32, message = ctx.r4.u32, param1 = ctx.r5.u32;
     static int logged = 0;
-    if (logged < 40 || message != 0x7001B)
+    if (logged < 40 || (message != 0x7001B && logged < 200))   // 0x5800E comes every frame online
     {
         ++logged;
         std::fprintf(stderr, "[xam] XMsgInProcessCall app=%08X msg=%08X lr=%08X\n", app, message, (uint32_t)ctx.lr);

@@ -74,7 +74,6 @@ struct Graphics
     int anisotropy = 0;         // index into Anisotropies(): 0 = the game's own (bilinear / trilinear)
     int sharpen = 0;            // 0 OFF, 1 LOW, 2 MEDIUM, 3 HIGH (contrast-adaptive)
     bool shadows = true;        // OFF: the game's shadow map is not drawn (lighter on the GPU)
-    bool onlineCrowds = false;  // ON: online matches keep the stages' background characters (online_crowds.cpp)
     int brightness = 5;         // 0..10, 5 = unchanged
     bool fpsCounter = false;    // frames per second in the top-left corner
 };
