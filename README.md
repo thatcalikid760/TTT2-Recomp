@@ -45,7 +45,7 @@
 | | |
 |---|---|
 | 🌐 **Online play** | Ranked and Player Match over Steam, rollback netcode, community servers with leaderboards, teams and replays, ranked rematch, rage-quit penalties |
-| 🎮 **Every controller** | Xbox, DualShock 4, DualSense and keyboard, with button prompts that follow the controller you use |
+| 🎮 **Every controller** | Xbox, DualShock 4, DualSense and keyboard, with button prompts and the Controller Setup picture that follow the controller you use |
 | 🖥️ **PC graphics** | Up to 4K at 60 fps, windowed / borderless / fullscreen, FSR 1, SMAA / FXAA, presets, V-Sync, render scale |
 | 🎙️ **Voice and text chat** | Open mic or push-to-talk, per-player mute, text chat in lobbies |
 | 🕹️ **Classic Offline** | An arcade-style mode where you unlock 37 fighters one ARCADE clear at a time |
@@ -61,6 +61,19 @@
 
 > [!IMPORTANT]
 > **You need your own copy of the game.** This project contains no game files; the installer builds them on your PC from your disc image.
+
+## Coming in 0.2.6
+
+- **Fighting Lounge is still in alpha testing and being built.** Here is concept art of what I'm aiming for:
+
+  ![Fighting Lounge concept art: a temple courtyard with cabinet banks, a featured match screen and players walking around](.github/assets/lounge-concept-temple-courtyard.jpg)
+
+  This build adds a first, simple 3D blockout of the courtyard and its cabinets. It is local only for now: other players don't walk around in it yet. Both seated players still have to press ready before a cabinet match starts.
+- **Controller Setup shows your controller:** the big controller picture switches to a PS4 or PS5 controller, or a keyboard and mouse with your bound keys lit up, following whatever you last pressed (or your button prompt setting). Xbox shows the game's original picture.
+- **Unlock all Customize items:** Options > **UNLOCK ALL ITEMS** asks YES / NO and makes every Customize item free to equip. Your save isn't changed, so choosing it again locks them back to what you own.
+- **Voice chat panel (RS / R3 / F7) only opens in Online Mode's menus and the online lobby,** not in the offline menus anymore. It also no longer opens while you're setting keys in Controller Setup (#8).
+- **F8 no longer mutes everyone in voice chat,** so it won't clash with clip / recording shortcuts. You can still mute players one at a time from the voice panel.
+- **Controller Setup > KEYBOARD:** the keyboard works again right after you choose a key (#6).
 
 ## What's new in 0.2.5
 
@@ -127,7 +140,7 @@
 <summary><b>0.1.8</b></summary>
 
 - **Graphics Settings:** V-Sync, render scale (supersampling), FXAA, anisotropic filtering, sharpening, brightness, FPS counter.
-- **Voice Chat:** open mic or push-to-talk in online lobbies and matches, voice volume, mute players (F8 mutes everyone).
+- **Voice Chat:** open mic or push-to-talk in online lobbies and matches, voice volume, mute players.
 - **Updates:** check for and install new versions from inside the game (Options > Updates).
 - **Fix:** Discord Join now works for friends-only sessions.
 
