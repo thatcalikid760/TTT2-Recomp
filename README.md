@@ -64,7 +64,7 @@
 
 ## What's new in 0.2.6
 
-- **Fighting Lounge is still in alpha testing and being built.** Here is concept art of what I'm aiming for: and no it does not look like this yet.
+- **Fighting Lounge is still in alpha testing and being built.** Here is concept art of what I'm aiming for and no it does not look like this yet.
 
   ![Fighting Lounge concept art: a temple courtyard with cabinet banks, a featured match screen and players walking around](.github/assets/lounge-concept-temple-courtyard.jpg)
 
