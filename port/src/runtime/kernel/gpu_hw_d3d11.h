@@ -23,6 +23,7 @@
 #include "button_prompts.h"
 #include "voice_chat.h"
 #include "toast.h"
+#include "lounge_view.h"
 #include "AreaTex.h"                  // SMAA's lookup textures (third_party/smaa, MIT)
 #include "SearchTex.h"
 #include <d3d11_1.h>
@@ -1830,8 +1831,8 @@ private:
             "  }\n"
             "  return on ? float4(1, 0.85, 0.1, 1) : float4(0.04, 0.04, 0.04, 1); }\n", "ttt2 fps ps");
         // Voice chat: a microphone (lit green while our voice is sent) and a speaker (yellow while
-        // somebody is heard, red while F8 mutes everyone), 8 x 8 glyphs on a plate of 20 x 10 cells.
-        // params.z: 1 talking, 2 heard, 4 all muted.
+        // somebody is heard), 8 x 8 glyphs on a plate of 20 x 10 cells.
+        // params.z: 1 talking, 2 heard.
         voicePs_ = PostShader(
             "static const uint glyph[16] = { 60, 60, 60, 189, 153, 66, 60, 24, 16, 52, 242, 242, 242, 242, 52, 16 };\n"
             "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
@@ -1841,7 +1842,6 @@ private:
             "  if (cell.y < 0 || cell.y > 7 || col < 0 || col > 7) return float4(0.04, 0.04, 0.04, 1);\n"
             "  if (((glyph[icon * 8 + cell.y] >> (7 - col)) & 1) == 0) return float4(0.04, 0.04, 0.04, 1);\n"
             "  if (icon == 0) return (flags & 1) ? float4(0.2, 1, 0.3, 1) : float4(0.3, 0.3, 0.3, 1);\n"
-            "  if (flags & 4) return float4(1, 0.2, 0.15, 1);\n"
             "  return (flags & 2) ? float4(1, 0.85, 0.1, 1) : float4(0.3, 0.3, 0.3, 1); }\n", "ttt2 voice ps");
         // Notifications: the premultiplied texture, its alpha scaled by the fade (params.x).
         toastPs_ = PostShader(
@@ -1992,6 +1992,40 @@ private:
         context_->OMSetBlendState(toastBlend_.Get(), factor, 0xFFFFFFFF);
         PostPass(toastPs_.Get(), toastSrv_.Get(), rtv, box, cb);
         context_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    }
+    ComPtr<ID3D11Texture2D> loungeTex_;
+    ComPtr<ID3D11ShaderResourceView> loungeSrv_;
+    std::vector<uint32_t> loungePixels_;
+    uint64_t loungeSerial_ = 0;
+    bool loungeFailed_ = false;
+    void DrawLounge(ID3D11RenderTargetView* rtv, const D3D11_VIEWPORT& vp, PostCB cb)
+    {
+        if (loungeFailed_) return;
+        const uint64_t before = loungeSerial_;
+        if (!lounge_view::Paint(loungePixels_, loungeSerial_)) return;
+        if (!loungeTex_)
+        {
+            D3D11_TEXTURE2D_DESC d{};
+            d.Width = lounge_view::Width; d.Height = lounge_view::Height;
+            d.MipLevels = d.ArraySize = d.SampleDesc.Count = 1;
+            d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            HRESULT hr = device_->CreateTexture2D(&d, nullptr, &loungeTex_);
+            if (SUCCEEDED(hr)) hr = device_->CreateShaderResourceView(loungeTex_.Get(), nullptr, &loungeSrv_);
+            if (FAILED(hr))
+            {
+                loungeFailed_ = true;
+                lounge_view::SetAvailable(false);
+                std::fprintf(stderr, "[lounge] presentation unavailable: %08X; using native menu\n", unsigned(hr));
+                return;
+            }
+        }
+        if (before != loungeSerial_)
+            context_->UpdateSubresource(loungeTex_.Get(), 0, nullptr, loungePixels_.data(), lounge_view::Width * 4, 0);
+        cb.params[0] = 1; cb.params[1] = 0;
+        context_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+        PostPass(toastPs_.Get(), loungeSrv_.Get(), rtv, vp, cb);
+        lounge_view::SetAvailable(true);
     }
     // `extra0` / `extra1`: textures at t2 / t3 (SMAA's lookups and intermediate results).
     void PostPass(ID3D11PixelShader* ps, ID3D11ShaderResourceView* srv, ID3D11RenderTargetView* rtv, const D3D11_VIEWPORT& vp,
@@ -2152,9 +2186,9 @@ private:
             cb.params[2] = float(std::min(fpsShown_, 999u));
             PostPass(fpsPs_.Get(), nullptr, rtv, D3D11_VIEWPORT{ vp.TopLeftX + cell * 2, vp.TopLeftY + cell * 2, cell * 13, cell * 7, 0, 1 }, cb);
         }
+        DrawLounge(rtv, vp, cb);
         DrawToast(rtv, vp, cb);
-        const uint32_t voice = (voice_chat::LocalTalking() ? 1u : 0u) | (voice_chat::RemoteTalking() ? 2u : 0u) |
-                               (voice_chat::AllMuted() ? 4u : 0u);
+        const uint32_t voice = (voice_chat::LocalTalking() ? 1u : 0u) | (voice_chat::RemoteTalking() ? 2u : 0u);
         if (voice)
         {
             const float cell = std::max(2.0f, std::floor(vh / 200.0f));
@@ -2238,7 +2272,7 @@ private:
         uint32_t levels = 1, mipStart = 0, mipSize = 0;     // mip levels held; their guest bytes (levels 1+)
         bool genericSwizzled = false;
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-        bool promptFont = false;           // the menu font: its button icons follow the controller
+        bool promptFont = false;           // the menu font or controller atlas: redrawn for the controller
         uint32_t promptGeneration = 0;     // button_prompts::Generation() it was painted for
     };
     struct Bound { ID3D11ShaderResourceView* srv; uint32_t swizzle, mode, width, height; float scaleX, scaleY; uint32_t slices = 1, levels = 1; };
@@ -4149,6 +4183,32 @@ private:
                     rowPitch = allocW * 4;
                 }
             }
+            // Controller Setup's picture: the current controller (or keyboard) over the Xbox pad.
+            else if (t.pitch == 512 && !t.originX && !t.originY &&
+                     button_prompts::IsControllerAtlas(t.format, t.width, t.height, t.tiled, g_base + t.base,
+                                                       size_t(bw) * blocksY * blockBytes))
+            {
+                c.promptFont = true;
+                c.promptGeneration = button_prompts::Generation();
+                const button_prompts::Style style = button_prompts::Current();
+                if (style != button_prompts::Style::Xbox)
+                {
+                    std::vector<uint8_t> rgba(size_t(allocW) * allocH * 4);
+                    Texture st = t;
+                    st.swizzle = 0x688;                 // identity: the draw applies the fetch swizzle
+                    for (uint32_t y = 0; y < t.height; ++y)
+                        for (uint32_t x = 0; x < t.width; ++x)
+                        {
+                            const V4 v = SampleTexel(st, int(x), int(y));
+                            for (int k = 0; k < 4; ++k)
+                                rgba[(size_t(y) * allocW + x) * 4 + k] = uint8_t(std::lround(std::clamp(v.c[k], 0.0f, 1.0f) * 255.0f));
+                        }
+                    button_prompts::PaintController(style, rgba.data(), allocW, allocH, allocW * 4);
+                    data.swap(rgba);
+                    format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    rowPitch = allocW * 4;
+                }
+            }
         }
         else
         {
@@ -4715,6 +4775,7 @@ inline bool Guarded(const char* what, F&& f)
     catch (const std::exception& e)
     {
         g_failed.store(true, std::memory_order_relaxed);
+        lounge_view::SetAvailable(false);
         std::fprintf(stderr, "[gpu-hw] DISABLED after failure in %s: %s (device removed reason %08X)\n",
                      what, e.what(), (unsigned)Get().RemovedReason());
         return false;

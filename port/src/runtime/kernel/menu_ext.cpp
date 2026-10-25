@@ -58,6 +58,7 @@ extern "C" PPC_FUNC(__imp__sub_8241B9D0);
 extern "C" PPC_FUNC(__imp__sub_8256C708);
 extern "C" PPC_FUNC(__imp__sub_82374700);
 extern "C" PPC_FUNC(__imp__sub_823747C0);
+extern "C" PPC_FUNC(__imp__sub_827163B8);
 extern "C" PPC_FUNC(__imp__sub_8241F988);
 extern "C" PPC_FUNC(__imp__sub_8241B588);
 extern void (*g_uiFrameHook)(PPCContext& ctx, uint8_t* base);
@@ -477,7 +478,7 @@ void BuildVoice(Ui& ui)
     static const char* const modes[] = { "OFF", "OPEN MIC", "PUSH TO TALK" };
     const bool capturing = g_voiceCapture.load();
     ui.rows = {
-        { "VOICE CHAT", modes[v.mode], "Talk with players in online lobbies and matches. F8 mutes everyone." },
+        { "VOICE CHAT", modes[v.mode], "Talk with players in online lobbies and matches." },
         { "PUSH-TO-TALK KEY", capturing ? "PRESS A KEY" : keyboard_keys::KeyName(v.pushToTalkKey),
           capturing ? "Press the key to hold while talking.   ESC: cancel" : "A: choose the key you hold to talk (PUSH TO TALK)." },
         { "VOICE VOLUME", std::to_string(v.volume), "How loud other players are." },
@@ -1122,8 +1123,8 @@ void KeyboardFrame(PPCContext& ctx, uint8_t* base)
 }
 
 // ---- the voice panel: VOICE CHAT's settings in the game's information window, opened with F7 or
-// the right stick's click (R3) in the menus or the online lobby - never at character select or in
-// a fight. The game's mode manager [0x82F30B94] holds the current mode at +12 (MEASURED
+// the right stick's click (R3) in Online Mode's menus or the online lobby - never in the offline
+// menus, at character select or in a fight. The game's mode manager [0x82F30B94] holds the current mode at +12 (MEASURED
 // 2026-10-22: 16 the main menu and its submenus, Options included; 29 Online Mode's menus; 35 the
 // online session room;
 // 8 character select, 9 a fight). UP / DOWN choose a line, LEFT / RIGHT or A change it (a
@@ -1175,7 +1176,6 @@ std::string VoicePanelText(VoicePanel& vp)
         m += "\n" + (int(i) == vp.cursor ? "> " + lines[i] + " <" : lines[i]);
     }
     if (vp.peers.empty()) m += "\n\nNo players yet.";
-    if (voice_chat::AllMuted()) m += "\n\nF8: everyone is muted.";
     // The buttons as the current prompt style names them (keyboard: player 1's keys).
     const button_prompts::Style style = button_prompts::Current();
     auto name = [&](int control, const char* xbox, const char* ps) {
@@ -1237,11 +1237,13 @@ void VoicePanelFrame(PPCContext& ctx, uint8_t* base)
     if (!vp.showing)
     {
         if (!(f7Pressed || (pressed & kRightStick))) return;
-        // Only in the menus or the session room, with nothing else of ours open.
+        // Only in Online Mode's menus or the session room, with nothing else of ours open.
         if (g_owns.load() || g_boxOwns.load() || g_kbOwns.load()) return;
         const uint32_t manager = GRead32(base, 0x82F30B94);
         const uint32_t mode = manager ? GRead32(base, manager + 12) : 0;
-        if (mode != 16 && mode != 29 && mode != 35) return;
+        if (mode != 29 && mode != 35) return;
+        // Controller Setup owns every bindable key, including RS/R3 and F7 (issue #8).
+        if (menu_host::CurrentFrame(ctx, base) == "FrameControlerSetup") return;
         std::fprintf(stderr, "[sys-ui] voice panel (mode %u)\n", mode);
         vp.showing = true;
         g_vpOwns = true;
@@ -1466,6 +1468,43 @@ void Frame(PPCContext& ctx, uint8_t* base)
     if (ui.screen == Screen::None)
     {
         const std::string current = CurrentFrameName(ctx, base);
+        static bool unlockLeaving = false;                       // the switch back to Options takes a few frames
+        if (current != "FrameUnlockAllItems") unlockLeaving = false;
+        else if (unlockLeaving) return;
+        else
+        {
+            // Options -> UNLOCK ALL ITEMS played Options out: ask, then back to Options (display_settings.h).
+            static std::atomic<bool> asked{ false }, answered{ false };
+            g_owns = true;
+            if (answered.exchange(false))
+            {
+                asked = false;
+                unlockLeaving = true;
+                SwitchFrame(ctx, base, "FrameMode007-01");
+                ui.releasing = true;                             // the answer's button is not Options' too
+                ui.continueAfter = false;
+                return;
+            }
+            // Not while the A that chose the row is held: the box would take it as YES.
+            if (!asked && !SysUiBoxBusy() && !HostControllerButtons())
+            {
+                const bool on = display_settings::GetUnlockAllItems();
+                SysUiMessageBox box;
+                box.text = on ? "Every Customize item is unlocked.\n\nLock them again?\nOnly the items you own will show."
+                              : "Unlock every Customize item for free?\n\nYour save is not changed:\nchoose this again to lock them.";
+                box.buttons = { "YES", "NO" };
+                box.active = 1;
+                box.cancel = 1;
+                box.done = [on](int choice) {
+                    if (choice == 0) display_settings::SetUnlockAllItems(!on);
+                    std::fprintf(stderr, "[sys-ui] unlock all items: %s\n", display_settings::GetUnlockAllItems() ? "ON" : "OFF");
+                    answered = true;
+                };
+                asked = SysUiShowMessageBox(std::move(box));
+                if (asked) OptionsBackground(ctx, base);
+            }
+            return;
+        }
         if (current == "FrameGraphicsSettings" || current == "FrameVoiceSettings" || current == "FrameUpdates")
         {
             // Options -> GRAPHICS SETTINGS / VOICE CHAT / UPDATES played Options out and switched to
@@ -2458,6 +2497,14 @@ PPC_FUNC(sub_82374700)
             display_settings::SetKeyboardPlayer(GRead32(base, w + 368) == 1);
     }
     ctx = saved;
+}
+
+// Customize's "does the profile own item r4" (impl sub_827163B8; lib hasItem, and the owned-item lists of
+// getHaveItemMax / getHaveItemId; found 2026-10-25): every item while UNLOCK ALL ITEMS is ON.
+PPC_FUNC(sub_827163B8)
+{
+    if (display_settings::GetUnlockAllItems()) { ctx.r3.u64 = 1; return; }
+    __imp__sub_827163B8(ctx, base);
 }
 
 // lib::GameOptionResetToDefaults (impl sub_823747C0): Game Options' DEFAULT resets INPUT DELAY and

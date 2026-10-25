@@ -34,7 +34,7 @@ struct Peer
 
 std::mutex g_mutex;
 std::map<uint64_t, Peer> g_peers;
-std::atomic<bool> g_localTalking{ false }, g_allMuted{ false };
+std::atomic<bool> g_localTalking{ false };
 
 // ---- playback: one XAudio2 source voice per player (created at its first packet)
 struct Playback
@@ -75,7 +75,7 @@ void Play(uint64_t peer, const int16_t* samples, size_t count, uint32_t rate)
         p.lastVoice = clock::now();
     }
     const display_settings::Voice settings = display_settings::GetVoice();
-    if (settings.mode == display_settings::VoiceOff || g_allMuted.load() || display_settings::IsVoiceMuted(peer) || !count)
+    if (settings.mode == display_settings::VoiceOff ||display_settings::IsVoiceMuted(peer) || !count)
         return;
     std::lock_guard l(g_audioMutex);
     if (!EnsureAudio()) return;
@@ -115,10 +115,10 @@ bool GameInFront()
     return w && process == GetCurrentProcessId();
 }
 
-// Every 20 ms: the microphone, the peers our voice goes to, F8.
+// Every 20 ms: the microphone and the peers our voice goes to.
 void Tick()
 {
-    bool recording = false, f8 = false;
+    bool recording = false;
     std::vector<uint64_t> sentPeers;
     // TTT2_VOICE_FAKE_PEER=<SteamID64 hex> (tests): that player counts as in our session.
     static const uint64_t fake = [] { const char* e = std::getenv("TTT2_VOICE_FAKE_PEER"); return e ? std::strtoull(e, nullptr, 16) : 0ull; }();
@@ -127,13 +127,6 @@ void Tick()
         if (fake) NotePeer(fake);
         const display_settings::Voice settings = display_settings::GetVoice();
         const bool front = GameInFront();
-        const bool f8Now = front && (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-        if (f8Now && !f8)
-        {
-            g_allMuted = !g_allMuted.load();
-            std::fprintf(stderr, "[voice] F8: everyone %s\n", g_allMuted.load() ? "muted" : "heard again");
-        }
-        f8 = f8Now;
         std::vector<uint64_t> peers;
         {
             std::lock_guard l(g_mutex);
@@ -229,7 +222,6 @@ bool LocalTalking() { return g_localTalking.load(); }
 
 bool RemoteTalking()
 {
-    if (g_allMuted.load()) return false;
     std::vector<uint64_t> talking;
     {
         std::lock_guard l(g_mutex);
@@ -242,7 +234,6 @@ bool RemoteTalking()
     return false;
 }
 
-bool AllMuted() { return g_allMuted.load(); }
 
 void OpenSteamProfile(uint64_t peer)
 {

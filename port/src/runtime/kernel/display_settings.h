@@ -61,6 +61,12 @@ void SetInputDelayOn(bool on);
 bool GetKeyboardPlayer();
 void SetKeyboardPlayer(bool separate);
 
+// Options -> UNLOCK ALL ITEMS (YES / NO asked in menu_ext.cpp): every Customize item counts as owned while ON
+// (menu_ext.cpp's hook of the item check); the save is not changed, so OFF shows the items the profile really has.
+// [Game] UnlockAllItems=0|1, default 0.
+bool GetUnlockAllItems();
+void SetUnlockAllItems(bool on);
+
 // Options -> GRAPHICS SETTINGS (menu_ext.cpp's system UI page; the presenter applies them each
 // frame). [Graphics] in settings.ini. The game itself always runs at 60 fps: its simulation steps
 // once per vblank (kernel_video.cpp), so there is no frame-rate choice beyond V-SYNC.

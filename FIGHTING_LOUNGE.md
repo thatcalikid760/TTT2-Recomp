@@ -28,6 +28,44 @@ Known limits and open items:
   PCs on Steam.
 - The lounge closes when its host leaves.
 
+## Grid and local courtyard (2026-10-25)
+
+The D3D11 presenter now draws a five-column, four-row cabinet grid over the native lounge page. It reads the
+existing host-authoritative seats, readiness, queues, player names, chat, and match state; it does not maintain
+another lobby or change the network protocol. Both players still have to press Ready. The existing match
+handoff, winner-stays rotation, and loser requeue are unchanged.
+
+- Grid: arrow keys / controller D-pad select a cabinet; Enter / controller A sits, queues, or toggles readiness.
+- X on the keyboard or controller X leaves the selected cabinet. C / RB opens the existing lounge chat.
+- Tab / controller Y switches between the grid and courtyard. Escape / B returns to the grid, then leaves the lounge.
+- Courtyard: WASD / D-pad or left stick moves, Shift runs, and left/right arrow keys turn the camera.
+- E / A interacts with a nearby cabinet or bench. Q sits in an available cabinet seat or joins its queue without
+  toggling readiness. G plays a short placeholder wave.
+- Moving stands up from a bench or a cabinet occupied only by you. With two players seated, use X to leave before
+  the match begins. Selecting a cabinet in the grid works from anywhere in the courtyard.
+
+The courtyard follows the supplied four-bank coordinates, spawn at `(0, 0, -28)`, six bench anchors, watch-zone
+steps, and featured-match board. It uses procedural geometry, a local block avatar, collision bounds, and a
+perspective camera. Player silhouettes stand in for fighter portraits. The featured board identifies the playing
+cabinet with the largest queue; it does not show match video. This is explicitly labeled **LOCAL BLOCKOUT**.
+
+**Not implemented in this increment:** extracted stage art, animated TTT2 fighters, shared avatar transforms,
+shared bench occupancy, native emotes/IK, mouse orbit/camera collision, live spectating, or match video. The
+spectate action is labeled unavailable rather than launching a placeholder. The GDI painter uses sorted projected
+faces, not the game's scene/depth pipeline; it is a blockout renderer, not the final character renderer.
+
+The presenter caches a 1280x720 BGRA texture and uploads it only when the view changes. All guest menu calls and
+lounge actions remain on the game thread; the render thread receives copies. Physical controller buttons are
+sampled separately so the game's keyboard bindings (A/S/X/W) cannot trigger menu actions during WASD movement.
+The native list remains the fallback without the hardware presenter or if its lounge resources fail.
+
+Verification: `port/tools/test_lounge_view.py --work-dir <existing-temporary-directory>` checks layout and movement;
+add `--host`, `--input`, or `--paint` to exercise the production state owner, UI input transitions, or painter.
+`--paint --capture` additionally writes synthetic-state PNG previews (requires Pillow for the test only).
+`port/tools/test_input_polling.py` covers the physical-only snapshot alongside the existing input regressions.
+Two-PC Steam matches and in-game transitions still require manual testing; standalone checks do not establish
+that the native match bridge works end to end.
+
 ## Plan
 
 1. Menu lounge (0.0.1): cabinets, queues, chat, the match flow.

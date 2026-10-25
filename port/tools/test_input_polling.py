@@ -32,6 +32,11 @@ CHECKER = r'''
 #include <thread>
 #include "ps_pads.h"
 #include "button_prompts.h"
+namespace display_settings { bool GetKeyboardPlayer() { return false; } }
+std::atomic<uint32_t> g_usedUsers{0};
+bool User0SignedIn() { return false; }
+std::string UserName(uint32_t) { return "PLAYER"; }
+void XamNotifyEnqueueEvent(uint32_t, uint32_t) {}
 int notedDevice=-1;
 void button_prompts::NoteInput(button_prompts::Device d) { notedDevice=int(d); }
 std::array<bool,256> keys{};
@@ -93,6 +98,7 @@ int main() {
     keys[VK_RETURN]=true;PollPadsOnce(poll,false,1000);
     CHECK(g_pads[0].connected && !g_pads[0].physical && g_pads[0].state.Gamepad.wButtons==0x10);
     CHECK(g_pads[0].caps.Gamepad.wButtons==0xF3FF);
+    CHECK(g_physicalButtons.load()==0); // Lounge controls must not treat keyboard mappings as a physical pad.
     DWORD packet=g_pads[0].state.dwPacketNumber;
     for(unsigned tick=0;tick<400;++tick) {
         PollPadsOnce(poll,false,1010+tick*8);
@@ -114,6 +120,7 @@ int main() {
     while(!poll.physicalConnected[0] && attempts++<252) PollPadsOnce(poll,false,6000+attempts*8);
     CHECK(poll.physicalConnected[0] && g_pads[0].connected && g_pads[0].physical);
     CHECK(g_pads[0].state.Gamepad.wButtons==0x1010 && g_pads[0].caps.Flags==0x55);
+    CHECK(g_physicalButtons.load()==0x1000); // Keyboard ENTER is not part of the physical snapshot.
     CHECK(g_pads[0].state.Gamepad.bLeftTrigger==90 && g_pads[0].state.Gamepad.sThumbLX==-1234);
     CHECK(g_pads[0].state.dwPacketNumber!=packet); // Host counter collision cannot hide the handoff.
     packet=g_pads[0].state.dwPacketNumber;

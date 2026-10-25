@@ -2,8 +2,8 @@
 // carries the voice (steam_net.h); this side decides when the microphone is open (OPEN MIC, or
 // PUSH TO TALK while the key is held with the game in front), who hears it (every peer the game
 // exchanged packets with in the last few seconds: the lobby and the match alike), and plays each
-// player through an XAudio2 voice of its own at VOICE VOLUME unless muted. F8 mutes everyone
-// until pressed again. Only over Steam: the loopback backend has no voice.
+// player through an XAudio2 voice of its own at VOICE VOLUME unless muted.
+// Only over Steam: the loopback backend has no voice.
 #pragma once
 #include <cstdint>
 #include <string>
@@ -27,10 +27,9 @@ struct Player
 // The players met this session (the 6 heard from most recently, in the order they were met).
 std::vector<Player> Players();
 
-// For the overlay: our microphone is sending / somebody unmuted is heard / F8 mutes everyone.
+// For the overlay: our microphone is sending / somebody unmuted is heard.
 bool LocalTalking();
 bool RemoteTalking();
-bool AllMuted();
 
 // Opens `peer`'s Steam profile in the Steam client (the web page when steam:// is not handled).
 void OpenSteamProfile(uint64_t peer);

@@ -222,10 +222,10 @@ void DrawPsFace(Graphics& g, RectF r, Control c, bool ringed)
 }
 
 // The OPTIONS / SHARE (CREATE) buttons: the name over a small dark button, as START / BACK are drawn.
-void DrawPsMenu(Graphics& g, RectF r, const std::wstring& name, bool options)
+void DrawPsMenu(Graphics& g, RectF r, const std::wstring& name, bool options, Color ink = Rgb(245, 245, 248))
 {
     RectF text(r.X, r.Y, r.Width, r.Height * 0.56f);
-    DrawLabel(g, name, text, Rgb(245, 245, 248), r.Height * 0.5f);
+    DrawLabel(g, name, text, ink, r.Height * 0.5f);
     const float bw = r.Width * 0.36f, bh = r.Height * 0.34f;
     RectF button(r.X + (r.Width - bw) / 2, r.Y + r.Height - bh - 1.0f, bw, bh);
     GraphicsPath path;
@@ -337,26 +337,26 @@ void RecolorDots(uint8_t* rgba, uint32_t pitch, const Glyph& gl)
         }
 }
 
-// Draw one replacement glyph into a fresh ARGB canvas and copy it over the atlas rectangle.
-template <typename F> void PaintGlyph(uint8_t* rgba, uint32_t pitch, const Glyph& gl, F&& draw)
+// Draw into a fresh ARGB canvas and copy it over the atlas rectangle (x, y, w, h).
+template <typename F> void PaintRect(uint8_t* rgba, uint32_t pitch, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, F&& draw)
 {
-    Bitmap canvas(gl.w, gl.h, PixelFormat32bppARGB);
+    Bitmap canvas(INT(w), INT(h), PixelFormat32bppARGB);
     {
         Graphics g(&canvas);
         g.SetSmoothingMode(SmoothingModeAntiAlias);
         g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
         g.SetPixelOffsetMode(PixelOffsetModeHalf);
         g.Clear(Color(0, 0, 0, 0));
-        draw(g, RectF(0.5f, 0.5f, gl.w - 1.0f, gl.h - 1.0f));
+        draw(g, RectF(0.5f, 0.5f, w - 1.0f, h - 1.0f));
     }
     BitmapData data;
-    Rect all(0, 0, gl.w, gl.h);
+    Rect all(0, 0, INT(w), INT(h));
     if (canvas.LockBits(&all, ImageLockModeRead, PixelFormat32bppARGB, &data) != Ok) return;
-    for (uint32_t y = 0; y < gl.h; ++y)
+    for (uint32_t y = 0; y < h; ++y)
     {
         const uint8_t* src = static_cast<const uint8_t*>(data.Scan0) + size_t(y) * data.Stride;
-        uint8_t* dst = rgba + size_t(gl.y + y) * pitch + size_t(gl.x) * 4;
-        for (uint32_t x = 0; x < gl.w; ++x)
+        uint8_t* dst = rgba + size_t(y0 + y) * pitch + size_t(x0) * 4;
+        for (uint32_t x = 0; x < w; ++x)
         {
             dst[x * 4 + 0] = src[x * 4 + 2];   // BGRA -> RGBA
             dst[x * 4 + 1] = src[x * 4 + 1];
@@ -365,6 +365,194 @@ template <typename F> void PaintGlyph(uint8_t* rgba, uint32_t pitch, const Glyph
         }
     }
     canvas.UnlockBits(&data);
+}
+
+template <typename F> void PaintGlyph(uint8_t* rgba, uint32_t pitch, const Glyph& gl, F&& draw)
+{
+    PaintRect(rgba, pitch, gl.x, gl.y, gl.w, gl.h, std::forward<F>(draw));
+}
+
+// ---- Controller Setup picture ----------------------------------------------------------------
+// The controller atlas (BC3 512x512, tiled, FNV-1a 86748E22A730B2D1 over its guest bytes; measured
+// 2026-10-25) holds a PS3 pad, the Xbox 360 pad Controller Setup shows at (0, 220) 316x196, player
+// numbers and menu icons. Only the Xbox pad's rectangle is redrawn.
+constexpr uint64_t kControllerHash = 0x86748E22A730B2D1ull;
+constexpr uint32_t kFmtDxt4_5 = 20, kAtlas = 512, kPadX = 0, kPadY = 220, kPadW = 316, kPadH = 196;
+
+// Left half of a pad's outline (body top plus grip); the right half mirrors it.
+void PadOutline(GraphicsPath& path, float top)
+{
+    RectF body(34, top, 248, 92);
+    RoundRect(path, body, 34);
+    const PointF grip[] = { PointF(44, top + 40), PointF(104, top + 70), PointF(116, top + 132), PointF(84, top + 160),
+                            PointF(44, top + 162), PointF(18, top + 128), PointF(16, top + 70) };
+    path.AddClosedCurve(grip, 7, 0.4f);
+    PointF mirror[7];
+    for (int i = 0; i < 7; ++i) mirror[i] = PointF(316 - grip[6 - i].X, grip[6 - i].Y);   // same winding as the left
+    path.AddClosedCurve(mirror, 7, 0.4f);
+    path.SetFillMode(FillModeWinding);
+}
+
+void DrawDpad(Graphics& g, float cx, float cy, Color fill)
+{
+    SolidBrush brush(fill);
+    Pen edge(Rgb(20, 20, 24), 1.0f);
+    SolidBrush arrow(Rgb(30, 30, 36));
+    for (int i = 0; i < 4; ++i)
+    {
+        const float dx = i == 0 ? 0.0f : i == 1 ? 14.0f : i == 2 ? 0.0f : -14.0f, dy = i == 0 ? -14.0f : i == 2 ? 14.0f : 0.0f;
+        RectF key(cx + dx - 7, cy + dy - 7, 14, 14);
+        GraphicsPath path;
+        RoundRect(path, key, 3);
+        g.FillPath(&brush, &path);
+        g.DrawPath(&edge, &path);
+        const float ax = cx + dx, ay = cy + dy, s = 3.5f;
+        const PointF tri[4][3] = { { PointF(ax, ay - s), PointF(ax + s, ay + s), PointF(ax - s, ay + s) },
+                                   { PointF(ax + s, ay), PointF(ax - s, ay + s), PointF(ax - s, ay - s) },
+                                   { PointF(ax, ay + s), PointF(ax - s, ay - s), PointF(ax + s, ay - s) },
+                                   { PointF(ax - s, ay), PointF(ax + s, ay - s), PointF(ax + s, ay + s) } };
+        g.FillPolygon(&arrow, tri[i], 3);
+    }
+}
+
+void DrawPadStick(Graphics& g, float cx, float cy, Color ring)
+{
+    SolidBrush well(ring);
+    g.FillEllipse(&well, cx - 22, cy - 22, 44.0f, 44.0f);
+    LinearGradientBrush cap(PointF(0, cy - 16), PointF(0, cy + 16), Rgb(84, 86, 94), Rgb(18, 18, 22));
+    g.FillEllipse(&cap, cx - 16, cy - 16, 32.0f, 32.0f);
+    Pen rim(Rgb(120, 122, 130), 1.2f);
+    g.DrawEllipse(&rim, cx - 11, cy - 11, 22.0f, 22.0f);
+}
+
+// DualShock 4 (dark, light bar over the touchpad) or DualSense (white wings, black centre).
+void DrawPad(Graphics& g, bool ps5)
+{
+    const float top = 30;
+    // Shoulders behind the body: L2 / R2 over L1 / R1.
+    DrawKey(g, RectF(58, 0, 60, 17), L"L2", false, 6);
+    DrawKey(g, RectF(198, 0, 60, 17), L"R2", false, 6);
+    DrawKey(g, RectF(50, 15, 76, 17), L"L1", false, 8);
+    DrawKey(g, RectF(190, 15, 76, 17), L"R1", false, 8);
+
+    GraphicsPath shell;
+    PadOutline(shell, top);
+    Pen outline(ps5 ? Rgb(40, 40, 46) : Rgb(170, 174, 184), 3.0f);
+    g.DrawPath(&outline, &shell);                       // drawn first: the fill hides inner seams
+    LinearGradientBrush body(PointF(0, top), PointF(0, top + 162),
+                             ps5 ? Rgb(252, 252, 255) : Rgb(70, 72, 82), ps5 ? Rgb(196, 198, 208) : Rgb(16, 16, 20));
+    g.FillPath(&body, &shell);
+    if (ps5)
+    {
+        GraphicsPath centre;                            // the black panel between the white wings
+        RoundRect(centre, RectF(92, top + 30, 132, 92), 24);
+        SolidBrush black(Rgb(22, 22, 28));
+        g.FillPath(&black, &centre);
+    }
+
+    RectF pad(112, top + 6, 92, 50);                    // touchpad
+    GraphicsPath touch;
+    RoundRect(touch, pad, 8);
+    LinearGradientBrush padFill(PointF(0, pad.Y), PointF(0, pad.Y + pad.Height),
+                                ps5 ? Rgb(246, 246, 250) : Rgb(52, 54, 62), ps5 ? Rgb(206, 208, 216) : Rgb(26, 26, 32));
+    g.FillPath(&padFill, &touch);
+    Pen padEdge(ps5 ? Rgb(120, 122, 130) : Rgb(96, 98, 108), 1.0f);
+    g.DrawPath(&padEdge, &touch);
+    Pen light(Rgb(70, 150, 255), 3.0f);
+    light.SetStartCap(LineCapRound); light.SetEndCap(LineCapRound);
+    if (ps5)                                            // the DualSense lights run down the touchpad's sides
+    {
+        g.DrawLine(&light, pad.X - 3, pad.Y + 8, pad.X - 3, pad.Y + pad.Height - 4);
+        g.DrawLine(&light, pad.X + pad.Width + 3, pad.Y + 8, pad.X + pad.Width + 3, pad.Y + pad.Height - 4);
+    }
+    else                                                // the DualShock 4 light bar across the top
+        g.DrawLine(&light, pad.X + 12, top + 2, pad.X + pad.Width - 12, top + 2);
+
+    const Color ink = ps5 ? Rgb(40, 40, 46) : Rgb(245, 245, 248);
+    DrawPsMenu(g, RectF(70, top + 6, 40, 26), ps5 ? L"CREATE" : L"SHARE", false, ink);
+    DrawPsMenu(g, RectF(206, top + 6, 40, 26), L"OPTIONS", true, ink);
+
+    DrawDpad(g, 74, top + 52, ps5 ? Rgb(230, 232, 238) : Rgb(64, 66, 74));
+    const float fx = 242, fy = top + 52, d = 17, r = 9.5f;
+    DrawPsFace(g, RectF(fx - r, fy - d - r, 2 * r, 2 * r), Y, false);
+    DrawPsFace(g, RectF(fx + d - r, fy - r, 2 * r, 2 * r), B, false);
+    DrawPsFace(g, RectF(fx - r, fy + d - r, 2 * r, 2 * r), A, false);
+    DrawPsFace(g, RectF(fx - d - r, fy - r, 2 * r, 2 * r), X, false);
+
+    const Color well = ps5 ? Rgb(8, 8, 10) : Rgb(10, 10, 12);
+    DrawPadStick(g, 118, top + 92, well);
+    DrawPadStick(g, 198, top + 92, well);
+    SolidBrush home(ps5 ? Rgb(60, 62, 70) : Rgb(34, 34, 40));
+    Pen homeRim(Rgb(150, 152, 160), 1.0f);
+    g.FillEllipse(&home, 151.0f, top + 84, 14.0f, 14.0f);
+    g.DrawEllipse(&homeRim, 151.0f, top + 84, 14.0f, 14.0f);
+    if (ps5)                                            // the DualSense mute button
+    {
+        GraphicsPath mute;
+        RoundRect(mute, RectF(149, top + 102, 18, 6), 3);
+        SolidBrush orange(Rgb(255, 140, 60));
+        g.FillPath(&orange, &mute);
+    }
+}
+
+// One key cap: lit red when a control is bound to it.
+void KeyCap(Graphics& g, RectF r, int vk, const std::wstring& label)
+{
+    if (keyboard_keys::Bound(vk)) { DrawKey(g, r, label, true, 3); return; }
+    GraphicsPath path;
+    RoundRect(path, r, 3);
+    LinearGradientBrush fill(PointF(0, r.Y), PointF(0, r.Y + r.Height), Rgb(78, 80, 88), Rgb(40, 40, 46));
+    g.FillPath(&fill, &path);
+    Pen edge(Rgb(14, 14, 18), 1.0f);
+    g.DrawPath(&edge, &path);
+    RectF text = r;
+    text.Inflate(-2.0f, -2.0f);
+    DrawLabel(g, label, text, Rgb(190, 192, 200), r.Height * 0.6f);
+}
+
+// A keyboard and mouse; the keys bound in Controller Setup light up.
+void DrawKeyboard(Graphics& g)
+{
+    const float oy = 22;
+    GraphicsPath board;
+    RoundRect(board, RectF(4, oy + 38, 246, 114), 8);
+    LinearGradientBrush boardFill(PointF(0, oy + 38), PointF(0, oy + 152), Rgb(58, 60, 68), Rgb(22, 22, 26));
+    g.FillPath(&boardFill, &board);
+    Pen boardEdge(Rgb(170, 174, 184), 2.0f);
+    g.DrawPath(&boardEdge, &board);
+
+    const char* rows[] = { "1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM" };
+    const float rowX[] = { 12, 18, 22, 48 };
+    for (int row = 0; row < 4; ++row)
+        for (int i = 0; rows[row][i]; ++i)
+        {
+            const wchar_t c = wchar_t(rows[row][i]);
+            KeyCap(g, RectF(rowX[row] + i * 20.0f, oy + 46 + row * 20.0f, 18, 18), int(c), std::wstring(1, c));
+        }
+    KeyCap(g, RectF(212, oy + 46, 32, 18), VK_BACK, L"BKSP");
+    KeyCap(g, RectF(202, oy + 86, 42, 18), VK_RETURN, L"ENTER");
+    KeyCap(g, RectF(12, oy + 106, 34, 18), VK_LSHIFT, L"SHIFT");
+    KeyCap(g, RectF(12, oy + 126, 30, 18), VK_LCONTROL, L"CTRL");
+    KeyCap(g, RectF(46, oy + 126, 24, 18), VK_LMENU, L"ALT");
+    KeyCap(g, RectF(74, oy + 126, 106, 18), VK_SPACE, L"SPACE");
+    KeyCap(g, RectF(206, oy + 106, 18, 18), VK_UP, ShortKey(VK_UP, 1));
+    KeyCap(g, RectF(186, oy + 126, 18, 18), VK_LEFT, ShortKey(VK_LEFT, 1));
+    KeyCap(g, RectF(206, oy + 126, 18, 18), VK_DOWN, ShortKey(VK_DOWN, 1));
+    KeyCap(g, RectF(226, oy + 126, 18, 18), VK_RIGHT, ShortKey(VK_RIGHT, 1));
+
+    RectF mouse(262, oy + 64, 46, 76);                  // the mouse: menus only, nothing to bind
+    GraphicsPath body;
+    body.AddEllipse(mouse);
+    LinearGradientBrush mouseFill(PointF(0, mouse.Y), PointF(0, mouse.Y + mouse.Height), Rgb(78, 80, 88), Rgb(22, 22, 26));
+    g.FillPath(&mouseFill, &body);
+    g.DrawPath(&boardEdge, &body);
+    Pen seam(Rgb(140, 144, 152), 1.0f);
+    g.DrawLine(&seam, mouse.X + 4, mouse.Y + 30, mouse.X + mouse.Width - 4, mouse.Y + 30);
+    g.DrawLine(&seam, mouse.X + mouse.Width / 2, mouse.Y + 2, mouse.X + mouse.Width / 2, mouse.Y + 30);
+    SolidBrush wheel(Rgb(170, 174, 184));
+    g.FillRectangle(&wheel, mouse.X + mouse.Width / 2 - 2, mouse.Y + 10, 4.0f, 12.0f);
+    Pen cord(Rgb(150, 154, 162), 1.6f);
+    g.DrawBezier(&cord, PointF(285, mouse.Y), PointF(285, oy + 30), PointF(250, oy + 20), PointF(230, oy + 38));
 }
 
 const wchar_t* PsName(Control c, bool ps5)
@@ -482,6 +670,27 @@ void Paint(Style style, uint8_t* rgba, uint32_t width, uint32_t height, uint32_t
     }
     std::fprintf(stderr, "[prompts] %s icons painted (%d)\n",
                  ps5 ? "PS5" : ps ? "PS4" : "keyboard", painted);
+}
+
+bool IsControllerAtlas(uint32_t format, uint32_t width, uint32_t height, bool tiled, const uint8_t* guest, size_t bytes)
+{
+    const size_t size = size_t(kAtlas / 4) * (kAtlas / 4) * 16;
+    if (format != kFmtDxt4_5 || width != kAtlas || height != kAtlas || !tiled || !guest || bytes < size) return false;
+    uint64_t h = 14695981039346656037ull;
+    for (size_t i = 0; i < size; ++i) { h ^= guest[i]; h *= 1099511628211ull; }
+    return h == kControllerHash;
+}
+
+void PaintController(Style style, uint8_t* rgba, uint32_t width, uint32_t height, uint32_t pitch)
+{
+    if (style == Style::Xbox || !rgba || width != 512 || height != 512 || pitch < width * 4) return;
+    StartGdiPlus();
+    PaintRect(rgba, pitch, kPadX, kPadY, kPadW, kPadH, [&](Graphics& g, RectF) {
+        if (style == Style::Keyboard) DrawKeyboard(g);
+        else if (style == Style::PlayStation4 || style == Style::PlayStation5) DrawPad(g, style == Style::PlayStation5);
+    });
+    std::fprintf(stderr, "[prompts] controller picture painted (%s)\n",
+                 style == Style::PlayStation5 ? "PS5" : style == Style::PlayStation4 ? "PS4" : "keyboard");
 }
 
 } // namespace button_prompts

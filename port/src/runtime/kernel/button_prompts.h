@@ -31,4 +31,11 @@ void DecodeBc2(const uint8_t* blocks, uint32_t blocksX, uint32_t blocksY, uint8_
 // Xbox leaves it as it is.
 void Paint(Style style, uint8_t* rgba, uint32_t width, uint32_t height, uint32_t pitch);
 
+// Controller Setup's controller atlas (DXT5 512x512, tiled), checked over its guest bytes.
+bool IsControllerAtlas(uint32_t format, uint32_t width, uint32_t height, bool tiled, const uint8_t* guest, size_t bytes);
+
+// Redraw the Xbox 360 pad in that atlas (RGBA8, 512x512) as `style`'s controller or a keyboard and
+// mouse with the bound keys lit. Xbox, and any other size, leaves it as it is.
+void PaintController(Style style, uint8_t* rgba, uint32_t width, uint32_t height, uint32_t pitch);
+
 } // namespace button_prompts

@@ -10,6 +10,7 @@
 //   [Game]
 //   InputDelay=0|1        (the game's 2-frame offline input delay: removed / original)
 //   KeyboardPlayer=0|1    (the keyboard: part of player 1's controller / a player of its own)
+//   UnlockAllItems=0|1    (every Customize item owned while on; the save's own items are kept)
 //   [Graphics]
 //   VSync=0|1  RenderScale=100|125|150|200  Upscaler=0|1  FsrMode=100|77|67|59|50
 //   AntiAliasing=0|1|2 (FXAA=0|1 before it)  Anisotropy=1|2|4|8|16  Sharpen=0..3
@@ -48,6 +49,8 @@ int g_customRollback = kMaxRollback;
 std::atomic<int> g_sharpness{ 0 }, g_antiAliasing{ 0 }, g_textureFilter{ 0 }, g_vsync{ 1 }, g_shadows{ 1 };
 // KEYBOARD PLAYER, read by the input poll thread every millisecond: lock-free too.
 std::atomic<int> g_keyboardPlayer{ 0 };
+// UNLOCK ALL ITEMS, read by the Customize item checks: lock-free too.
+std::atomic<int> g_unlockAllItems{ 0 };
 std::atomic<bool> g_loadedFlag{ false };
 
 void MirrorLocked()
@@ -111,6 +114,7 @@ void LoadLocked()
     }
     g_inputDelay = GetPrivateProfileIntA("Game", "InputDelay", 0, ini.c_str()) != 0;
     g_keyboardPlayer = GetPrivateProfileIntA("Game", "KeyboardPlayer", 0, ini.c_str()) != 0 ? 1 : 0;
+    g_unlockAllItems = GetPrivateProfileIntA("Game", "UnlockAllItems", 0, ini.c_str()) != 0 ? 1 : 0;
     const Graphics d;
     Graphics& g = g_graphics;
     g.vsync = GetPrivateProfileIntA("Graphics", "VSync", d.vsync, ini.c_str()) != 0;
@@ -169,6 +173,7 @@ void SaveLocked()
     WritePrivateProfileStringA("Display", "Shadows", g_shadows.load() ? "1" : "0", ini.c_str());
     WritePrivateProfileStringA("Game", "InputDelay", g_inputDelay ? "1" : "0", ini.c_str());
     WritePrivateProfileStringA("Game", "KeyboardPlayer", g_keyboardPlayer.load() ? "1" : "0", ini.c_str());
+    WritePrivateProfileStringA("Game", "UnlockAllItems", g_unlockAllItems.load() ? "1" : "0", ini.c_str());
     const Graphics& g = g_graphics;
     auto put = [&](const char* key, int v) {
         std::snprintf(value, sizeof(value), "%d", v);
@@ -413,6 +418,8 @@ void SetAntiAliasing(int mode) { Graphics g = GetGraphics(); g.antiAliasing = mo
 void SetTextureFilter(int mode) { Graphics g = GetGraphics(); g.anisotropy = std::clamp(mode, 0, kMaxTextureFilter); SetGraphics(g); }
 bool GetKeyboardPlayer() { return GetAtomic(g_keyboardPlayer) != 0; }
 void SetKeyboardPlayer(bool separate) { SetAtomic(g_keyboardPlayer, separate ? 1 : 0, 0, 1, "keyboard player (1 = separate)"); }
+bool GetUnlockAllItems() { return GetAtomic(g_unlockAllItems) != 0; }
+void SetUnlockAllItems(bool on) { SetAtomic(g_unlockAllItems, on ? 1 : 0, 0, 1, "unlock all items"); }
 void SetVSync(bool on) { Graphics g = GetGraphics(); g.vsync = on; SetGraphics(g); }
 void SetShadows(bool on) { Graphics g = GetGraphics(); g.shadows = on; SetGraphics(g); }
 

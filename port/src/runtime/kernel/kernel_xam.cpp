@@ -759,6 +759,7 @@ static KeyboardPad ReadKeyboardPad()
 }
 
 constexpr DWORD kXInputPads = 4, kKeyboardPad = kXInputPads + ps_pads::Slots, kHostPads = kKeyboardPad + 1;
+std::atomic<uint16_t> g_physicalButtons{0};
 
 struct PadPollState
 {
@@ -1008,6 +1009,20 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
         if (polling.physicalConnected[kKeyboardPad]) hostCaps[kKeyboardPad] = PlayStationCaps();
     }
 
+    // The lounge owns WASD directly; expose pads before keyboard/script buttons are merged.
+    uint16_t physicalButtons = 0;
+    for (DWORD i = 0; i < kKeyboardPad; ++i)
+    {
+        if (!polling.physicalConnected[i]) continue;
+        const XINPUT_GAMEPAD& pad = sampled[i].Gamepad;
+        physicalButtons |= pad.wButtons;
+        if (pad.sThumbLY > 16000) physicalButtons |= 0x0001;
+        if (pad.sThumbLY < -16000) physicalButtons |= 0x0002;
+        if (pad.sThumbLX < -16000) physicalButtons |= 0x0004;
+        if (pad.sThumbLX > 16000) physicalButtons |= 0x0008;
+    }
+    g_physicalButtons.store(physicalButtons);
+
     auto claimed = [&](int user) {
         for (DWORD j = 0; j < kHostPads; ++j)
             if (polling.guestOf[j] == user) return true;
@@ -1148,6 +1163,12 @@ int64_t NowMs()
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 } // namespace
+
+uint16_t HostPhysicalControllerButtons()
+{
+    EnsurePadThread();
+    return g_physicalButtons.load();
+}
 
 // The system UI's view of the controllers (sys_ui.h): every connected pad's buttons (keyboard
 // included) with the left stick as a D-pad - read even while the game is given neutral input.

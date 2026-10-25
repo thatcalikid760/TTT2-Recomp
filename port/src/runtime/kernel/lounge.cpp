@@ -2,6 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "lounge.h"
+#include "lounge_view.h"
 #include "menu_host.h"
 #include "net_transport.h"
 #include "profiles.h"
@@ -536,6 +537,11 @@ struct Ui
     int64_t repeatAt = 0;
     std::atomic<uint16_t> mask{ 0xFFFF };
     bool typing = false;
+    bool grid = true, overlayInput = false;
+    int selected = 0, seatCab = -1, seatSlot = -1;
+    int64_t viewTickMs = 0;
+    uint32_t keys = 0;
+    lounge_view::Local local;
     // the page's menu stays inactive after a window of ours closed over it (it waits for an answer of its own
     // window - MEASURED 2026-10-24: no cursor moves after LOUNGE CHAT): shown again, it takes input again
     std::atomic<bool> reshow{ false };
@@ -549,7 +555,7 @@ std::string Two(int i) { return std::string(i < 10 ? "0" : "") + std::to_string(
 
 uint16_t Pressed()
 {
-    const uint16_t now = HostControllerButtons();
+    const uint16_t now = lounge_view::Available() && ui.walk == Walk::None ? HostPhysicalControllerButtons() : HostControllerButtons();
     uint16_t pressed = now & ~ui.prev;
     const uint16_t dirs = now & (kUp | kDown);
     const int64_t t = NowMs();
@@ -654,6 +660,168 @@ void TypeChat()
     if (!SysUiShowKeyboard(std::move(kb))) ui.typing = false;
 }
 
+// The presenter reads copies only; requests and guest menu calls stay on the game thread.
+lounge_view::View LoungeView()
+{
+    lounge_view::View view;
+    view.visible = ui.pageUp && ui.walk == Walk::None && !ui.typing && !SysUiBoxBusy();
+    view.grid = ui.grid;
+    view.selected = ui.selected;
+    view.local = ui.local;
+    std::lock_guard l(g_m);
+    view.connected = g.phase == Phase::In;
+    view.host = g.host;
+    view.members = int(g.members.size());
+    view.connection = view.connected ? "SHARED CABINETS" : g.phase == Phase::Off ?
+        (g.closedWhy.empty() ? "CLOSED / ENTER TO REJOIN" : g.closedWhy + " / ENTER TO REJOIN") : "SEARCHING FOR LOUNGE...";
+    if (!g.chat.empty()) view.chat = g.chat.back().name + ": " + g.chat.back().text;
+    for (int i = 0; i < kCabinets; ++i)
+    {
+        const Cabinet& c = g.cab[i];
+        auto& card = view.cards[i];
+        const int seated = int(c.seat[0] != 0) + int(c.seat[1] != 0);
+        card.status = lounge_view::Status(c.state == Playing, seated, c.ready[0], c.ready[1]);
+        for (int s = 0; s < 2; ++s) { card.players[s] = c.seat[s] ? NameOf(c.seat[s]) : ""; card.ready[s] = c.ready[s]; }
+        card.mine = SeatOf(c, Self());
+        card.queue = int(c.queue.size());
+        card.last = c.last;
+        for (size_t q = 0; q < c.queue.size(); ++q)
+        {
+            if (q < 3) card.next[q] = NameOf(c.queue[q]);
+            if (c.queue[q] == Self()) card.queued = int(q + 1);
+        }
+    }
+    return view;
+}
+
+void CabinetAction(int i, bool leave, bool queueOnly = false)
+{
+    if (i < 0 || i >= kCabinets) return;
+    uint8_t action;
+    {
+        std::lock_guard l(g_m);
+        if (g.phase != Phase::In) return;
+        // An active participant cannot acquire a second cabinet through the new grid.
+        for (const Cabinet& c : g.cab)
+            if (c.state == Playing && SeatOf(c, Self()) >= 0) return;
+        const int mine = SeatOf(g.cab[i], Self());
+        if (queueOnly && mine >= 0) return;
+        action = leave ? Leave : mine >= 0 ? Ready : Sit;
+    }
+    Writer w(Act);
+    w.U8(uint8_t(i)); w.U8(action);
+    Request(w);
+}
+
+void ViewFrame(PPCContext& ctx, uint8_t* base, uint16_t pressed, bool idle)
+{
+    enum : uint32_t { UpKey=1, DownKey=2, LeftKey=4, RightKey=8, AcceptKey=16, BackKey=32,
+        TabKey=64, LeaveKey=128, ChatKey=256, InteractKey=512, QueueKey=1024, EmoteKey=2048 };
+    DWORD pid = 0;
+    if (HWND front = GetForegroundWindow()) GetWindowThreadProcessId(front, &pid);
+    const bool focused = pid == GetCurrentProcessId();
+    auto down = [&](int key) { return focused && (GetAsyncKeyState(key) & 0x8000) != 0; };
+    const int vk[] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE, VK_TAB, 'X', 'C', 'E', 'Q', 'G'};
+    uint32_t held = 0;
+    for (int i = 0; i < 12; ++i) if (down(vk[i])) held |= 1u << i;
+    const uint32_t hit = ui.overlayInput ? held & ~ui.keys : 0;
+    ui.keys = held;
+    const int64_t now = NowMs();
+    const float dt = ui.viewTickMs ? float(now - ui.viewTickMs) / 1000.0f : 0;
+    ui.viewTickMs = now;
+    if (!ui.overlayInput) pressed = 0;
+    ui.overlayInput = idle && focused;
+    ui.mask = idle ? 0 : uint16_t(0xFFFF);
+    if (!idle || !focused) return;
+    auto view = LoungeView();
+    int seatCab = -1, seatSlot = -1;
+    for (int i = 0; i < kCabinets; ++i)
+        if (view.cards[i].mine >= 0) { seatCab = i; seatSlot = view.cards[i].mine; break; }
+    if (seatCab >= 0)
+    {
+        ui.local.bench = -1;
+        ui.local.position = lounge_view::SeatPosition(seatCab, seatSlot);
+        ui.local.yaw = lounge_view::CabinetFacing(seatCab) + lounge_view::Pi;
+    }
+    else if (ui.seatCab >= 0)
+    {
+        ui.local.position.y = 0;
+        ui.local.position.z += (ui.seatCab / 5) % 2 == 0 ? -.8f : .8f;
+    }
+    ui.seatCab = seatCab; ui.seatSlot = seatSlot;
+    const bool back = (hit & BackKey) || (pressed & kB);
+    if ((hit & TabKey) || (pressed & 0x8000)) { ui.grid = !ui.grid; return; }
+    if (back)
+    {
+        if (!ui.grid) { ui.grid = true; return; }
+        menu_host::PlaySound(ctx, base, menu_host::SoundCancel);
+        lounge_view::Publish({});
+        menu_host::ShowFrame(ctx, base, kOnlineMenu);
+        return;
+    }
+    if ((hit & ChatKey) || (pressed & 0x0200))
+    {
+        if (view.connected) TypeChat();
+        return;
+    }
+    const bool accept = (hit & AcceptKey) || (pressed & kA);
+    if (!view.connected)
+    {
+        if (accept) Enter();
+        return;
+    }
+    if (ui.grid)
+    {
+        int dx = int(bool((hit & RightKey) || (pressed & 0x0008))) - int(bool((hit & LeftKey) || (pressed & 0x0004)));
+        int dy = int(bool((hit & DownKey) || (pressed & kDown))) - int(bool((hit & UpKey) || (pressed & kUp)));
+        ui.selected = lounge_view::Select(ui.selected, dx, dy);
+        if (accept) CabinetAction(ui.selected, false);
+        else if ((hit & LeaveKey) || (pressed & kX)) CabinetAction(ui.selected, true);
+        return;
+    }
+    ui.local.cameraYaw += (float(down(VK_RIGHT))-float(down(VK_LEFT))) * (std::min)(dt, .1f) * 1.8f;
+    const uint16_t buttons = HostPhysicalControllerButtons();
+    float x = float(down('D') || (buttons & 0x0008)) - float(down('A') || (buttons & 0x0004));
+    float z = float(down('W') || (buttons & kUp)) - float(down('S') || (buttons & kDown));
+    if (x != 0 || z != 0)
+    {
+        if (seatCab >= 0)
+        {
+            const auto& c = view.cards[seatCab];
+            if (c.status != lounge_view::CabinetStatus::Playing && (c.players[0].empty() || c.players[1].empty()))
+                CabinetAction(seatCab, true);
+            return;
+        }
+        if (ui.local.bench >= 0)
+        {
+            ui.local.position.x += ui.local.bench < 3 ? 1.1f : -1.1f;
+            ui.local.position.y = 0;
+            ui.local.bench = -1;
+        }
+        lounge_view::Move(ui.local, x, z, down(VK_SHIFT), dt);
+    }
+    ui.local.emote = (std::max)(0.0f, ui.local.emote - dt);
+    if ((hit & EmoteKey) && seatCab < 0 && ui.local.bench < 0) ui.local.emote = 2.5f;
+    int nearest = lounge_view::NearestCabinet(ui.local.position);
+    if (nearest >= 0) ui.selected = nearest;
+    if ((hit & LeaveKey) || (pressed & kX)) { CabinetAction(ui.selected, true); return; }
+    if ((hit & QueueKey) && nearest >= 0) CabinetAction(nearest, false, true);
+    if ((hit & InteractKey) || accept)
+    {
+        if (nearest >= 0) CabinetAction(nearest, false);
+        else if (seatCab < 0)
+        {
+            const int bench = lounge_view::NearestBench(ui.local.position);
+            if (bench >= 0)
+            {
+                ui.local.bench = bench;
+                ui.local.position = lounge_view::BenchPosition(bench);
+                ui.local.yaw = bench < 3 ? lounge_view::Pi/2 : -lounge_view::Pi/2;
+            }
+        }
+    }
+}
+
 void PageFrame(PPCContext& ctx, uint8_t* base)
 {
     if (ui.settle > 0) { --ui.settle; Pressed(); return; }
@@ -668,6 +836,12 @@ void PageFrame(PPCContext& ctx, uint8_t* base)
     const uint16_t pressed = Pressed();
     const int c = menu_host::Cursor(ctx, base, kMenu);
     const bool idle = !ui.typing && !SysUiBoxBusy() && !menu_host::WindowShowing(ctx, base) && ui.walk == Walk::None;
+    if (lounge_view::Available() && ui.walk == Walk::None)
+    {
+        ViewFrame(ctx, base, pressed, idle);
+        return;
+    }
+    ui.overlayInput = false;
     if (idle)
     {
         if ((pressed & kDown) && c == kRows - 1 && ui.top + kRows < kEntries) { ++ui.top; menu_host::PlaySound(ctx, base, menu_host::SoundCursor); }
@@ -1022,6 +1196,12 @@ void Frame(PPCContext& ctx, uint8_t* base)
             ui.drawn = false;
             ui.top = 0;
             ui.prev = HostControllerButtons();           // the A that opened the page is not ours
+            ui.overlayInput = false;
+            ui.viewTickMs = 0;
+            {
+                std::lock_guard l(g_m);
+                if (g.phase == Phase::Off) { ui.local = {}; ui.grid = true; ui.selected = 0; ui.seatCab = -1; }
+            }
             Enter();
         }
         PageFrame(ctx, base);
@@ -1036,6 +1216,14 @@ void Frame(PPCContext& ctx, uint8_t* base)
     // out of ONLINE MODE altogether
     if (frame == "FrameMainMenu" && ui.walk == Walk::None) LeaveLounge();
     Upkeep();
+    if (!ui.pageUp || ui.walk != Walk::None)
+        lounge_view::Publish({});
+    else
+    {
+        auto view = LoungeView();
+        view.visible = view.visible && !menu_host::WindowShowing(ctx, base) && frame == reported && ui.settle == 0;
+        lounge_view::Publish(view);
+    }
 }
 
 uint16_t GameButtonMask() { return ui.mask.load(); }

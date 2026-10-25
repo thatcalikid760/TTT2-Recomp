@@ -58,7 +58,7 @@ enable_language(C)
 add_subdirectory(third_party/ffmpeg_xma)
 
 # The runtime executable: minimal host (memory, function table, entry) + kernel import stubs.
-file(GLOB RUNTIME_KERNEL "${CMAKE_SOURCE_DIR}/src/runtime/kernel/*.cpp")
+file(GLOB RUNTIME_KERNEL CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/runtime/kernel/*.cpp")
 add_executable(tekken_recomp
     "${CMAKE_SOURCE_DIR}/src/runtime/main.cpp"
     "${CMAKE_SOURCE_DIR}/src/runtime/runtime_math.cpp"

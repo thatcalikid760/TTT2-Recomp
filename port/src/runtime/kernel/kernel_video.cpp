@@ -87,6 +87,7 @@ static uint32_t PhysToGuest(uint32_t addr)
     return (addr && addr < 0x20000000u) ? (addr | 0xA0000000u) : addr;
 }
 
+
 // ===================== Present pass: host window + frontbuffer blit =====================
 // The swap packet carries the frontbuffer TEXTURE FETCH BLOCK; we decode the surface
 // address from it and show the surface in a host window (and periodically dump a BMP
@@ -800,6 +801,64 @@ static void HwPresentFrame(uint32_t fb)
 static uint32_t g_opcodeSeen[128];
 static std::atomic<uint32_t> g_ringRptr{0}; // CP owns writes; vblank observes ring progress
 static uint32_t g_regFile[0x8000];     // GPU register file (word index)
+
+// ---- bone capture (Fighting Lounge 3D research, port/tools/lounge_re): TTT2_BONE_CAPTURE=<file> with
+// TTT2_BONE_SIGS=<file> (one line per mesh: 32 hex digits, the first 16 bytes of its vertex data as the model file
+// has them). A draw whose vertex fetch buffer starts with one of them appends a record to the capture file: u32 present
+// count, u32 signature number, u32 fetch slot, then the 256 vertex shader float constants (c0..c255, 4 KB). The
+// skinned meshes' bone matrices are expected among them.
+static std::atomic<uint32_t> g_presentCount{ 0 };
+static void BoneCaptureDraw()
+{
+    static FILE* out = nullptr;
+    static std::vector<std::vector<uint8_t>> sigs;
+    static bool tried = false;
+    static uint32_t records = 0;
+    if (!tried)
+    {
+        tried = true;
+        const char* o = std::getenv("TTT2_BONE_CAPTURE");
+        const char* s = std::getenv("TTT2_BONE_SIGS");
+        if (!o || !s) return;
+        if (FILE* f = std::fopen(s, "r"))
+        {
+            char line[128];
+            while (std::fgets(line, sizeof(line), f))
+            {
+                std::vector<uint8_t> sig;
+                for (int k = 0; k + 1 < 64 && line[k] && line[k + 1] && sig.size() < 16; k += 2)
+                {
+                    unsigned v = 0;
+                    if (std::sscanf(line + k, "%2x", &v) != 1) break;
+                    sig.push_back(uint8_t(v));
+                }
+                if (sig.size() == 16) sigs.push_back(std::move(sig));
+            }
+            std::fclose(f);
+        }
+        out = std::fopen(o, "wb");
+        std::fprintf(stderr, "[bones] capture to %s: %zu signatures\n", o, sigs.size());
+    }
+    if (!out || sigs.empty() || records > 200000) return;
+    for (uint32_t slot = 0; slot < 96; ++slot)
+    {
+        const uint32_t* c = &g_regFile[0x4800 + slot * 2];
+        if ((c[0] & 3) != 3) continue;
+        const uint32_t addr = PhysToGuest(c[0] & ~3u);
+        if (!addr) continue;
+        uint8_t head[16];
+        for (int k = 0; k < 16; ++k) head[k] = g_base[addr + k];
+        for (uint32_t s = 0; s < sigs.size(); ++s)
+        {
+            if (std::memcmp(head, sigs[s].data(), 16) != 0) continue;
+            const uint32_t hdr[3] = { g_presentCount.load(), s, slot };
+            std::fwrite(hdr, 4, 3, out);
+            std::fwrite(&g_regFile[0x4000], 4, 256 * 4, out);
+            if (++records % 64 == 0) std::fflush(out);
+            return;
+        }
+    }
+}
 
 // ---- GPU milestone 1: EDRAM fast-clear + resolve-to-memory (CPU-only). With no draws
 // rasterized yet, EDRAM content per color_base is fully described by the last clear, so we
@@ -2245,6 +2304,7 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
                 uint32_t dprim = init & 0x3F;
                 ++g_primSeen[dprim];
                 if (dprim != 1 && dprim != 8 && dprim != 4) DumpDrawState(init, op);
+                if (dprim != 1 && dprim != 8 && dprim != 4) BoneCaptureDraw();
                 if (dprim != 1 && dprim != 8 && dprim != 4 && CwOn())
                 {
                     --g_cwBudget;
@@ -3031,6 +3091,7 @@ void RollbackResimTime(int id, double ms);
 PPC_FUNC(__imp__VdSwap)
 {
     KTrace("VdSwap");
+    g_presentCount.fetch_add(1);                   // the bone capture's frame number
     struct SwapTimer
     {
         std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();

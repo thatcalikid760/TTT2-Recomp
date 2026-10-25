@@ -468,11 +468,20 @@ void Edit(Doc& d, const PcLists& lists, std::string* note)
     Doc updates = d;
     try
     {
-        AddHostPage(updates, lastIcon, 9, "UPDATES", "Check for a newer version of the game and install it.", "icon_s_046",
-                    "FrameUpdates");
+        lastIcon = AddHostPage(updates, lastIcon, 9, "UPDATES", "Check for a newer version of the game and install it.", "icon_s_046",
+                               "FrameUpdates");
         d = std::move(updates);
     }
     catch (const Fail& e) { if (note) *note += std::string(note->empty() ? "" : "; ") + "Options UPDATES left out: " + e.what(); }
+    // And UNLOCK ALL ITEMS (no page: menu_ext.cpp asks YES / NO and comes back to Options).
+    Doc unlockAll = d;
+    try
+    {
+        AddHostPage(unlockAll, lastIcon, 10, "UNLOCK ALL ITEMS", "Every Customize item, free. Your save is not changed.",
+                    "icon_s_046", "FrameUnlockAllItems");
+        d = std::move(unlockAll);
+    }
+    catch (const Fail& e) { if (note) *note += std::string(note->empty() ? "" : "; ") + "Options UNLOCK ALL ITEMS left out: " + e.what(); }
     AddSystemFrames(d);
     // KEYBOARD edits a copy: if the screen is not as measured, only that part is left out.
     Doc keyboard = d;
