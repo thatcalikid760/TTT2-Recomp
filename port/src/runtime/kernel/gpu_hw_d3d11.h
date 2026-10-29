@@ -32,6 +32,9 @@
 #include <dxgi1_5.h>
 #include <dwmapi.h>
 #pragma comment(lib, "dwmapi.lib")
+#include <tlhelp32.h>                 // frame cost: CPU use per thread
+#include <psapi.h>                    // K32GetMappedFileNameW (a kernel32 export): thread start modules
+#include <winver.h>                   // Initialize: VS_FIXEDFILEINFO of the loaded d3d11.dll / dxgi.dll
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <array>
@@ -54,6 +57,7 @@
 
 extern void (*g_gpuFrameNote)(const char*);   // gpu_render.cpp: the frame log (framelog.trigger)
 extern HANDLE g_mainThreadHandle;               // main.cpp: the game's main thread (frame cost reports)
+namespace hitch { uint32_t GuestEntryOfThread(DWORD tid); }   // diag_hooks.cpp: labels guest threads in the frame cost report
 void GpuNoteMemory(int kind, uint32_t addr, uint32_t bytes);   // kernel_video.cpp (TTT2_RB_GPUMEM diagnostics)
 bool DirtyMeasureOn();                          // rollback_probe.cpp: the write-watch bits are its
 void WriteWatchPublish(int self, const PVOID* pages, size_t count);                          // write_watch.cpp
@@ -308,6 +312,47 @@ inline D3D11_SAMPLER_DESC SamplerDesc(const uint32_t info[4], uint32_t mip = 0, 
 class Backend
 {
     struct ColorSurface;
+    // "<path> (<file version>)" of a loaded DLL, plus a note when it is not the one in the Windows
+    // system directory (a replacement such as DXVK placed next to the exe). version.dll is loaded
+    // from System32 here rather than linked: a static VERSION.dll import is resolved next to the
+    // exe first, so a DLL dropped there would be loaded into the game.
+    static void DescribeLoadedDll(const wchar_t* dll, char* out, size_t cap)
+    {
+        const HMODULE m = GetModuleHandleW(dll);
+        wchar_t path[MAX_PATH];
+        const DWORD len = m ? GetModuleFileNameW(m, path, MAX_PATH) : 0;
+        if (!len || len >= MAX_PATH) { std::snprintf(out, cap, "(not loaded)"); return; }
+        char version[48] = "version unknown";
+        using SizeFn = DWORD(WINAPI*)(LPCWSTR, LPDWORD);
+        using InfoFn = BOOL(WINAPI*)(LPCWSTR, DWORD, DWORD, LPVOID);
+        using QueryFn = BOOL(WINAPI*)(LPCVOID, LPCWSTR, LPVOID*, PUINT);
+        if (const HMODULE ver = LoadLibraryExW(L"version.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32))
+        {
+            const auto getSize = reinterpret_cast<SizeFn>(reinterpret_cast<void*>(GetProcAddress(ver, "GetFileVersionInfoSizeW")));
+            const auto getInfo = reinterpret_cast<InfoFn>(reinterpret_cast<void*>(GetProcAddress(ver, "GetFileVersionInfoW")));
+            const auto query = reinterpret_cast<QueryFn>(reinterpret_cast<void*>(GetProcAddress(ver, "VerQueryValueW")));
+            DWORD ignored = 0;
+            if (getSize && getInfo && query)
+                if (const DWORD size = getSize(path, &ignored))
+                {
+                    std::vector<uint8_t> data(size);
+                    VS_FIXEDFILEINFO* fi = nullptr;
+                    UINT fiLen = 0;
+                    if (getInfo(path, 0, size, data.data()) &&
+                        query(data.data(), L"\\", reinterpret_cast<void**>(&fi), &fiLen) && fi && fiLen >= sizeof(*fi))
+                        std::snprintf(version, sizeof(version), "%u.%u.%u.%u", unsigned(HIWORD(fi->dwFileVersionMS)), unsigned(LOWORD(fi->dwFileVersionMS)),
+                                      unsigned(HIWORD(fi->dwFileVersionLS)), unsigned(LOWORD(fi->dwFileVersionLS)));
+                }
+            FreeLibrary(ver);
+        }
+        wchar_t sys[MAX_PATH];
+        const UINT sysLen = GetSystemDirectoryW(sys, MAX_PATH);
+        const bool windowsOne = sysLen && sysLen < MAX_PATH && len > sysLen && _wcsnicmp(path, sys, sysLen) == 0 &&
+                                (path[sysLen] == L'\\' || path[sysLen] == L'/');
+        char narrow[MAX_PATH * 2] = {};
+        WideCharToMultiByte(CP_UTF8, 0, path, -1, narrow, sizeof(narrow) - 1, nullptr, nullptr);
+        std::snprintf(out, cap, "%s (%s)%s", narrow, version, windowsOne ? "" : " - not the Windows one (a replacement such as DXVK)");
+    }
 public:
     // ----------------------------------------------------------------- lifetime
     void Initialize()
@@ -333,6 +378,14 @@ public:
         WideCharToMultiByte(CP_UTF8, 0, adesc.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
         std::fprintf(stderr, "[gpu-hw] active on %s (feature level %X), mode=%s\n", name, (unsigned)actual,
                      RequestedMode() == Mode::Compare ? "compare" : "on");
+        // Which d3d11.dll / dxgi.dll the process actually loaded: issue #13's reporter had installed
+        // DXVK at some point, and from the log we could not tell whether it was the one running.
+        {
+            char d3d11[MAX_PATH * 2 + 128], dxgiDll[MAX_PATH * 2 + 128];
+            DescribeLoadedDll(L"d3d11.dll", d3d11, sizeof(d3d11));
+            DescribeLoadedDll(L"dxgi.dll", dxgiDll, sizeof(dxgiDll));
+            std::fprintf(stderr, "[gpu-hw] d3d11.dll %s; dxgi.dll %s\n", d3d11, dxgiDll);
+        }
         ComPtr<ID3D11Device5> device5;
         const char* fenceEnv = std::getenv("TTT2_READBACK_FENCE");
         if (!(fenceEnv && *fenceEnv == '0') && SUCCEEDED(device_.As(&device5)) && SUCCEEDED(context_.As(&context4_)) &&
@@ -4655,6 +4708,7 @@ private:
         FILETIME c, e, k, u;
         GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
         const uint64_t proc = (uint64_t(k.dwHighDateTime) << 32 | k.dwLowDateTime) + (uint64_t(u.dwHighDateTime) << 32 | u.dwLowDateTime);
+        double threadTscPerMs = 0, processCores = 0;   // for ReportThreadCpu (0: nothing to report this window)
         if (costTsc_ && presents)
         {
             const double tscPerMs = double(tsc - costTsc_) / (seconds * 1000.0);
@@ -4669,9 +4723,146 @@ private:
                          "cpu per frame: game main thread %.2f ms, command processor %.2f ms; process %.2f cores\n",
                          n ? sum / double(n) : 0.0, n ? gpuFrameMs_[n / 2] : 0.0f, n ? gpuFrameMs_[n * 95 / 100] : 0.0f, n ? gpuFrameMs_[n - 1] : 0.0f, n,
                          mainMs, cpMs, cores);
+            threadTscPerMs = tscPerMs; processCores = cores;
         }
+        ReportThreadCpu(seconds, threadTscPerMs, processCores);
         gpuFrameMs_.clear();
         costCpCycles_ = cp; costMainCycles_ = mainCycles; costTsc_ = tsc; costProc100ns_ = proc;
+    }
+
+    // The busiest threads over the same window (after the frame cost line). Issue #13: the process
+    // used 7+ cores from the main menu on while the main thread and the command processor used well
+    // under one, and the thread dump only showed RIPs in some DLL outside the exe - this names the
+    // threads (guest entry, or the module their start address is in) and their share.
+    // Free when quiet: below one core for the whole process there is no thread snapshot at all (it
+    // lists every thread on the system, and this runs under g_backendMutex) and the start counts are
+    // dropped. The first busy window only takes the start counts; the next one prints.
+    std::unordered_map<DWORD, uint64_t> threadCycles_;   // tid -> QueryThreadCycleTime at the last report
+    struct OwnedHandle
+    {
+        HANDLE h;
+        explicit OwnedHandle(HANDLE v) : h(v) {}
+        OwnedHandle(const OwnedHandle&) = delete;
+        OwnedHandle& operator=(const OwnedHandle&) = delete;
+        ~OwnedHandle() { if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+    };
+    void ReportThreadCpu(double seconds, double tscPerMs, double processCores) noexcept
+    {
+        try
+        {
+            if (!(tscPerMs > 0 && seconds > 0 && processCores >= 1.0)) { threadCycles_.clear(); return; }
+            const bool report = !threadCycles_.empty();
+            const DWORD pid = GetCurrentProcessId();
+            const OwnedHandle snap{ CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+            if (snap.h == INVALID_HANDLE_VALUE) return;
+            struct Busy { DWORD tid; double cores; };
+            std::vector<Busy> busy;
+            std::unordered_map<DWORD, uint64_t> now;
+            THREADENTRY32 te{};
+            te.dwSize = sizeof(te);
+            for (BOOL ok = Thread32First(snap.h, &te); ok; ok = Thread32Next(snap.h, &te))
+            {
+                if (te.th32OwnerProcessID != pid) continue;
+                const DWORD tid = te.th32ThreadID;
+                const auto it = threadCycles_.find(tid);
+                ULONG64 cycles = 0;
+                BOOL got = FALSE;
+                {
+                    const OwnedHandle h{ OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid) };
+                    got = h.h && QueryThreadCycleTime(h.h, &cycles);
+                }
+                if (!got)
+                {
+                    // Keep its start count, or the next window would count its whole lifetime.
+                    if (it != threadCycles_.end()) now[tid] = it->second;
+                    continue;
+                }
+                now[tid] = cycles;
+                if (!report) continue;
+                // A thread not in the map started during this window: all its cycles are this window's.
+                // A reused tid counts from 0 as well.
+                const uint64_t from = it != threadCycles_.end() && it->second <= cycles ? it->second : 0;
+                busy.push_back({ tid, double(cycles - from) / tscPerMs / (seconds * 1000.0) });
+            }
+            threadCycles_.swap(now);                       // threads that ended drop out
+            if (!report || busy.empty()) return;
+            std::sort(busy.begin(), busy.end(), [](const Busy& a, const Busy& b) { return a.cores > b.cores; });
+            const DWORD mainTid = g_mainThreadHandle ? GetThreadId(g_mainThreadHandle) : 0, cpTid = GetCurrentThreadId();
+            std::string line;
+            double other = 0;
+            int shown = 0;
+            for (const Busy& b : busy)
+            {
+                if (shown >= 6 || b.cores < 0.05) { other += b.cores; continue; }
+                char item[192];
+                std::snprintf(item, sizeof(item), "%s%lu %s %.2f", shown ? ", " : "", (unsigned long)b.tid,
+                              ThreadLabel(b.tid, mainTid, cpTid).c_str(), b.cores);
+                line += item;
+                ++shown;
+            }
+            if (shown) std::fprintf(stderr, "[gpu-hw]   cpu by thread: %s (other %.2f)\n", line.c_str(), other);
+        }
+        catch (...) {}
+    }
+    // main / cp / guest <entry> / the module of the thread's start address ("host" for the exe),
+    // plus its description (SetThreadDescription) when it has one. The module is found with
+    // VirtualQuery + the mapped file name, not GetModuleHandleExW / GetModuleFileNameW: those take
+    // the loader lock, and this runs under g_backendMutex while some thread may be inside a DLL load.
+    static std::string ThreadLabel(DWORD tid, DWORD mainTid, DWORD cpTid)
+    {
+        if (tid == mainTid) return "main";
+        if (tid == cpTid) return "cp";
+        char text[160];
+        if (const uint32_t entry = hitch::GuestEntryOfThread(tid))
+        {
+            std::snprintf(text, sizeof(text), "guest %08X", entry);
+            return text;
+        }
+        // Looked up by name: no DDK header for NtQueryInformationThread, and GetThreadDescription
+        // is missing before Windows 10 1607.
+        using NtQueryInformationThreadFn = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+        using GetThreadDescriptionFn = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+        static const auto ntQuery = reinterpret_cast<NtQueryInformationThreadFn>(
+            reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread")));
+        static const auto getDescription = reinterpret_cast<GetThreadDescriptionFn>(
+            reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription")));
+        static const HMODULE exe = GetModuleHandleW(nullptr);
+        const OwnedHandle h{ OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid) };
+        if (!h.h) return "unknown";
+        char module[160] = "unknown";
+        void* start = nullptr;
+        constexpr ULONG ThreadQuerySetWin32StartAddress = 9;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (ntQuery && ntQuery(h.h, ThreadQuerySetWin32StartAddress, &start, sizeof(start), nullptr) >= 0 && start &&
+            VirtualQuery(start, &mbi, sizeof(mbi)) && mbi.Type == MEM_IMAGE && mbi.AllocationBase)
+        {
+            wchar_t path[MAX_PATH];
+            const DWORD len = mbi.AllocationBase == exe ? 0
+                : K32GetMappedFileNameW(GetCurrentProcess(), mbi.AllocationBase, path, MAX_PATH);
+            if (mbi.AllocationBase == exe) std::snprintf(module, sizeof(module), "host");
+            else if (len && len < MAX_PATH)
+            {
+                path[len] = 0;                             // a truncated name may come back unterminated
+                const wchar_t* name = path;
+                for (const wchar_t* q = path; *q; ++q) if (*q == L'\\' || *q == L'/') name = q + 1;
+                if (!WideCharToMultiByte(CP_UTF8, 0, name, -1, module, sizeof(module) - 1, nullptr, nullptr))
+                    std::snprintf(module, sizeof(module), "unknown");
+                module[sizeof(module) - 1] = 0;
+            }
+        }
+        // The description is copied out and freed before any std::string work (which may throw).
+        char description[160] = "";
+        PWSTR wide = nullptr;
+        if (getDescription && SUCCEEDED(getDescription(h.h, &wide)) && wide)
+        {
+            if (*wide && !WideCharToMultiByte(CP_UTF8, 0, wide, -1, description, sizeof(description) - 1, nullptr, nullptr))
+                description[0] = 0;
+            description[sizeof(description) - 1] = 0;
+            LocalFree(wide);
+        }
+        std::string label = module;
+        if (*description) label += std::string(" \"") + description + "\"";
+        return label;
     }
 
     void MaybeReportStats()

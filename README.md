@@ -66,13 +66,22 @@
 > [!NOTE]
 > **Antivirus warnings.** `ttt2_setup.exe` is not code-signed (certificates cost money), and it unpacks and rebuilds the game's files on your PC, so a few antivirus engines flag it on heuristics ("ML score", generic "Malware" names). On VirusTotal it's typically 2 or 3 engines out of about 70. Every release is built from the source in this repo; if you'd rather not trust the download, build it yourself with [BUILDING.md](BUILDING.md).
 
-## What's new in 0.2.7
+## What's new in 0.2.8
 
-- **Controller vibration works.** Xbox / XInput controllers and PS4 / PS5 controllers rumble in matches like on the console (#12). Turn it off in the game's Options if you don't want it.
-- **Better freeze reports.** If the game stops swapping frames, waits a long time on a lock, or a file read takes ages, `log.txt` now says which thread was waiting on what (#13). If the game freezes on you, grab the log and attach it to a bug report.
-- **Antivirus note** in the Install section: a couple of engines flag the unsigned installer on heuristics (#18).
+- **Controller vibration really works now.** 0.2.7 wired the rumble up, but the game itself never asked for it: it reads the console's "Vibration" profile setting when you sign in, and the port answered it as off. Now it answers on, so Xbox / XInput and PS4 / PS5 controllers rumble in matches (#12).
+- **New Options > EXTRA SETTINGS page** (it replaces the VOICE CHAT row): **VIBRATION** on / off at the top, then the voice chat settings as before.
+- **More freeze diagnostics** for #13: `log.txt` now lists which threads use the CPU (and which DLL they belong to) every few seconds, which `d3d11.dll` / `dxgi.dll` the game loaded (a DXVK copy shows up as such), and the thread dump names DLLs. If the game freezes or crawls on you, grab the log and attach it to a bug report.
 
 ## All patch notes
+
+<details>
+<summary><b>0.2.7</b></summary>
+
+- **Controller vibration** was wired up for Xbox / XInput and PS4 / PS5 controllers (#12). It turned out the game still never asked for rumble; 0.2.8 fixes that.
+- **Better freeze reports.** If the game stops swapping frames, waits a long time on a lock, or a file read takes ages, `log.txt` now says which thread was waiting on what (#13).
+- **Antivirus note** in the Install section: a couple of engines flag the unsigned installer on heuristics (#18).
+
+</details>
 
 <details>
 <summary><b>0.2.6</b></summary>

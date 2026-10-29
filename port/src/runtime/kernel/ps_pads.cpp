@@ -1,5 +1,6 @@
 // Native DualShock 4 / DualSense input through SDL3 (see ps_pads.h).
 #include "ps_pads.h"
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -186,7 +187,13 @@ void Rumble(int slot, uint16_t low, uint16_t high)
 {
 #if TTT2_HAVE_SDL
     if (g_state != State::Running || slot < 0 || slot >= Slots || !g_slots[slot].pad) return;
-    SDL_RumbleGamepad(g_slots[slot].pad, low, high, 200);
+    // Issue #12 (no vibration): the first failure, with SDL's reason. Logged only.
+    if (!SDL_RumbleGamepad(g_slots[slot].pad, low, high, 200))
+    {
+        static std::atomic<bool> logged{ false };
+        if (!logged.exchange(true))
+            std::fprintf(stderr, "[input] SDL_RumbleGamepad(slot %d) failed: %s\n", slot, SDL_GetError());
+    }
 #else
     (void)slot; (void)low; (void)high;
 #endif

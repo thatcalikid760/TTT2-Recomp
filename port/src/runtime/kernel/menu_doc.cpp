@@ -455,15 +455,15 @@ void Edit(Doc& d, const PcLists& lists, std::string* note)
         d = std::move(graphics);
     }
     catch (const Fail& e) { if (note) *note = std::string("Options GRAPHICS SETTINGS left out: ") + e.what(); }
-    // And VOICE CHAT after it (the main menu's ONLINE MODE globe).
-    Doc voice = d;
+    // And EXTRA SETTINGS after it (VIBRATION and the voice chat rows; the main menu's ONLINE MODE globe).
+    Doc extra = d;
     try
     {
-        lastIcon = AddHostPage(voice, lastIcon, 8, "VOICE CHAT", "Open mic or push to talk online, and muting players.",
-                               "icon_s_000", "FrameVoiceSettings");
-        d = std::move(voice);
+        lastIcon = AddHostPage(extra, lastIcon, 8, "EXTRA SETTINGS", "Vibration, voice chat and other extras.",
+                               "icon_s_000", "FrameExtraSettings");
+        d = std::move(extra);
     }
-    catch (const Fail& e) { if (note) *note += std::string(note->empty() ? "" : "; ") + "Options VOICE CHAT left out: " + e.what(); }
+    catch (const Fail& e) { if (note) *note += std::string(note->empty() ? "" : "; ") + "Options EXTRA SETTINGS left out: " + e.what(); }
     // And UPDATES (Display Settings' monitor icon).
     Doc updates = d;
     try

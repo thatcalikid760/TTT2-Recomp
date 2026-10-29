@@ -10,6 +10,7 @@
 #include "sys_ui.h"
 #include "keyboard_keys.h"
 #include "xlive.h"
+#include "xmp.h"
 #include "ps_pads.h"
 #include "button_prompts.h"
 #include "steam_net.h"
@@ -232,16 +233,21 @@ PPC_FUNC(__imp__XamUserGetName)
 }
 
 // (titleId, userIndex, xuidCount, xuids, settingCount, settingIds, bufferSize, buffer, overlapped)
-// Query pass (buffer null): report 4 bytes needed. Read pass: zero the buffer; the game
-// tolerates all-zero profile settings (Unleashed behavior).
 // Profile settings (XUserReadProfileSettings, ...ByXuid with xuids), as XAM answers them: the first call (no buffer,
 // or one too small) gets ERROR_INSUFFICIENT_BUFFER and the size; the second an XUSER_READ_PROFILE_SETTING_RESULT
 // {u32 count, u32 settings} with one XUSER_PROFILE_SETTING (40 bytes: +0 source, +8 user index / xuid, +0x10 setting
 // id, +0x18 XUSER_DATA {u8 type, +8 value / {u32 size, u32 pointer}}) per player and setting, each "no value"
-// (source 0: the game's defaults; no profile settings are kept here), then the strings' and blobs' room.
+// (source 0: the game's defaults; no profile settings are kept here) except controller vibration, described below,
+// then the strings' and blobs' room.
 // MEASURED 2026-10-23: the license screen (sub_826D5CB0) reads a player's gamer picture key (0x4064000F) and requires
 // 122 from the first call, else "Failed to obtain license."; the second call is overlapped. (The old answer - success,
 // 4 bytes, a zeroed buffer - failed every read: the menus asked again and again, ~1000 times a session.)
+// Controller vibration (XPROFILE_OPTION_CONTROLLER_VIBRATION, int32): the game reads it at sign-in (sub_823527C8 /
+// sub_82352E38) and sets its vibration flag only on 3 (the dashboard's "Vibration: On"). "No value" read as 0 kept every
+// pad silent (issue #12), so this one setting answers 3 from the default source. The port's own VIBRATION switch
+// (display_settings::GetVibration, applied in ApplyVibration) still decides what reaches the pad; the value does not
+// follow it, as the game reads it once.
+constexpr uint32_t kProfileControllerVibration = 0x10040003u;
 void ReadProfileSettings(PPCContext& ctx, uint8_t* base)
 {
     const uint32_t xuidCount = ctx.r5.u32, xuids = ctx.r6.u32, settingCount = ctx.r7.u32, ids = ctx.r8.u32;
@@ -297,6 +303,11 @@ void ReadProfileSettings(PPCContext& ctx, uint8_t* base)
                 GWrite32(base, e + 0x08, ctx.r4.u32);
             GWrite32(base, e + 0x10, id);
             GWrite8(base, e + 0x18, uint8_t(type));
+            if (id == kProfileControllerVibration)
+            {
+                GWrite32(base, e + 0x00, 1);                 // XSOURCE_DEFAULT
+                GWrite32(base, e + 0x20, 3);                 // int32 value: vibration on
+            }
             if (type == 4 || type == 6)
             {
                 GWrite32(base, e + 0x24, extra);             // size 0: empty, the room zeroed
@@ -625,6 +636,13 @@ PPC_FUNC(__imp__XMsgInProcessCall)
         const uint32_t hr = XLiveDispatch(base, app, message, param1, ctx.r6.u32, handled);
         if (handled) { ctx.r3.u32 = hr; return; }
         std::fprintf(stderr, "[xam] XMsgInProcessCall app=%02X msg=%08X not handled\n", app, message);
+    }
+    if (app == 0xFA)
+    {
+        // XMP (xmp.cpp, logged there): 0x7001B keeps 0xFFFFFFFF, GetStatus (0x70009) writes its state,
+        // the rest return 0 as before.
+        ctx.r3.u32 = XmpInProcess(base, message, param1, uint32_t(ctx.lr));
+        return;
     }
     if (message == 0x7001B)
     {
@@ -958,12 +976,14 @@ void PublishPad(DWORD index, bool connected, bool physical,
 // disconnected slots are the slow ones); it counts as stopped and gets the request again when it
 // reconnects. XInputSetState holds the speeds until changed; SDL rumble stops after its duration,
 // so a running PlayStation rumble is re-sent every 50 ms with a 200 ms duration. The keyboard pad
-// has no motors. XInputSetState failures are ignored.
+// has no motors. XInputSetState failures are ignored. VIBRATION OFF (Game Options): every pad is
+// wanted at 0, so a running rumble is stopped once and nothing more is sent.
 static void ApplyVibration(PadPollState& polling, const int source[4], uint64_t elapsedMs)
 {
     uint32_t wanted[kHostPads]{};
+    const bool vibrationOn = display_settings::GetVibration();
     for (int user = 0; user < 4; ++user)
-        if (source[user] >= 0) wanted[source[user]] = g_vibration[user].load();
+        if (source[user] >= 0) wanted[source[user]] = vibrationOn ? g_vibration[user].load() : 0;
         // A stop request sent while the pad is disconnected is rejected with ERROR_DEVICE_NOT_CONNECTED,
         // so the last value would otherwise be replayed on reconnect.
         else g_vibration[user].store(0);
@@ -976,7 +996,13 @@ static void ApplyVibration(PadPollState& polling, const int source[4], uint64_t 
         {
             if (!changed) continue;
             XINPUT_VIBRATION vib{ WORD(v >> 16), WORD(v & 0xFFFF) };
-            XInputSetState(i, &vib);
+            const DWORD result = XInputSetState(i, &vib);
+            // Issue #12 (no vibration): whether the host call succeeds - the first non-zero request on
+            // each pad, and the first failure on any pad. Logged only; the failure is still ignored.
+            static std::atomic<bool> loggedNonZero[kXInputPads]{}, loggedFailure{ false };
+            if ((v && !loggedNonZero[i].exchange(true)) || (result != ERROR_SUCCESS && !loggedFailure.exchange(true)))
+                std::fprintf(stderr, "[input] XInputSetState(pad %lu, %u/%u) -> %lu\n", (unsigned long)i,
+                             unsigned(vib.wLeftMotorSpeed), unsigned(vib.wRightMotorSpeed), (unsigned long)result);
         }
         else
         {
@@ -1386,7 +1412,24 @@ PPC_FUNC(__imp__XamInputSetState)
     // Only records the speeds: the pad poll thread sends them to the host pad (ApplyVibration).
     EnsurePadThread();
     uint32_t user = ctx.r3.u32, in = ctx.r5.u32;
-    if (user > 3 || !in || !g_pads[user].connected.load())
+    const char* const rejected = user > 3 ? "bad user" : !in ? "null vibration"
+                               : !g_pads[user].connected.load() ? "not connected" : nullptr;
+    // Issue #12 (no vibration): whether the game asks for it at all and gets it - the first calls,
+    // and separately the first accepted one with a motor running. A rejected call's speeds are read
+    // only when it is logged (the reject path does not otherwise touch the guest buffer).
+    {
+        static std::atomic<unsigned> calls{ 0 };
+        static std::atomic<bool> nonZeroLogged{ false };
+        const bool first = calls.fetch_add(1, std::memory_order_relaxed) < 6;
+        if (first || (!rejected && !nonZeroLogged.load(std::memory_order_relaxed)))
+        {
+            const unsigned left = in ? GRead16(base, in + 0) : 0u, right = in ? GRead16(base, in + 2) : 0u;
+            if (first || ((left || right) && !nonZeroLogged.exchange(true)))
+                std::fprintf(stderr, "[input] XamInputSetState user=%u flags=%08X left=%u right=%u -> %s\n",
+                             user, ctx.r4.u32, left, right, rejected ? rejected : "ok");
+        }
+    }
+    if (rejected)
     {
         ctx.r3.u32 = 0x48F;   // ERROR_DEVICE_NOT_CONNECTED
         return;

@@ -24,6 +24,7 @@
 #include "net_transport.h"
 #include "community_net.h"
 #include "matchmaking.h"
+#include "xmp.h"
 #include <algorithm>
 #include <thread>
 #include <atomic>
@@ -99,7 +100,13 @@ uint32_t NewEnumerator(uint32_t app, uint32_t open, uint32_t extraBytes, uint32_
     e.app = app;
     e.open = open;
     e.items = itemCount;
-    if (extraBytes) e.extra = xlive::GuestAlloc(extraBytes);
+    // The private block gets 0x18 bytes more than asked: the XMP song enumerator wrapper
+    // (sub_82851EB0) asks extra = 5672 (ppc_recomp.168.cpp:193) and then clears 5672 bytes from
+    // priv+24 (memset at 168.cpp:248-268, r3 = priv+24 at :264), and passes priv+24 to 0x70014
+    // (+0x18 of its block). With only `extraBytes` allocated that memset ran 24 bytes past the
+    // block (dormant while no source is reported: 111.cpp:2362-2380). The pointer handed out stays
+    // the block start.
+    if (extraBytes) e.extra = xlive::GuestAlloc(extraBytes + 0x18);
     std::lock_guard l(g_enumMutex);
     const uint32_t handle = g_nextEnum++;
     g_enums.emplace(handle, e);
@@ -366,6 +373,15 @@ PPC_FUNC(__imp__XamCreateEnumeratorHandle)
     if (!out) { ctx.r3.u64 = ERROR_INVALID_PARAMETER_; return; }
     const uint32_t handle = NewEnumerator(app, open, extra, items);
     GWrite32(base, out, handle);
+    if (app == 0xFA)
+    {
+        uint32_t priv = 0;
+        {
+            std::lock_guard l(g_enumMutex);
+            priv = g_enums[handle].extra;
+        }
+        XmpEnumCreated(handle, open, ctx.r6.u32, extra, items, priv);
+    }
     Trace("enum" + std::to_string(open), "XamCreateEnumeratorHandle(app %02X, open %08X, extra %u, items %u) -> empty",
           app, open, extra, items);
     ctx.r3.u64 = 0;
@@ -389,6 +405,11 @@ bool XLiveEnumerate(uint8_t* base, uint32_t handle, uint32_t buffer, uint32_t by
     count = 0;
     result = ERROR_NO_MORE_FILES_;
     Enumerator& e = it->second;
+    if (e.app == 0xFA)
+    {
+        XmpEnumerate(base, handle, e.extra, buffer, bytes, e.done, count, result);   // XMP songs (xmp.cpp)
+        return true;
+    }
     if (e.open == 0x00058039u)
     {
         // XTitleServerCreateEnumerator: its private block holds the title's query (logged); with GIN on one
@@ -418,6 +439,7 @@ bool XLiveCloseHandle(uint32_t handle, uint32_t& status)
     std::lock_guard l(g_enumMutex);
     const auto it = g_enums.find(handle);
     if (it == g_enums.end()) return false;
+    if (it->second.app == 0xFA) XmpEnumClosed(handle);
     if (it->second.extra) g_virtualHeap.Free(g_base + it->second.extra);
     g_enums.erase(it);
     status = 0;
@@ -626,30 +648,7 @@ void XLivePollInvites()
 // an overlapped request completes inline and reports pending, failures as ERROR_FUNCTION_FAILED
 // with the HRESULT as extended error (real XAM; Xenia's fork loses it). Session searches can wait
 // on Steam's lobby list for seconds: those complete from a worker thread instead.
-// XMP (app 0xFA, the music player / custom soundtracks), offline: no media sources. TEKKEN TUNES
-// asks XMPGetMediaSources (0x0007002B) on the way in; failing it left the screen black ~27 s
-// (the user's run, 2026-10-15) before the page appeared. Arguments as Xenia's XmpApp:
-// {client, connected-only, MSAL_MEDIASOURCEINFO* (0xB4 each), max, &returned}; a null array
-// asks for the count (10 slots), the answer is 0 sources.
-static uint32_t XmpDispatch(uint8_t* base, uint32_t msg, uint32_t buffer, bool& handled)
-{
-    handled = false;
-    if (msg != 0x0007002B || !buffer) return E_FAIL_;
-    handled = true;
-    constexpr uint32_t kSlots = 10;
-    const uint32_t sources = GRead32(base, buffer + 8), max = GRead32(base, buffer + 12), returned = GRead32(base, buffer + 16);
-    if (!returned) return E_INVALIDARG_;
-    if (!sources) { GWrite32(base, returned, kSlots); return 0; }
-    if (max < kSlots) return 0x80070008u;                     // E_OUTOFMEMORY-style: buffer too small
-    for (uint32_t i = 0; i < kSlots; ++i)
-    {
-        std::memset(base + sources + i * 0xB4, 0, 0x28);
-        GWrite32(base, sources + i * 0xB4, i);
-    }
-    GWrite32(base, returned, 0);
-    return 0;
-}
-
+// XMP (app 0xFA, the music player / custom soundtracks): xmp.cpp, logged there.
 static void StartIORequest(PPCContext& ctx, uint8_t* base, const char* name)
 {
     const uint32_t app = ctx.r3.u32, msg = ctx.r4.u32, overlapped = ctx.r5.u32, buffer = ctx.r6.u32, length = ctx.r7.u32;
@@ -670,16 +669,13 @@ static void StartIORequest(PPCContext& ctx, uint8_t* base, const char* name)
     }
     if (app == 0xFA)
     {
-        bool handled = false;
-        const uint32_t hr = XmpDispatch(base, msg, buffer, handled);
-        if (handled)
-        {
-            std::fprintf(stderr, "[xmp] %s(msg %08X) -> %08X (no media sources)\n", name, msg, hr);
-            if (!overlapped) { ctx.r3.u64 = hr; return; }
-            if (const uint32_t e = XamValidateOverlapped(base, overlapped)) { ctx.r3.u64 = e; return; }
-            ctx.r3.u64 = XamCompleteOverlapped(base, overlapped, hr ? ERROR_FUNCTION_FAILED_ : 0, 0, hr);
-            return;
-        }
+        // Every app-0xFA message ends here; one xmp.cpp does not serve gets E_FAIL, the answer
+        // XLiveDispatch gave it before.
+        const uint32_t hr = XmpStartIO(base, msg, overlapped, buffer, length, uint32_t(ctx.lr));
+        if (!overlapped) { ctx.r3.u64 = hr; return; }
+        if (const uint32_t e = XamValidateOverlapped(base, overlapped)) { ctx.r3.u64 = e; return; }
+        ctx.r3.u64 = XamCompleteOverlapped(base, overlapped, hr ? ERROR_FUNCTION_FAILED_ : 0, 0, hr);
+        return;
     }
     // ... and XUserReadStats (0xB0021), which asks the community server.
     const bool search = app == 0xFB && (msg == 0x000B0016 || msg == 0x000B001C || msg == 0x000B001B || msg == 0x000B0021);

@@ -239,7 +239,7 @@ bool keyui_Foreground()
 
 namespace sysui {
 
-enum class Screen { None, Profiles, Name, Graphics, Voice, Update };
+enum class Screen { None, Profiles, Name, Graphics, Extra, Update };
 constexpr int kRows = 9;
 constexpr uint16_t kUp = 0x0001, kDown = 0x0002, kLeft = 0x0004, kRight = 0x0008, kStart = 0x0010, kA = 0x1000, kB = 0x2000,
                    kY = 0x8000;
@@ -466,18 +466,20 @@ void ChangeGraphics(int row, int dir)
     display_settings::SetGraphics(g);
 }
 
-// ---- Options -> VOICE CHAT (display_settings::Voice, voice_chat.h): mode, talk key, volume, then
+// ---- Options -> EXTRA SETTINGS: VIBRATION (display_settings.h; kernel_xam.cpp sends no rumble while OFF),
+// then voice chat (display_settings::Voice, voice_chat.h): mode, talk key, volume, then
 // the players met this session (A / LEFT / RIGHT mutes or unmutes one).
-enum VoiceRow { kVoiceMode, kVoiceKey, kVoiceVolume, kVoicePlayers };
+enum ExtraRow { kVibration, kVoiceMode, kVoiceKey, kVoiceVolume, kVoicePlayers };
 std::atomic<bool> g_voiceCapture{ false };               // PUSH-TO-TALK KEY waits for a key
 std::atomic<int> g_voiceKey{ 0 };
 std::vector<uint64_t> g_voicePeers;                      // the player rows' peers, in row order
-void BuildVoice(Ui& ui)
+void BuildExtra(Ui& ui)
 {
     const display_settings::Voice v = display_settings::GetVoice();
     static const char* const modes[] = { "OFF", "OPEN MIC", "PUSH TO TALK" };
     const bool capturing = g_voiceCapture.load();
     ui.rows = {
+        { "VIBRATION", display_settings::GetVibration() ? "ON" : "OFF", "Controller rumble in matches (Xbox and PlayStation pads)." },
         { "VOICE CHAT", modes[v.mode], "Talk with players in online lobbies and matches." },
         { "PUSH-TO-TALK KEY", capturing ? "PRESS A KEY" : keyboard_keys::KeyName(v.pushToTalkKey),
           capturing ? "Press the key to hold while talking.   ESC: cancel" : "A: choose the key you hold to talk (PUSH TO TALK)." },
@@ -497,8 +499,9 @@ void BuildVoice(Ui& ui)
     if (g_voicePeers.empty())
         ui.rows.push_back({ "NO PLAYERS YET", "", "Players from your online lobbies show here, to mute them." });
 }
-void ChangeVoice(int row, int dir)
+void ChangeExtra(int row, int dir)
 {
+    if (row == kVibration) { display_settings::SetVibration(!display_settings::GetVibration()); return; }
     display_settings::Voice v = display_settings::GetVoice();
     if (row == kVoiceMode) v.mode = (v.mode + dir + 3) % 3;
     else if (row == kVoiceVolume) v.volume = std::clamp(v.volume + dir, 0, 10);
@@ -661,7 +664,7 @@ void OptionsBackground(PPCContext& ctx, uint8_t* base)
 void Draw(PPCContext& ctx, uint8_t* base, Ui& ui)
 {
     if (ui.screen == Screen::Graphics) BuildGraphics(ui);
-    else if (ui.screen == Screen::Voice) BuildVoice(ui);
+    else if (ui.screen == Screen::Extra) BuildExtra(ui);
     else if (ui.screen == Screen::Update) BuildUpdate(ui);
     else BuildProfiles(ui);
     const int total = (std::max)(int(ui.rows.size()), 2);
@@ -709,7 +712,7 @@ void Draw(PPCContext& ctx, uint8_t* base, Ui& ui)
         // Select Profile shows the main menu's PROFILE icon, GRAPHICS SETTINGS Display Settings' monitor.
         DrawCursor(ctx, base, count, cursor, ui.shownCursor < 0,
                    ui.screen == Screen::Graphics || ui.screen == Screen::Update ? "icon_s_046"
-                   : ui.screen == Screen::Voice                                  ? "icon_s_000"
+                   : ui.screen == Screen::Extra                                  ? "icon_s_000"
                                                                                  : "icon_s_006");
         ui.shownCursor = cursor;
     }
@@ -1505,12 +1508,12 @@ void Frame(PPCContext& ctx, uint8_t* base)
             }
             return;
         }
-        if (current == "FrameGraphicsSettings" || current == "FrameVoiceSettings" || current == "FrameUpdates")
+        if (current == "FrameGraphicsSettings" || current == "FrameExtraSettings" || current == "FrameUpdates")
         {
-            // Options -> GRAPHICS SETTINGS / VOICE CHAT / UPDATES played Options out and switched to
+            // Options -> GRAPHICS SETTINGS / EXTRA SETTINGS / UPDATES played Options out and switched to
             // its empty frame.
             const Screen screen = current == "FrameGraphicsSettings" ? Screen::Graphics
-                                  : current == "FrameVoiceSettings"  ? Screen::Voice
+                                  : current == "FrameExtraSettings"  ? Screen::Extra
                                                                      : Screen::Update;
             Open(ui, 0, screen);
             if (screen == Screen::Update)
@@ -1553,7 +1556,7 @@ void Frame(PPCContext& ctx, uint8_t* base)
         std::lock_guard l(g_charMutex);
         chars.swap(g_chars);
     }
-    if (ui.screen == Screen::Voice && g_voiceCapture.load())
+    if (ui.screen == Screen::Extra && g_voiceCapture.load())
     {
         // PUSH-TO-TALK KEY: the next key pressed (ESC, or a pad's B, cancels). The keys held then
         // count as pressed only once they are let go.
@@ -1576,7 +1579,7 @@ void Frame(PPCContext& ctx, uint8_t* base)
         Draw(ctx, base, ui);
         return;
     }
-    if ((ui.screen == Screen::Graphics || ui.screen == Screen::Voice || ui.screen == Screen::Update) && g_boxOwns.load())
+    if ((ui.screen == Screen::Graphics || ui.screen == Screen::Extra || ui.screen == Screen::Update) && g_boxOwns.load())
     {
         Draw(ctx, base, ui);                                 // a message box has the controller
         return;
@@ -1598,7 +1601,7 @@ void Frame(PPCContext& ctx, uint8_t* base)
         Draw(ctx, base, ui);
         return;
     }
-    if (ui.screen == Screen::Graphics || ui.screen == Screen::Voice || ui.screen == Screen::Update)
+    if (ui.screen == Screen::Graphics || ui.screen == Screen::Extra || ui.screen == Screen::Update)
     {
         const bool graphics = ui.screen == Screen::Graphics;
         if (ui.settle > 0 && --ui.settle == 0) ui.shownCursor = -1;
@@ -1611,14 +1614,14 @@ void Frame(PPCContext& ctx, uint8_t* base)
         else if ((pressed & (kLeft | kRight)) && ui.screen != Screen::Update && (graphics ? ui.cursor != kDefault : ui.cursor != kVoiceKey))
         {
             if (graphics) ChangeGraphics(ui.cursor, (pressed & kLeft) ? -1 : 1);
-            else ChangeVoice(ui.cursor, (pressed & kLeft) ? -1 : 1);
+            else ChangeExtra(ui.cursor, (pressed & kLeft) ? -1 : 1);
             MenuSound(ctx, base, kSoundCursor);
         }
         else if (pressed & (kA | kStart))
         {
             if (graphics) ChangeGraphics(ui.cursor, 1);
             else if (ui.cursor == kVoiceKey) { g_voiceKey = 0; g_voiceCapture = true; }
-            else ChangeVoice(ui.cursor, 1);
+            else ChangeExtra(ui.cursor, 1);
             MenuSound(ctx, base, kSoundDecide);
         }
         else if (pressed & kB)

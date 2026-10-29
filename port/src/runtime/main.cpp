@@ -11,6 +11,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <tlhelp32.h>
+#include <psapi.h>        // K32GetMappedFileNameW (a kernel32 export): DumpAllStacks names RIP modules
 #include <timeapi.h>
 #include <fcntl.h>
 #include <io.h>
@@ -97,7 +98,7 @@ void DumpAllStacks(const char* why)
     THREADENTRY32 te{ sizeof(te) };
     // Capture with threads suspended, but PRINT only after resuming them: a suspended
     // thread may hold the CRT stderr lock and printing would deadlock the dump.
-    struct Cap { DWORD tid; uint64_t rip; uint64_t rets[24]; int nret; };
+    struct Cap { DWORD tid; uint64_t rip, ripAbs; uint64_t rets[24]; int nret; };
     Cap caps[64]; int ncap = 0;
     for (BOOL ok = Thread32First(snap, &te); ok && ncap < 64; ok = Thread32Next(snap, &te))
     {
@@ -112,6 +113,7 @@ void DumpAllStacks(const char* why)
                 Cap& cap = caps[ncap++];
                 cap.tid = te.th32ThreadID;
                 cap.rip = c.Rip - modBase;
+                cap.ripAbs = c.Rip;
                 cap.nret = 0;
                 for (int i = 0; i < 2048 && cap.nret < 24; ++i)
                 {
@@ -130,10 +132,34 @@ void DumpAllStacks(const char* why)
     extern void KernelDumpGuestThreads();
     KernelDumpGuestThreads();
     std::fprintf(stderr, "[stacks] ==== thread dump (%s) ====\n", why);
+    // Threads busy outside the exe (driver, DXVK, audio) show only a RIP with no in-exe return
+    // addresses (issue #13), so name the module the RIP is in. Resolved after every thread is
+    // resumed, and with VirtualQuery + the mapped file name rather than GetModuleHandleExW /
+    // GetModuleFileNameW: those take the loader lock, and this dump runs exactly when a thread may
+    // be stuck inside DllMain or a driver load holding it.
     for (int i = 0; i < ncap; ++i)
     {
-        std::fprintf(stderr, "[stacks] tid=%lu rip=0x%llX", caps[i].tid,
-                     (unsigned long long)caps[i].rip);
+        MEMORY_BASIC_INFORMATION mbi{};
+        wchar_t path[MAX_PATH];
+        char where[96] = "";
+        if (VirtualQuery(reinterpret_cast<void*>(caps[i].ripAbs), &mbi, sizeof(mbi)) && mbi.Type == MEM_IMAGE &&
+            mbi.AllocationBase && reinterpret_cast<uint64_t>(mbi.AllocationBase) != modBase)
+        {
+            const DWORD len = K32GetMappedFileNameW(GetCurrentProcess(), mbi.AllocationBase, path, MAX_PATH);
+            if (len && len < MAX_PATH)
+            {
+                path[len] = 0;                                 // a truncated name may come back unterminated
+                const wchar_t* name = path;
+                for (const wchar_t* q = path; *q; ++q) if (*q == L'\\' || *q == L'/') name = q + 1;
+                std::snprintf(where, sizeof(where), " (%ls+0x%llX)", name,
+                              (unsigned long long)(caps[i].ripAbs - reinterpret_cast<uint64_t>(mbi.AllocationBase)));
+            }
+        }
+        if (*where)
+            std::fprintf(stderr, "[stacks] tid=%lu rip=0x%llX%s", caps[i].tid, (unsigned long long)caps[i].ripAbs, where);
+        else
+            std::fprintf(stderr, "[stacks] tid=%lu rip=0x%llX", caps[i].tid,
+                         (unsigned long long)caps[i].rip);
         for (int j = 0; j < caps[i].nret; ++j)
             std::fprintf(stderr, " 0x%llX", (unsigned long long)caps[i].rets[j]);
         std::fprintf(stderr, "\n");
