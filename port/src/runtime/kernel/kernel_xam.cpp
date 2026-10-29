@@ -706,6 +706,8 @@ PPC_FUNC(__imp__ExRegisterTitleTerminateNotification)
 // loop to ~0.5 Hz. A host poll thread keeps a snapshot (connected pads and the keyboard every
 // ~1 ms - a press reaches the game at most ~1 ms later than it could, it was 8 ms; disconnected
 // pads retried every 2 s per XInput guidance); guest calls read it instantly.
+// Vibration goes the same way: XamInputSetState only records the motor speeds (g_vibration), and
+// the poll thread sends them to the user's host pad (ApplyVibration).
 #pragma comment(lib, "xinput9_1_0.lib")
 
 namespace {
@@ -719,6 +721,8 @@ struct PadSnapshot
 };
 PadSnapshot g_pads[4];
 std::atomic<bool> g_padThreadStarted{false};
+// Guest user -> requested motor speeds, wLeftMotorSpeed << 16 | wRightMotorSpeed (XamInputSetState).
+std::atomic<uint32_t> g_vibration[4]{};
 
 // Keyboard controls augment player 0 even when a controller is connected, unless Game Options
 // -> KEYBOARD PLAYER is SEPARATE: then the keyboard is a host pad of its own (kKeyboardPad),
@@ -780,9 +784,15 @@ struct PadPollState
     bool hostPs5[kHostPads]{};
     uint16_t prevPressed[kHostPads]{};        // buttons + triggers (0x0400 / 0x0800) last poll
     bool keyboardDown = false, promptNoted = false;
+    // Vibration last sent to each host pad (left << 16 | right; 0 = stopped), the next SDL re-send
+    // of a running PlayStation rumble, and whether "[input] vibration on host pad N" was logged.
+    uint32_t rumbleSent[kHostPads]{};
+    uint64_t rumbleResendAtMs[kHostPads]{};
+    bool rumbleLogged[kHostPads]{};
 };
 
-// What XInputGetCapabilities reports for a wired Xbox 360 pad, minus rumble (none is played).
+// What XInputGetCapabilities reports for a wired Xbox 360 pad, both motors included: the guest's
+// vibration is played through SDL (ApplyVibration, ps_pads::Rumble).
 static XINPUT_CAPABILITIES PlayStationCaps()
 {
     XINPUT_CAPABILITIES caps{};
@@ -791,6 +801,7 @@ static XINPUT_CAPABILITIES PlayStationCaps()
     caps.Gamepad.wButtons = 0xF3FF;
     caps.Gamepad.bLeftTrigger = caps.Gamepad.bRightTrigger = 255;
     caps.Gamepad.sThumbLX = caps.Gamepad.sThumbLY = caps.Gamepad.sThumbRX = caps.Gamepad.sThumbRY = SHORT(0xFFC0);
+    caps.Vibration.wLeftMotorSpeed = caps.Vibration.wRightMotorSpeed = 0xFFFF;
     return caps;
 }
 
@@ -941,6 +952,47 @@ void PublishPad(DWORD index, bool connected, bool physical,
     pad.connected.store(connected);
 }
 
+// Send each guest user's requested vibration to the host pad that user reads (source[user]).
+// A host pad no user reads any more (unassigned, or its user moved to another pad) is sent 0, 0
+// once, so a motor does not keep running. A disconnected pad is not called at all (XInput calls on
+// disconnected slots are the slow ones); it counts as stopped and gets the request again when it
+// reconnects. XInputSetState holds the speeds until changed; SDL rumble stops after its duration,
+// so a running PlayStation rumble is re-sent every 50 ms with a 200 ms duration. The keyboard pad
+// has no motors. XInputSetState failures are ignored.
+static void ApplyVibration(PadPollState& polling, const int source[4], uint64_t elapsedMs)
+{
+    uint32_t wanted[kHostPads]{};
+    for (int user = 0; user < 4; ++user)
+        if (source[user] >= 0) wanted[source[user]] = g_vibration[user].load();
+        // A stop request sent while the pad is disconnected is rejected with ERROR_DEVICE_NOT_CONNECTED,
+        // so the last value would otherwise be replayed on reconnect.
+        else g_vibration[user].store(0);
+    for (DWORD i = 0; i < kKeyboardPad; ++i)
+    {
+        if (!polling.physicalConnected[i]) { polling.rumbleSent[i] = 0; continue; }
+        const uint32_t v = wanted[i];
+        const bool changed = v != polling.rumbleSent[i];
+        if (i < kXInputPads)
+        {
+            if (!changed) continue;
+            XINPUT_VIBRATION vib{ WORD(v >> 16), WORD(v & 0xFFFF) };
+            XInputSetState(i, &vib);
+        }
+        else
+        {
+            if (!changed && (v == 0 || elapsedMs < polling.rumbleResendAtMs[i])) continue;
+            ps_pads::Rumble(int(i - kXInputPads), uint16_t(v >> 16), uint16_t(v & 0xFFFF));
+            polling.rumbleResendAtMs[i] = elapsedMs + 50;
+        }
+        polling.rumbleSent[i] = v;
+        if (v && !polling.rumbleLogged[i])
+        {
+            polling.rumbleLogged[i] = true;
+            std::fprintf(stderr, "[input] vibration on host pad %lu\n", (unsigned long)i);
+        }
+    }
+}
+
 void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, PadScript* script = nullptr)
 {
     // AUTOSTART is an explicit unattended test mode. Apply its START pulse to
@@ -1006,7 +1058,11 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
         g.wButtons = keys.buttons;
         g.bLeftTrigger = keys.leftTrigger ? 255 : 0;
         g.bRightTrigger = keys.rightTrigger ? 255 : 0;
-        if (polling.physicalConnected[kKeyboardPad]) hostCaps[kKeyboardPad] = PlayStationCaps();
+        if (polling.physicalConnected[kKeyboardPad])
+        {
+            hostCaps[kKeyboardPad] = PlayStationCaps();
+            hostCaps[kKeyboardPad].Vibration = {};   // the keyboard has no motors
+        }
     }
 
     // The lounge owns WASD directly; expose pads before keyboard/script buttons are merged.
@@ -1057,6 +1113,7 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
         for (int user = 0; user < 4; ++user)
             if (source[user] < 0 && !claimed(user)) { source[user] = int(i); break; }
     }
+    ApplyVibration(polling, source, elapsedMs);
 
     {
         // Player 1's last device picks the prompt icons: a new key, or a new button / trigger on the
@@ -1319,6 +1376,22 @@ PPC_FUNC(__imp__XamInputGetState)
     GWrite16(base, out + 10, (uint16_t)st.Gamepad.sThumbLY);
     GWrite16(base, out + 12, (uint16_t)st.Gamepad.sThumbRX);
     GWrite16(base, out + 14, (uint16_t)st.Gamepad.sThumbRY);
+    ctx.r3.u32 = 0;
+}
+
+PPC_FUNC(__imp__XamInputSetState)
+{
+    KTrace("XamInputSetState");
+    // r3=userIndex, r4=flags, r5=XINPUT_VIBRATION* in (wLeftMotorSpeed at +0, wRightMotorSpeed at +2).
+    // Only records the speeds: the pad poll thread sends them to the host pad (ApplyVibration).
+    EnsurePadThread();
+    uint32_t user = ctx.r3.u32, in = ctx.r5.u32;
+    if (user > 3 || !in || !g_pads[user].connected.load())
+    {
+        ctx.r3.u32 = 0x48F;   // ERROR_DEVICE_NOT_CONNECTED
+        return;
+    }
+    g_vibration[user].store(uint32_t(GRead16(base, in + 0)) << 16 | GRead16(base, in + 2));
     ctx.r3.u32 = 0;
 }
 

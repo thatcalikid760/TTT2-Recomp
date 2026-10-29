@@ -42,23 +42,51 @@ static std::unordered_map<uint32_t, std::unique_ptr<CsEntry>> g_csMap;
 // Threads blocked in RtlEnterCriticalSection right now (host thread id -> the section), written on the
 // slow path only: rollback's job wait (CsThreadBlockedBy) must not wait for a thread it blocks itself.
 static std::mutex g_csWaitLock;
-struct CsWait { CsEntry* e; std::chrono::steady_clock::time_point since; bool dumped; };
+struct CsWait { CsEntry* e; std::chrono::steady_clock::time_point since; bool dumped; uint32_t lr; };
 static std::unordered_map<unsigned long, CsWait> g_csWaiting;
 
-// TTT2_CS_STACKS=1 (diagnostics): a thread that waits over 2 s for a guest critical section gets every thread's
-// stack dumped (main.cpp DumpAllStacks; resolve with the linker map), with who waits and who holds it - what the
-// holder does then is why the game stalls (GitHub #42: character select frozen 17-72 s on a loader section).
+// A pool job's worker thread (sub_824F5458) waits at this lr on the job's gate (+60), which the main
+// thread holds between kicks by design (rollback.cpp: the kick opens it, then closes it again). Such a
+// wait lasts as long as the job goes unused - seconds while a menu or a load runs - and is not a stall.
+constexpr uint32_t kPoolJobGateLr = 0x824F54F0u;
+
+namespace hitch { uint32_t GuestEntryOfThread(DWORD tid); PPCContext* GuestContextOf(DWORD tid); }   // diag_hooks.cpp
+static const auto g_csClockStart = std::chrono::steady_clock::now();
+
+// " lr X: A B C ..." - a thread's live guest call chain (racy read of its context: diagnostics only).
+static int AppendGuestChain(char* line, int n, size_t cap, unsigned long tid)
+{
+    const PPCContext* c = tid ? hitch::GuestContextOf(tid) : nullptr;
+    if (!c) return n + std::snprintf(line + n, cap - n, " (no guest context)");
+    n += std::snprintf(line + n, cap - n, " lr %08X:", uint32_t(c->lr));
+    uint32_t frame = c->r1.u32;
+    for (int i = 0; i < 16 && frame && frame < 0xFFFFFFF0u && n < int(cap) - 12; ++i)
+    {
+        const uint32_t prev = GRead32(g_base, frame);
+        if (!prev || prev <= frame || prev - frame > 0x10000) break;
+        n += std::snprintf(line + n, cap - n, " %08X", GRead32(g_base, prev - 8));
+        frame = prev;
+    }
+    return n;
+}
+
+// A thread that waits over 2 s for a guest critical section (any but a pool job's idle gate) gets one
+// report: who waits where, who holds the section, where the holder entered it, and both threads' guest
+// call chains - what the holder does meanwhile is why the game stalls (GitHub #13 and #42: character select
+// frozen for many seconds). On by default, at most 6 reports a session. TTT2_CS_STACKS=1 (after 2 s) or
+// =<ms> also dumps every thread's host stack (main.cpp DumpAllStacks; resolve with the linker map).
 void DumpAllStacks(const char* why);
 static void CsWatchdog()
 {
-    // TTT2_CS_STACKS=1: after 2 s; =<ms>: after that long
-    static const long long threshold = [] { const long long v = std::atoll(std::getenv("TTT2_CS_STACKS")); return v > 1 ? v : 2000; }();
-    int dumps = 0;
+    const char* env = std::getenv("TTT2_CS_STACKS");
+    const bool stacks = env && *env && *env != '0';
+    const long long threshold = [&] { const long long v = env ? std::atoll(env) : 0; return v > 1 ? v : 2000; }();
+    int reports = 0, dumps = 0;
     for (;;)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
         unsigned long waiter = 0, holder = 0;
-        uint32_t section = 0, holderLr = 0;
+        uint32_t section = 0, holderLr = 0, waiterLr = 0, holderWaitsFor = 0;
         long long ms = 0;
         {
             std::lock_guard l(g_csWaitLock);
@@ -66,20 +94,38 @@ static void CsWatchdog()
             for (auto& [tid, w] : g_csWaiting)
             {
                 ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - w.since).count();
-                if (w.dumped || ms < threshold) continue;
+                if (w.dumped || ms < threshold || w.lr == kPoolJobGateLr) continue;
                 w.dumped = true;
                 waiter = tid;
+                waiterLr = w.lr;
                 holder = w.e->holder.load(std::memory_order_relaxed);
                 section = w.e->ga;
                 holderLr = w.e->ownerLr.load(std::memory_order_relaxed);
                 break;
             }
+            if (waiter && holder)
+                if (const auto h = g_csWaiting.find(holder); h != g_csWaiting.end()) holderWaitsFor = h->second.e->ga;
         }
-        if (!waiter || dumps >= 4) continue;
-        ++dumps;
-        std::fprintf(stderr, "[cs] thread %lu has waited %lld ms for section %08X, held by thread %lu (entered at %08X) - stacks:\n",
-                     waiter, ms, section, holder, holderLr);
-        DumpAllStacks("a long section wait");
+        if (!waiter || reports >= 6) continue;
+        ++reports;
+        const double up = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_csClockStart).count();
+        std::fprintf(stderr, "[cs] at %.1f s: thread %lu (entry %08X) has waited %lld ms at lr %08X for section %08X, held by thread %lu (entry %08X, entered at %08X)%s\n",
+                     up, waiter, hitch::GuestEntryOfThread(waiter), ms, waiterLr, section, holder, holder ? hitch::GuestEntryOfThread(holder) : 0u,
+                     holderLr, holder ? "" : " - released meanwhile");
+        if (holderWaitsFor)
+            std::fprintf(stderr, "[cs]   the holder itself waits for section %08X\n", holderWaitsFor);
+        char line[512];
+        int n = std::snprintf(line, sizeof(line), "[cs]   holder %lu guest stack", holder);
+        AppendGuestChain(line, n, sizeof(line), holder);
+        std::fprintf(stderr, "%s\n", line);
+        n = std::snprintf(line, sizeof(line), "[cs]   waiter %lu guest stack", waiter);
+        AppendGuestChain(line, n, sizeof(line), waiter);
+        std::fprintf(stderr, "%s\n", line);
+        if (stacks && dumps < 4)
+        {
+            ++dumps;
+            DumpAllStacks("a long section wait");
+        }
     }
 }
 
@@ -129,11 +175,10 @@ PPC_FUNC(__imp__RtlEnterCriticalSection)
         const unsigned long self = GetCurrentThreadId();
         {
             std::lock_guard l(g_csWaitLock);
-            g_csWaiting[self] = CsWait{ &cs, t0, false };
+            g_csWaiting[self] = CsWait{ &cs, t0, false, (uint32_t)ctx.lr };
         }
         static const bool watch = [] {
-            const char* e = std::getenv("TTT2_CS_STACKS");
-            if (e && *e && *e != '0') std::thread(CsWatchdog).detach();
+            std::thread(CsWatchdog).detach();
             return true;
         }();
         (void)watch;
@@ -146,12 +191,15 @@ PPC_FUNC(__imp__RtlEnterCriticalSection)
                       std::chrono::steady_clock::now() - t0).count();
         if (ms > 50)
         {
-            static std::atomic<int> slowLog{0};
-            if (slowLog++ < 60)
+            // Pool job gate waits are normal (kPoolJobGateLr): their own small budget, so they cannot
+            // use up the one for the others.
+            static std::atomic<int> slowLog{0}, poolGateLog{0};
+            if ((uint32_t)ctx.lr == kPoolJobGateLr ? poolGateLog++ < 10 : slowLog++ < 60)
                 std::fprintf(stderr,
-                    "[cs] slow acquire cs=%08X waited=%lldms waiter_lr=%08X prev_owner_lr=%08X tid=%lu\n",
+                    "[cs] slow acquire cs=%08X waited=%lldms waiter_lr=%08X prev_owner_lr=%08X tid=%lu%s\n",
                     ctx.r3.u32, (long long)ms, (uint32_t)ctx.lr, cs.ownerLr.load(std::memory_order_relaxed),
-                    cs.ownerTid.load(std::memory_order_relaxed));
+                    cs.ownerTid.load(std::memory_order_relaxed),
+                    (uint32_t)ctx.lr == kPoolJobGateLr ? " (a pool job's thread idle until the job's next kick: normal)" : "");
         }
     }
     cs.ownerLr.store((uint32_t)ctx.lr, std::memory_order_relaxed);

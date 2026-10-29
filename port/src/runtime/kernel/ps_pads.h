@@ -29,6 +29,11 @@ struct Pad
 // it reconnects, so the guest user it claimed stays its own.
 void Poll(Pad out[Slots]);
 
+// Pad poll thread only, like Poll. Rumble the pad in `slot` (0..Slots-1) with SDL's low / high
+// frequency motors (XINPUT_VIBRATION's left / right) for 200 ms; the caller re-sends while it
+// should keep running, and sends 0, 0 to stop. No pad in the slot, or no SDL: nothing happens.
+void Rumble(int slot, uint16_t low, uint16_t high);
+
 // SDL_GamepadButton / SDL_GamepadAxis values (SDL3 ABI; ps_pads.cpp static_asserts them), so the
 // mapping below needs no SDL header.
 enum SdlButton : int

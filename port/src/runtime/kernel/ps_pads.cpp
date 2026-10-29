@@ -182,4 +182,14 @@ void Poll(Pad out[Slots])
 #endif
 }
 
+void Rumble(int slot, uint16_t low, uint16_t high)
+{
+#if TTT2_HAVE_SDL
+    if (g_state != State::Running || slot < 0 || slot >= Slots || !g_slots[slot].pad) return;
+    SDL_RumbleGamepad(g_slots[slot].pad, low, high, 200);
+#else
+    (void)slot; (void)low; (void)high;
+#endif
+}
+
 } // namespace ps_pads

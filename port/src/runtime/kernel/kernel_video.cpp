@@ -3088,9 +3088,53 @@ void DirtyMeasureFrame();   // rollback_probe.cpp (TTT2_DIRTY_MEASURE=1)
 bool RollbackInResimDraw();                    // rollback.cpp
 void RollbackResimTime(int id, double ms);
 
+// Always on (GitHub #13: "freezing in character select"): the game swapping no frame for 4 s is a
+// stall. The first time per stall (at most twice a session) every guest thread's call chain goes to the
+// log (diag_hooks.cpp), then every thread's host stack (main.cpp DumpAllStacks; resolve with the linker
+// map); when frames come back, how long they were gone (at most 20 stalls a session). "at <s>" is the
+// time since the process started. Started by the first VdSwap.
+void DumpAllStacks(const char* why);
+namespace hitch { void DumpGuestThreads(); }
+static const auto g_swapClockStart = std::chrono::steady_clock::now();
+static std::atomic<int64_t> g_lastSwapMs{ 0 };
+static int64_t SwapClockMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_swapClockStart).count();
+}
+static void SwapStallWatchdog()
+{
+    int stalls = 0;
+    int64_t stalledAt = -1;                        // the last swap before the current stall, -1: none
+    for (;;)
+    {
+        Sleep(500);
+        const int64_t last = g_lastSwapMs.load(std::memory_order_relaxed), now = SwapClockMs();
+        if (stalledAt >= 0)
+        {
+            if (last == stalledAt) continue;
+            if (stalls <= 20)
+                std::fprintf(stderr, "[stall] at %.1f s: frames again after %lld ms without one\n", double(now) / 1000.0,
+                             (long long)(last - stalledAt));
+            stalledAt = -1;
+            continue;
+        }
+        if (now - last < 4000) continue;
+        stalledAt = last;
+        if (++stalls > 20) continue;
+        std::fprintf(stderr, "[stall] at %.1f s: no frame swapped for %lld ms (swap #%u)%s\n", double(now) / 1000.0,
+                     (long long)(now - last), uint32_t(g_gameSwaps.load()), stalls <= 2 ? "; guest threads:" : "");
+        if (stalls > 2) continue;
+        hitch::DumpGuestThreads();
+        DumpAllStacks("no frame swapped for 4 s");
+    }
+}
+
 PPC_FUNC(__imp__VdSwap)
 {
     KTrace("VdSwap");
+    g_lastSwapMs.store(SwapClockMs(), std::memory_order_relaxed);
+    static const bool stallWatch = (std::thread(SwapStallWatchdog).detach(), true);
+    (void)stallWatch;
     g_presentCount.fetch_add(1);                   // the bone capture's frame number
     struct SwapTimer
     {

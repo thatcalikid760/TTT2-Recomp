@@ -63,7 +63,19 @@
 > [!IMPORTANT]
 > **You need your own copy of the game.** This project contains no game files; the installer builds them on your PC from your disc image.
 
-## What's new in 0.2.6
+> [!NOTE]
+> **Antivirus warnings.** `ttt2_setup.exe` is not code-signed (certificates cost money), and it unpacks and rebuilds the game's files on your PC, so a few antivirus engines flag it on heuristics ("ML score", generic "Malware" names). On VirusTotal it's typically 2 or 3 engines out of about 70. Every release is built from the source in this repo; if you'd rather not trust the download, build it yourself with [BUILDING.md](BUILDING.md).
+
+## What's new in 0.2.7
+
+- **Controller vibration works.** Xbox / XInput controllers and PS4 / PS5 controllers rumble in matches like on the console (#12). Turn it off in the game's Options if you don't want it.
+- **Better freeze reports.** If the game stops swapping frames, waits a long time on a lock, or a file read takes ages, `log.txt` now says which thread was waiting on what (#13). If the game freezes on you, grab the log and attach it to a bug report.
+- **Antivirus note** in the Install section: a couple of engines flag the unsigned installer on heuristics (#18).
+
+## All patch notes
+
+<details>
+<summary><b>0.2.6</b></summary>
 
 - **Fighting Lounge is still in alpha testing and being built.** Here is concept art of what I'm aiming for and no it does not look like this yet.
 
@@ -76,7 +88,7 @@
 - **F8 no longer mutes everyone in voice chat,** so it won't clash with clip / recording shortcuts. You can still mute players one at a time from the voice panel.
 - **Controller Setup > KEYBOARD:** the keyboard works again right after you choose a key (#6).
 
-## All patch notes
+</details>
 
 <details>
 <summary><b>0.2.5</b></summary>

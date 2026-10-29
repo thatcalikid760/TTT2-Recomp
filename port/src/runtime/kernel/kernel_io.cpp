@@ -190,11 +190,14 @@ static std::wstring FinalPathOf(const std::filesystem::path& directory)
     return path;
 }
 
+// Guest name of this thread's latest open, read by LogSlowIo (TTT2 slow-I/O diagnostic).
+static thread_local char g_lastOpenName[128] = "";
 static void DoOpen(PPCContext& ctx, uint8_t* base,bool create)
 {
     // NtCreateFile: r3=FileHandle*, r5=ObjectAttributes*, r6=IoStatusBlock*  (NtOpenFile matches these).
     uint32_t handleOut = ctx.r3.u32, objAttr = ctx.r5.u32, ioStatus = ctx.r6.u32;
     std::string guestPath = ReadObjAttrPath(base, objAttr);
+    std::snprintf(g_lastOpenName, sizeof(g_lastOpenName), "%s", guestPath.c_str());   // for the slow-I/O diagnostic
     if (guestPath.empty() && objAttr && XamGuestRange(objAttr, 12))
     {
         // Diagnostics: the menu load issues a few opens whose name reads as empty.
@@ -351,19 +354,78 @@ bool TryCloseGuestFile(uint32_t handle)
 struct ThreadIo { uint64_t calls = 0, bytes = 0; double ms = 0; };
 thread_local ThreadIo g_threadIo;
 void ThreadIoTotals(uint64_t& calls, uint64_t& bytes, double& ms) { calls = g_threadIo.calls; bytes = g_threadIo.bytes; ms = g_threadIo.ms; }
-static void LogSlowIo(const char* what, std::chrono::steady_clock::time_point start, uint32_t length)
+// Always on (GitHub #13: a long stall at character select on a laptop, the game data on drive D:): a single
+// host file call of 250 ms or more is logged (at most 40), and a 5 s window in which the file calls took over
+// 1 s in all (summed over the threads calling them) gets one summary line (at most 60) - a slow or busy disk
+// then shows in the log. "at <s>" is the time since the process started.
+static const auto g_ioClockStart = std::chrono::steady_clock::now();
+// Hot path is lock-free (relaxed atomics). Only the 5 s window roll takes a mutex, via try_lock.
+static std::atomic<uint64_t> g_ioCalls{ 0 }, g_ioBytes{ 0 }, g_ioTotalUs{ 0 }, g_ioLongestUs{ 0 };
+static std::atomic<int64_t> g_ioWindowStartUs{ 0 };   // microseconds since g_ioClockStart
+// Name of the longest call. Written without a lock only when a new longest is recorded; a torn name under a
+// race is acceptable for a diagnostic.
+static char g_ioLongestName[128] = "";
+static void NoteIoTime(const char* what, double ms, uint32_t length, const char* name, std::chrono::steady_clock::time_point end)
 {
+    const int64_t nowUs = std::chrono::duration_cast<std::chrono::microseconds>(end - g_ioClockStart).count();
+    const double up = double(nowUs) / 1e6;
+    static std::atomic<int> slowLogged{ 0 };
+    if (ms >= 250.0 && slowLogged.fetch_add(1, std::memory_order_relaxed) < 40)
+        std::fprintf(stderr, "[io] at %.1f s: slow %s %.0f ms (%u bytes)%s%s%s thread %lu\n", up, what, ms, length,
+                     name ? " '" : "", name ? name : "", name ? "'" : "", GetCurrentThreadId());
+    const uint64_t us = ms > 0 ? uint64_t(ms * 1000.0) : 0;
+    g_ioCalls.fetch_add(1, std::memory_order_relaxed);
+    g_ioBytes.fetch_add(length, std::memory_order_relaxed);
+    g_ioTotalUs.fetch_add(us, std::memory_order_relaxed);
+    uint64_t longest = g_ioLongestUs.load(std::memory_order_relaxed);
+    while (us > longest)
+    {
+        if (g_ioLongestUs.compare_exchange_weak(longest, us, std::memory_order_relaxed))
+        {
+            std::snprintf(g_ioLongestName, sizeof(g_ioLongestName), "%s", name ? name : what);
+            break;
+        }
+    }
+    if (nowUs - g_ioWindowStartUs.load(std::memory_order_relaxed) < 5000000) return;
+    static std::mutex m;
+    static int summaries = 0;
+    uint64_t calls, bytes, totalUs, longestUs;
+    char longestName[128];
+    double window;
+    {
+        if (!m.try_lock()) return;
+        std::lock_guard l(m, std::adopt_lock);
+        const int64_t start = g_ioWindowStartUs.load(std::memory_order_relaxed);
+        if (nowUs - start < 5000000) return;
+        window = double(nowUs - start) / 1e6;
+        g_ioWindowStartUs.store(nowUs, std::memory_order_relaxed);
+        calls = g_ioCalls.exchange(0, std::memory_order_relaxed);
+        bytes = g_ioBytes.exchange(0, std::memory_order_relaxed);
+        totalUs = g_ioTotalUs.exchange(0, std::memory_order_relaxed);
+        longestUs = g_ioLongestUs.exchange(0, std::memory_order_relaxed);
+        std::memcpy(longestName, g_ioLongestName, sizeof(longestName));
+        longestName[sizeof(longestName) - 1] = 0;
+        if (totalUs < 1000000 || summaries >= 60) return;
+        ++summaries;
+    }
+    std::fprintf(stderr, "[io] at %.1f s: %.1f s window: %llu file calls, %.1f MB, %.0f ms inside them (summed over threads), longest %.0f ms ('%s')\n",
+                 up, window, (unsigned long long)calls, double(bytes) / 1048576.0, double(totalUs) / 1000.0, double(longestUs) / 1000.0, longestName);
+}
+static void LogSlowIo(const char* what, std::chrono::steady_clock::time_point start, uint32_t length, const char* name = nullptr)
+{
+    const auto end = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(end - start).count();
+    NoteIoTime(what, ms, length, name, end);
     static const bool on = [] { const char* e = std::getenv("TTT2_FRAMETIME"); return e && *e == '1'; }();
     if (!on) return;
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     g_threadIo.calls += 1;
     g_threadIo.bytes += length;
     g_threadIo.ms += ms;
     static std::atomic<int> logged{ 0 };
     if (ms > 5.0 && logged++ < 300) std::fprintf(stderr, "[frame] slow %s %.1f ms (%u bytes) thread %lu\n", what, ms, length, GetCurrentThreadId());
 }
-PPC_FUNC(__imp__NtCreateFile) { KTrace("NtCreateFile"); RollbackNoteIo(true, "NtCreateFile", &ctx); const auto t = std::chrono::steady_clock::now(); DoOpen(ctx, base,true); LogSlowIo("open", t, 0); }
-PPC_FUNC(__imp__NtOpenFile)   { KTrace("NtOpenFile");   RollbackNoteIo(true, "NtOpenFile", &ctx); const auto t = std::chrono::steady_clock::now(); DoOpen(ctx, base,false); LogSlowIo("open", t, 0); }
+PPC_FUNC(__imp__NtCreateFile) { KTrace("NtCreateFile"); RollbackNoteIo(true, "NtCreateFile", &ctx); const auto t = std::chrono::steady_clock::now(); g_lastOpenName[0] = 0; DoOpen(ctx, base,true); LogSlowIo("open", t, 0, g_lastOpenName[0] ? g_lastOpenName : nullptr); }
+PPC_FUNC(__imp__NtOpenFile)   { KTrace("NtOpenFile");   RollbackNoteIo(true, "NtOpenFile", &ctx); const auto t = std::chrono::steady_clock::now(); g_lastOpenName[0] = 0; DoOpen(ctx, base,false); LogSlowIo("open", t, 0, g_lastOpenName[0] ? g_lastOpenName : nullptr); }
 
 PPC_FUNC(__imp__NtReadFile)
 {
@@ -424,7 +486,7 @@ PPC_FUNC(__imp__NtReadFile)
         }
         // A valid zero-length read succeeds without changing the file position.
     }
-    LogSlowIo("read", ioStart, length);
+    LogSlowIo("read", ioStart, length, file->path.c_str());
     {
         static std::atomic<uint64_t> dlog{0};
         uint64_t dn = ++dlog;
